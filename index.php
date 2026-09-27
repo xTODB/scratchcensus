@@ -36,7 +36,7 @@ a { color: #ffaa33; }
 </head>
 <body>
     <h1>ScratchCensus</h1>
-    <p class="sub">A comprehensive list of every Scratcher, by followers. <?= number_format($total) ?> tracked so far.</p>
+    <p class="sub">A comprehensive list of every Scratcher, by followers. <?= number_format($total) ?> tracked so far. <a href="/s/census/changelog.php">Changelog</a></p>
 
     <?php
     $msg = $_GET['msg'] ?? '';
