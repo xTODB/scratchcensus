@@ -120,3 +120,42 @@ function getScratchersPage(int $page, int $perPage = 100): array {
     $stmt->close();
     return $rows;
 }
+
+// ---- Public "crawl now" button (crawl-now.php) - lets visitors trigger a
+// small batch themselves instead of waiting for the next cron run. Kept
+// separate from the cron's own CRAWL_BATCH_SIZE/CRON_SECRET: this one has no
+// secret (anyone can click it) so it processes far fewer usernames per click
+// and is rate-limited per IP via crawl_triggers, same pattern as the main
+// ScratchNews site's form_submissions rate limiting. Two clicks overlapping
+// across different IPs could still grab the same pending rows (crawlBatch
+// doesn't lock them) - harmless double-fetching, not worth guarding against
+// at this scale.
+const PUBLIC_CRAWL_BATCH_SIZE = 3;
+const CRAWL_TRIGGER_COOLDOWN_SEC = 20; // per-IP cooldown between button clicks
+
+function getClientIp(): string {
+    return $_SERVER['REMOTE_ADDR'] ?? 'unknown';
+}
+
+function isCrawlTriggerLimited(string $ip): bool {
+    $db = getDB();
+    $window = CRAWL_TRIGGER_COOLDOWN_SEC;
+    $stmt = $db->prepare("SELECT COUNT(*) AS cnt FROM crawl_triggers WHERE ip_address = ? AND triggered_at > DATE_SUB(NOW(), INTERVAL ? SECOND)");
+    $stmt->bind_param('si', $ip, $window);
+    $stmt->execute();
+    $cnt = (int)($stmt->get_result()->fetch_assoc()['cnt'] ?? 0);
+    $stmt->close();
+    return $cnt > 0;
+}
+
+// Call only after a trigger has actually run crawlBatch() - not on a
+// cooldown-blocked attempt, so a blocked click doesn't reset its own cooldown.
+function recordCrawlTrigger(string $ip): void {
+    $db = getDB();
+    $stmt = $db->prepare("INSERT INTO crawl_triggers (ip_address) VALUES (?)");
+    $stmt->bind_param('s', $ip);
+    $stmt->execute();
+    $stmt->close();
+    // Table only needs to hold one cooldown window's worth of rows.
+    $db->query("DELETE FROM crawl_triggers WHERE triggered_at < DATE_SUB(NOW(), INTERVAL " . CRAWL_TRIGGER_COOLDOWN_SEC . " SECOND)");
+}
