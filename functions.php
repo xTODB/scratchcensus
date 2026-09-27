@@ -78,8 +78,6 @@ function discoverFollowingUsernames(string $username): array {
     }
     return $found;
 }
-    return $found;
-}
 
 function queueUsername(string $username, ?string $discoveredFrom = null): void {
     $db = getDB();
