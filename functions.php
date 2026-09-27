@@ -130,7 +130,7 @@ function getScratchersPage(int $page, int $perPage = 100): array {
 // across different IPs could still grab the same pending rows (crawlBatch
 // doesn't lock them) - harmless double-fetching, not worth guarding against
 // at this scale.
-const PUBLIC_CRAWL_BATCH_SIZE = 3;
+const PUBLIC_CRAWL_BATCH_SIZE = 10;
 const CRAWL_TRIGGER_COOLDOWN_SEC = 20; // per-IP cooldown between button clicks
 
 function getClientIp(): string {
