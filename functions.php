@@ -148,6 +148,54 @@ function getScratchersPage(int $page, int $perPage = 100): array {
     return $rows;
 }
 
+// The rank subquery mirrors the leaderboard's own ordering (follower_count
+// DESC, username ASC) so a searched-up username shows its real position in
+// the full list, not just a 1/2/3 within the search results. No window
+// functions (ROW_NUMBER etc.) - can't assume MySQL 8 on iFastNet.
+const RANK_SUBQUERY = "(SELECT COUNT(*) FROM scratchers s2 WHERE s2.status = 'fetched'
+    AND (s2.follower_count > s1.follower_count
+         OR (s2.follower_count = s1.follower_count AND s2.username < s1.username))) + 1";
+
+// Partial, case-insensitive username search (the `username` query box).
+// Returns ['rows' => [...with 'rank'...], 'total' => int].
+function searchScratchers(string $term, int $page, int $perPage = 100): array {
+    $db = getDB();
+    // Bound as a parameter below, not concatenated into the SQL string, so
+    // no manual escaping needed here - just wrap it for LIKE's wildcards.
+    $like = '%' . $term . '%';
+
+    $stmt = $db->prepare("SELECT COUNT(*) AS c FROM scratchers WHERE status = 'fetched' AND username LIKE ?");
+    $stmt->bind_param('s', $like);
+    $stmt->execute();
+    $total = (int)$stmt->get_result()->fetch_assoc()['c'];
+    $stmt->close();
+
+    $offset = ($page - 1) * $perPage;
+    $stmt = $db->prepare("SELECT username, follower_count, checked_at, " . RANK_SUBQUERY . " AS rank
+        FROM scratchers s1 WHERE status = 'fetched' AND username LIKE ?
+        ORDER BY follower_count DESC, username ASC LIMIT ? OFFSET ?");
+    $stmt->bind_param('sii', $like, $perPage, $offset);
+    $stmt->execute();
+    $rows = $stmt->get_result()->fetch_all(MYSQLI_ASSOC);
+    $stmt->close();
+
+    return ['rows' => $rows, 'total' => $total];
+}
+
+// exact: operator - one specific username, own rank, no pagination.
+// Returns null if that username has no fetched row yet (never crawled,
+// still pending, or errored) so the caller can offer to crawl it.
+function getExactScratcher(string $username): ?array {
+    $db = getDB();
+    $stmt = $db->prepare("SELECT username, follower_count, checked_at, " . RANK_SUBQUERY . " AS rank
+        FROM scratchers s1 WHERE status = 'fetched' AND username = ?");
+    $stmt->bind_param('s', $username);
+    $stmt->execute();
+    $row = $stmt->get_result()->fetch_assoc();
+    $stmt->close();
+    return $row ?: null;
+}
+
 // ---- Public "crawl now" button (crawl-now.php) - lets visitors trigger a
 // small batch themselves instead of waiting for the next cron run. Kept
 // separate from the cron's own CRAWL_BATCH_SIZE/CRON_SECRET: this one has no

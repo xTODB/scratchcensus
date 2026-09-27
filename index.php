@@ -4,9 +4,48 @@ require_once __DIR__ . '/functions.php';
 $perPage = 100;
 $page = max(1, (int)($_GET['page'] ?? 1));
 $total = getScratcherCount();
-$totalPages = max(1, (int)ceil($total / $perPage));
-$page = min($page, $totalPages);
-$scratchers = getScratchersPage($page, $perPage);
+
+$q = trim($_GET['q'] ?? '');
+$isExact = false;
+$exactMissing = null; // set if exact: search finds no fetched row, for the "crawl it?" prompt
+$searchTime = null;
+$searchTotal = null;
+
+if ($q !== '' && stripos($q, 'exact:') === 0) {
+    $isExact = true;
+    $exactUsername = trim(substr($q, 6));
+    $t0 = microtime(true);
+    $exactRow = $exactUsername !== '' ? getExactScratcher($exactUsername) : null;
+    $searchTime = microtime(true) - $t0;
+    if ($exactRow) {
+        $scratchers = [$exactRow];
+        $searchTotal = 1;
+    } else {
+        $scratchers = [];
+        $searchTotal = 0;
+        $exactMissing = $exactUsername;
+    }
+    $totalPages = 1;
+    $page = 1;
+} elseif ($q !== '') {
+    $t0 = microtime(true);
+    $result = searchScratchers($q, $page, $perPage);
+    $searchTime = microtime(true) - $t0;
+    $scratchers = $result['rows'];
+    $searchTotal = $result['total'];
+    $totalPages = max(1, (int)ceil($searchTotal / $perPage));
+    $page = min($page, $totalPages);
+} else {
+    $totalPages = max(1, (int)ceil($total / $perPage));
+    $page = min($page, $totalPages);
+    $scratchers = getScratchersPage($page, $perPage);
+    // Browse mode is already in strict global order with no gaps, so the
+    // rank is just its position - no need for the per-row rank subquery.
+    foreach ($scratchers as $i => &$row) {
+        $row['rank'] = (($page - 1) * $perPage) + $i + 1;
+    }
+    unset($row);
+}
 ?>
 <!DOCTYPE html>
 <html lang="en">
@@ -25,13 +64,20 @@ th { color: #999; font-size: 0.85rem; }
 .rank { color: #999; width: 3rem; }
 .count { text-align: right; }
 a { color: #ffaa33; }
-.pagination { margin-top: 1.5rem; display: flex; gap: 1rem; align-items: center; }
 .crawl-btn { display: inline-block; margin-top: 0.8rem; padding: 0.5rem 1rem; background: #ffaa33; color: #17191c; font-weight: bold; text-decoration: none; border-radius: 6px; }
 .crawl-note { color: #888; font-size: 0.85rem; margin: 0.4rem 0 0; }
 .flash { margin-top: 1rem; padding: 0.6rem 0.9rem; border-radius: 6px; background: #2a2d31; border: 1px solid #444; }
 .crawl-user-form { display: flex; gap: 0.5rem; margin-top: 1rem; }
 .crawl-user-form input[type="text"] { flex: 1; padding: 0.5rem 0.7rem; border-radius: 6px; border: 1px solid #444; background: #1e2023; color: #eee; }
 .crawl-user-form button { padding: 0.5rem 1rem; border-radius: 6px; border: none; background: #ffaa33; color: #17191c; font-weight: bold; cursor: pointer; }
+.search-form { display: flex; gap: 0.5rem; margin-top: 1.5rem; }
+.search-form input[type="text"] { flex: 1; padding: 0.5rem 0.7rem; border-radius: 6px; border: 1px solid #444; background: #1e2023; color: #eee; }
+.search-form button { padding: 0.5rem 1rem; border-radius: 6px; border: none; background: #ffaa33; color: #17191c; font-weight: bold; cursor: pointer; }
+.search-meta { color: #888; font-size: 0.85rem; margin: 0.4rem 0 0; }
+.page-jump { display: flex; align-items: center; gap: 0.6rem; margin-top: 1.5rem; }
+.page-jump a { padding: 0.4rem 0.9rem; border-radius: 20px; border: 1px solid #444; text-decoration: none; }
+.page-jump a.disabled { color: #555; border-color: #333; pointer-events: none; }
+.page-jump input[type="number"] { width: 3.5rem; text-align: center; padding: 0.3rem; border-radius: 6px; border: 1px solid #444; background: #1e2023; color: #eee; }
 </style>
 </head>
 <body>
@@ -78,17 +124,34 @@ a { color: #ffaa33; }
     </form>
     <p class="crawl-note">Adds and crawls one specific Scratcher right away. Shares the same <?= CRAWL_TRIGGER_COOLDOWN_SEC ?>s cooldown as Crawl Now.</p>
 
+    <form class="search-form" method="get">
+        <input type="text" name="q" value="<?= e($q) ?>" placeholder="Search username, or exact:username for one exact match" maxlength="60">
+        <button type="submit">Search</button>
+    </form>
+    <?php if ($q !== ''): ?>
+        <p class="search-meta">
+            <?php if ($isExact && $exactMissing !== null): ?>
+                No fetched entry for <?= e($exactMissing) ?> yet (<?= number_format($searchTime * 1000) ?>ms) - <a href="/s/census/crawl-user.php" onclick="document.getElementById('quick-crawl-u').value=<?= json_encode($exactMissing) ?>; document.getElementById('quick-crawl-form').submit(); return false;">crawl it now</a>?
+                <form id="quick-crawl-form" method="post" action="/s/census/crawl-user.php" style="display:none;"><input type="hidden" id="quick-crawl-u" name="username"></form>
+            <?php else: ?>
+                <?= number_format($searchTotal) ?> result<?= $searchTotal === 1 ? '' : 's' ?> found in <?= number_format($searchTime, 2) ?> seconds
+                <?php if (!$isExact): ?> - <a href="?q=<?= urlencode('exact:' . $q) ?>">search exact:<?= e($q) ?> instead</a><?php endif; ?>
+            <?php endif; ?>
+            &middot; <a href="?">clear search</a>
+        </p>
+    <?php endif; ?>
+
     <?php if (!$scratchers): ?>
-        <p>No data yet - the crawl hasn't produced results for this page.</p>
+        <p><?= $q !== '' ? 'No matches.' : "No data yet - the crawl hasn't produced results for this page." ?></p>
     <?php else: ?>
     <table>
         <thead>
             <tr><th class="rank">#</th><th>Username</th><th class="count">Followers</th></tr>
         </thead>
         <tbody>
-            <?php foreach ($scratchers as $i => $s): ?>
+            <?php foreach ($scratchers as $s): ?>
             <tr>
-                <td class="rank"><?= (($page - 1) * $perPage) + $i + 1 ?></td>
+                <td class="rank">#<?= (int)$s['rank'] ?></td>
                 <td><a href="https://scratch.mit.edu/users/<?= e($s['username']) ?>/" target="_blank" rel="noopener"><?= e($s['username']) ?></a></td>
                 <td class="count"><?= number_format((int)$s['follower_count']) ?></td>
             </tr>
@@ -97,10 +160,13 @@ a { color: #ffaa33; }
     </table>
     <?php endif; ?>
 
-    <div class="pagination">
-        <?php if ($page > 1): ?><a href="?page=<?= $page - 1 ?>">&larr; Prev</a><?php endif; ?>
-        <span>Page <?= $page ?> of <?= $totalPages ?></span>
-        <?php if ($page < $totalPages): ?><a href="?page=<?= $page + 1 ?>">Next &rarr;</a><?php endif; ?>
-    </div>
+    <?php if ($totalPages > 1): ?>
+    <form class="page-jump" method="get">
+        <?php if ($q !== ''): ?><input type="hidden" name="q" value="<?= e($q) ?>"><?php endif; ?>
+        <a class="<?= $page <= 1 ? 'disabled' : '' ?>" href="?<?= http_build_query(array_filter(['q' => $q, 'page' => $page - 1])) ?>">&larr; Prev</a>
+        <span>Page <input type="number" name="page" min="1" max="<?= $totalPages ?>" value="<?= $page ?>" onchange="this.value = Math.max(1, Math.min(<?= $totalPages ?>, this.value || 1)); this.form.submit()"> out of <?= $totalPages ?></span>
+        <a class="<?= $page >= $totalPages ? 'disabled' : '' ?>" href="?<?= http_build_query(array_filter(['q' => $q, 'page' => $page + 1])) ?>">Next &rarr;</a>
+    </form>
+    <?php endif; ?>
 </body>
 </html>
