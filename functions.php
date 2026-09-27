@@ -159,3 +159,39 @@ function recordCrawlTrigger(string $ip): void {
     // Table only needs to hold one cooldown window's worth of rows.
     $db->query("DELETE FROM crawl_triggers WHERE triggered_at < DATE_SUB(NOW(), INTERVAL " . CRAWL_TRIGGER_COOLDOWN_SEC . " SECOND)");
 }
+
+// ---- Public "crawl a specific username" (crawl-user.php) - same idea as the
+// batch button, but targets one username someone typed in directly, so it
+// shows up immediately rather than waiting for BFS discovery to stumble onto
+// them. Shares the same crawl_triggers cooldown as the batch button - both
+// hit scratch.mit.edu, so no reason to let someone bypass the cooldown by
+// switching between the two actions.
+function isValidScratchUsername(string $username): bool {
+    return (bool)preg_match('/^[A-Za-z0-9_\-.]{1,50}$/', $username);
+}
+
+function crawlSingleUsername(string $username): array {
+    queueUsername($username); // ensures a row exists if this is a brand new username
+    $count = fetchFollowerCount($username);
+    $db = getDB();
+
+    if ($count === null) {
+        $stmt = $db->prepare("UPDATE scratchers SET status = 'error', checked_at = NOW() WHERE username = ?");
+        $stmt->bind_param('s', $username);
+        $stmt->execute();
+        $stmt->close();
+        return ['ok' => false];
+    }
+
+    $stmt = $db->prepare("UPDATE scratchers SET follower_count = ?, status = 'fetched', checked_at = NOW() WHERE username = ?");
+    $stmt->bind_param('is', $count, $username);
+    $stmt->execute();
+    $stmt->close();
+
+    usleep(300000); // same politeness pause as crawlBatch()
+    foreach (discoverFollowerUsernames($username) as $found) {
+        queueUsername($found, $username);
+    }
+
+    return ['ok' => true, 'count' => $count];
+}
