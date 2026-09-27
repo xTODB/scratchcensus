@@ -12,6 +12,13 @@ jobs:
       - name: Checkout repo
         uses: actions/checkout@v4
 
+      # TEMPORARY - remove this step once the connection issue is diagnosed.
+      # Prints the character count of FTP_SERVER, not the value itself, so it's
+      # safe to leave in a log. "ftp.coffepoint.ifree.page" is 25 characters -
+      # a bigger number here means a trailing space/newline is hiding in the secret.
+      - name: Debug FTP_SERVER length
+        run: echo -n "${{ secrets.FTP_SERVER }}" | wc -c
+
       - name: Deploy via FTP
         uses: SamKirkland/FTP-Deploy-Action@v4.3.5
         with:
