@@ -56,6 +56,31 @@ function discoverFollowerUsernames(string $username): array {
     return $found;
 }
 
+// Same idea, but the OTHER direction: who this user follows. Followers skews
+// hard toward brand-new accounts (following a famous creator is one of the
+// first things a new user does), so that edge alone rarely surfaces other
+// popular Scratchers. Following is much more likely to - big creators tend
+// to follow each other - so this is what actually reaches the head of the
+// follower-count distribution rather than only the long tail.
+function discoverFollowingUsernames(string $username): array {
+    $found = [];
+    for ($offset = 0; $offset < 40; $offset += 20) {
+        $url = 'https://api.scratch.mit.edu/users/' . rawurlencode($username)
+            . '/following?limit=20&offset=' . $offset;
+        $json = httpGet($url);
+        if ($json === null) break;
+        $data = json_decode($json, true);
+        if (!is_array($data) || count($data) === 0) break;
+        foreach ($data as $u) {
+            if (!empty($u['username'])) $found[] = $u['username'];
+        }
+        if (count($data) < 20) break; // last page
+    }
+    return $found;
+}
+    return $found;
+}
+
 function queueUsername(string $username, ?string $discoveredFrom = null): void {
     $db = getDB();
     $stmt = $db->prepare("INSERT IGNORE INTO scratchers (username, discovered_from) VALUES (?, ?)");
@@ -96,6 +121,10 @@ function crawlBatch(int $limit): int {
             foreach (discoverFollowerUsernames($username) as $found) {
                 queueUsername($found, $username);
             }
+            usleep(300000);
+            foreach (discoverFollowingUsernames($username) as $found) {
+                queueUsername($found, $username);
+            }
         }
 
         $processed++;
@@ -130,7 +159,7 @@ function getScratchersPage(int $page, int $perPage = 100): array {
 // across different IPs could still grab the same pending rows (crawlBatch
 // doesn't lock them) - harmless double-fetching, not worth guarding against
 // at this scale.
-const PUBLIC_CRAWL_BATCH_SIZE = 10;
+const PUBLIC_CRAWL_BATCH_SIZE = 5; // halved back down - each user now costs ~2x the requests (follower + following discovery)
 const CRAWL_TRIGGER_COOLDOWN_SEC = 20; // per-IP cooldown between button clicks
 
 function getClientIp(): string {
@@ -190,6 +219,10 @@ function crawlSingleUsername(string $username): array {
 
     usleep(300000); // same politeness pause as crawlBatch()
     foreach (discoverFollowerUsernames($username) as $found) {
+        queueUsername($found, $username);
+    }
+    usleep(300000);
+    foreach (discoverFollowingUsernames($username) as $found) {
         queueUsername($found, $username);
     }
 
