@@ -1,133 +1,348 @@
 <?php
 require_once __DIR__ . '/config.php';
 
+// ---- Crawler tuning. Each can be overridden by defining it in config.php
+// (config.php is loaded first, so its value wins).
+defined('CRAWL_CONCURRENCY')          || define('CRAWL_CONCURRENCY', 4);      // simultaneous requests to Scratch
+defined('CRAWL_REQUEST_GAP')          || define('CRAWL_REQUEST_GAP', 0.1);    // min seconds between request STARTS (0.1 = max ~10 req/s)
+defined('CRAWL_CHUNK_SIZE')           || define('CRAWL_CHUNK_SIZE', 20);      // rows claimed + processed per round
+defined('CRAWL_TIME_BUDGET_SEC')      || define('CRAWL_TIME_BUDGET_SEC', 45); // stop starting new rounds after this long
+defined('CRAWL_MAX_RETRIES')          || define('CRAWL_MAX_RETRIES', 3);      // transient failures before a row becomes 'error'
+defined('CRAWL_CLAIM_TTL_SEC')        || define('CRAWL_CLAIM_TTL_SEC', 300);  // a claim (or retry cooldown) expires after this
+defined('CRAWL_PRIORITY_LANE_SHARE')  || define('CRAWL_PRIORITY_LANE_SHARE', 0.7); // rest of each round is plain oldest-first
+defined('DISCOVER_FOLLOWERS_MIN')     || define('DISCOVER_FOLLOWERS_MIN', 25); // only mine "followers" of users at/above this
+defined('DISCOVER_FOLLOWING_MIN')     || define('DISCOVER_FOLLOWING_MIN', 5);  // only mine "following" of users at/above this
+
 function e(?string $s): string {
     return htmlspecialchars($s ?? '', ENT_QUOTES, 'UTF-8');
 }
 
-// Polite, identifiable User-Agent and a short timeout so a slow/hanging
-// request can't eat the whole cron batch.
-function httpGet(string $url): ?string {
+function newCurlHandle(string $url) {
     $ch = curl_init($url);
     curl_setopt_array($ch, [
         CURLOPT_RETURNTRANSFER => true,
         CURLOPT_TIMEOUT => 10,
+        CURLOPT_CONNECTTIMEOUT => 5,
+        CURLOPT_ENCODING => '', // accept gzip/deflate, the followers page is big
         CURLOPT_USERAGENT => 'ScratchCensus/0.1 (+https://scratchnews.net/s/census - contact via ScratchNews)',
         CURLOPT_FOLLOWLOCATION => true,
     ]);
-    $body = curl_exec($ch);
-    $httpCode = curl_getinfo($ch, CURLINFO_HTTP_CODE);
-    curl_close($ch);
-    if ($body === false || $httpCode !== 200) return null;
-    return $body;
+    return $ch;
+}
+
+// Fetches many URLs at once (up to CRAWL_CONCURRENCY in flight, request
+// starts spaced CRAWL_REQUEST_GAP apart). $urls is key => url.
+// Returns ['results' => key => ['code' => int, 'body' => ?string],
+//          'rate_limited' => bool].
+// code 0 = network error/timeout. A 429 stops any not-yet-started requests:
+// their keys are simply missing from 'results' (caller treats that as "not
+// attempted", not as a failure).
+function httpMultiGet(array $urls): array {
+    $results = [];
+    $rateLimited = false;
+    if (!$urls) return ['results' => $results, 'rate_limited' => false];
+
+    $mh = curl_multi_init();
+    $keys = array_keys($urls);
+    $total = count($keys);
+    $next = 0;
+    $handles = []; // spl_object_id => [handle, key]
+    $lastStart = 0.0;
+
+    while (true) {
+        while (count($handles) < CRAWL_CONCURRENCY && $next < $total && !$rateLimited) {
+            $wait = CRAWL_REQUEST_GAP - (microtime(true) - $lastStart);
+            if ($wait > 0) usleep((int)($wait * 1000000));
+            $lastStart = microtime(true);
+            $key = $keys[$next++];
+            $ch = newCurlHandle($urls[$key]);
+            curl_multi_add_handle($mh, $ch);
+            $handles[spl_object_id($ch)] = [$ch, $key];
+        }
+        if (!$handles) break;
+
+        do {
+            $status = curl_multi_exec($mh, $running);
+        } while ($status === CURLM_CALL_MULTI_PERFORM);
+        if (curl_multi_select($mh, 0.5) === -1) usleep(10000);
+
+        while ($info = curl_multi_info_read($mh)) {
+            $ch = $info['handle'];
+            $id = spl_object_id($ch);
+            $key = $handles[$id][1];
+            if ($info['result'] === CURLE_OK) {
+                $code = (int)curl_getinfo($ch, CURLINFO_HTTP_CODE);
+                $results[$key] = ['code' => $code, 'body' => curl_multi_getcontent($ch)];
+                if ($code === 429) $rateLimited = true;
+            } else {
+                $results[$key] = ['code' => 0, 'body' => null];
+            }
+            curl_multi_remove_handle($mh, $ch);
+            curl_close($ch);
+            unset($handles[$id]);
+        }
+    }
+    curl_multi_close($mh);
+    return ['results' => $results, 'rate_limited' => $rateLimited];
+}
+
+function followersPageUrl(string $username): string {
+    return 'https://scratch.mit.edu/users/' . rawurlencode($username) . '/followers/';
 }
 
 // Scratch has no official follower-count endpoint. The followers page's HTML
-// includes "Followers (<N>)" in the tab heading - this is one request
-// regardless of how many followers the user has, unlike paging through the
-// official API 20-at-a-time. Same trick scratchattach's follower_count() uses.
-function fetchFollowerCount(string $username): ?int {
-    $html = httpGet('https://scratch.mit.edu/users/' . rawurlencode($username) . '/followers/');
-    if ($html === null) return null;
-    if (preg_match('/Followers\s*\((\d+)\)/i', $html, $m)) {
+// includes "Followers (<N>)" in the tab heading - one request regardless of
+// how many followers the user has. Same trick scratchattach uses.
+function parseFollowerCount(?string $html): ?int {
+    if ($html !== null && preg_match('/Followers\s*\((\d+)\)/i', $html, $m)) {
         return (int)$m[1];
     }
     return null;
 }
 
-// Discovery only, not a full crawl - pulls up to 2 pages (40 people) of a
-// user's followers via the official API to find new usernames to queue.
-// Deliberately shallow: the goal is finding people ScratchViews's ~8,643-user
-// cutoff misses, not enumerating every follower of every popular account.
-function discoverFollowerUsernames(string $username): array {
-    $found = [];
-    for ($offset = 0; $offset < 40; $offset += 20) {
-        $url = 'https://api.scratch.mit.edu/users/' . rawurlencode($username)
-            . '/followers?limit=20&offset=' . $offset;
-        $json = httpGet($url);
-        if ($json === null) break;
-        $data = json_decode($json, true);
-        if (!is_array($data) || count($data) === 0) break;
-        foreach ($data as $u) {
-            if (!empty($u['username'])) $found[] = $u['username'];
-        }
-        if (count($data) < 20) break; // last page
-    }
-    return $found;
-}
-
-// Same idea, but the OTHER direction: who this user follows. Followers skews
-// hard toward brand-new accounts (following a famous creator is one of the
-// first things a new user does), so that edge alone rarely surfaces other
-// popular Scratchers. Following is much more likely to - big creators tend
-// to follow each other - so this is what actually reaches the head of the
-// follower-count distribution rather than only the long tail.
-function discoverFollowingUsernames(string $username): array {
-    $found = [];
-    for ($offset = 0; $offset < 40; $offset += 20) {
-        $url = 'https://api.scratch.mit.edu/users/' . rawurlencode($username)
-            . '/following?limit=20&offset=' . $offset;
-        $json = httpGet($url);
-        if ($json === null) break;
-        $data = json_decode($json, true);
-        if (!is_array($data) || count($data) === 0) break;
-        foreach ($data as $u) {
-            if (!empty($u['username'])) $found[] = $u['username'];
-        }
-        if (count($data) < 20) break; // last page
-    }
-    return $found;
-}
-
-function queueUsername(string $username, ?string $discoveredFrom = null): void {
+function queueUsername(string $username, ?string $discoveredFrom = null, int $priority = 0): void {
     $db = getDB();
-    $stmt = $db->prepare("INSERT IGNORE INTO scratchers (username, discovered_from) VALUES (?, ?)");
-    $stmt->bind_param('ss', $username, $discoveredFrom);
+    $stmt = $db->prepare("INSERT IGNORE INTO scratchers (username, discovered_from, priority) VALUES (?, ?, ?)");
+    $stmt->bind_param('ssi', $username, $discoveredFrom, $priority);
     $stmt->execute();
     $stmt->close();
 }
 
-// Processes up to $limit pending scratchers: fetches their follower count,
-// queues any newly-discovered usernames from their followers list, marks
-// them fetched (or error, if Scratch didn't return a usable page - deleted/
-// banned accounts mainly). Returns how many were processed this run.
-function crawlBatch(int $limit): int {
+// One INSERT IGNORE per 200 usernames instead of one per username.
+// $items: list of [username, discovered_from, priority].
+function queueUsernamesBulk(array $items): void {
+    if (!$items) return;
     $db = getDB();
-    $stmt = $db->prepare("SELECT id, username FROM scratchers WHERE status = 'pending' ORDER BY id ASC LIMIT ?");
-    $stmt->bind_param('i', $limit);
+    $seen = [];
+    $unique = [];
+    foreach ($items as $it) {
+        $k = strtolower($it[0]);
+        if (isset($seen[$k])) continue;
+        $seen[$k] = true;
+        $unique[] = $it;
+    }
+    foreach (array_chunk($unique, 200) as $chunk) {
+        $placeholders = implode(',', array_fill(0, count($chunk), '(?, ?, ?)'));
+        $params = [];
+        foreach ($chunk as $it) {
+            $params[] = $it[0];
+            $params[] = $it[1];
+            $params[] = (int)$it[2];
+        }
+        $stmt = $db->prepare("INSERT IGNORE INTO scratchers (username, discovered_from, priority) VALUES $placeholders");
+        $stmt->bind_param(str_repeat('ssi', count($chunk)), ...$params);
+        $stmt->execute();
+        $stmt->close();
+    }
+}
+
+// Discovery only, not a full crawl: up to 2 pages (40 people) per direction.
+// $jobs: username => ['followers' => bool, 'following' => bool, 'count' => int].
+// Everything is fetched in parallel. Returns ['items' => queue items,
+// 'rate_limited' => bool].
+//  - "following" finds peers (big creators follow each other), so those get
+//    priority = the discovering user's follower count and are crawled first.
+//  - "followers" mostly finds brand-new accounts, priority 0 (still crawled
+//    via the oldest-first lane, so the long tail keeps filling in).
+function discoverBatch(array $jobs): array {
+    $items = [];
+    $rateLimited = false;
+    $requests = [];
+    foreach ($jobs as $username => $job) {
+        foreach (['followers', 'following'] as $kind) {
+            if (!empty($job[$kind])) {
+                $requests[$username . '|' . $kind] = ['user' => (string)$username, 'kind' => $kind, 'offset' => 0];
+            }
+        }
+    }
+
+    for ($round = 0; $round < 2 && $requests && !$rateLimited; $round++) {
+        $urls = [];
+        foreach ($requests as $k => $rq) {
+            $urls[$k] = 'https://api.scratch.mit.edu/users/' . rawurlencode($rq['user'])
+                . '/' . $rq['kind'] . '?limit=20&offset=' . $rq['offset'];
+        }
+        $r = httpMultiGet($urls);
+        if ($r['rate_limited']) $rateLimited = true;
+
+        $next = [];
+        foreach ($requests as $k => $rq) {
+            $res = $r['results'][$k] ?? null;
+            if (!$res || $res['code'] !== 200) continue;
+            $data = json_decode((string)$res['body'], true);
+            if (!is_array($data) || count($data) === 0) continue;
+            $priority = $rq['kind'] === 'following' ? (int)$jobs[$rq['user']]['count'] : 0;
+            foreach ($data as $u) {
+                if (!empty($u['username'])) $items[] = [$u['username'], $rq['user'], $priority];
+            }
+            if (count($data) >= 20) {
+                $next[$k] = ['user' => $rq['user'], 'kind' => $rq['kind'], 'offset' => 20];
+            }
+        }
+        $requests = $next;
+    }
+    return ['items' => $items, 'rate_limited' => $rateLimited];
+}
+
+function discoveryJobFor(int $count): array {
+    return [
+        'followers' => $count >= DISCOVER_FOLLOWERS_MIN,
+        'following' => $count >= DISCOVER_FOLLOWING_MIN,
+        'count' => $count,
+    ];
+}
+
+// Atomically claims up to $n pending rows: a single UPDATE stamps them with a
+// random token, so cron runs and public button clicks can never grab the same
+// rows. Claims expire after CRAWL_CLAIM_TTL_SEC, so a run that dies mid-way
+// doesn't strand its rows. Two lanes: most rows by priority (peers of popular
+// users first), the rest oldest-first so the low-priority tail isn't starved.
+function claimPendingRows(int $n): array {
+    $db = getDB();
+    $token = bin2hex(random_bytes(8));
+    $ttl = CRAWL_CLAIM_TTL_SEC;
+    $priorityN = (int)ceil($n * CRAWL_PRIORITY_LANE_SHARE);
+    $lanes = [['priority DESC, id ASC', $priorityN], ['id ASC', $n - $priorityN]];
+
+    foreach ($lanes as $lane) {
+        $order = $lane[0];
+        $count = $lane[1];
+        if ($count <= 0) continue;
+        $stmt = $db->prepare("UPDATE scratchers SET claim_token = ?, claimed_at = NOW()
+            WHERE status = 'pending'
+              AND (claim_token IS NULL OR claimed_at < DATE_SUB(NOW(), INTERVAL ? SECOND))
+            ORDER BY $order LIMIT ?");
+        $stmt->bind_param('sii', $token, $ttl, $count);
+        $stmt->execute();
+        $stmt->close();
+    }
+
+    $stmt = $db->prepare("SELECT id, username FROM scratchers WHERE claim_token = ? AND status = 'pending'");
+    $stmt->bind_param('s', $token);
     $stmt->execute();
     $rows = $stmt->get_result()->fetch_all(MYSQLI_ASSOC);
     $stmt->close();
+    return ['token' => $token, 'rows' => $rows];
+}
 
-    $processed = 0;
+function markFetched(int $id, int $count): void {
+    $db = getDB();
+    $stmt = $db->prepare("UPDATE scratchers SET follower_count = ?, status = 'fetched', checked_at = NOW(), claim_token = NULL, claimed_at = NULL WHERE id = ?");
+    $stmt->bind_param('ii', $count, $id);
+    $stmt->execute();
+    $stmt->close();
+}
+
+// Permanent: Scratch answered 404, so the account is deleted or never existed.
+function markError(int $id): void {
+    $db = getDB();
+    $stmt = $db->prepare("UPDATE scratchers SET status = 'error', checked_at = NOW(), claim_token = NULL, claimed_at = NULL WHERE id = ?");
+    $stmt->bind_param('i', $id);
+    $stmt->execute();
+    $stmt->close();
+}
+
+// Transient (timeout, 5xx, odd page): count a retry and park the row behind a
+// claim cooldown (claim_token 'retry' + claimed_at now = ineligible until the
+// claim TTL passes). status only flips to 'error' after CRAWL_MAX_RETRIES.
+// status is assigned before retries on purpose: MySQL evaluates SET left to
+// right, so it must see the OLD retries value.
+function markRetry(int $id): void {
+    $db = getDB();
+    $max = CRAWL_MAX_RETRIES;
+    $stmt = $db->prepare("UPDATE scratchers
+        SET status = IF(retries + 1 >= ?, 'error', 'pending'),
+            retries = retries + 1,
+            claim_token = 'retry', claimed_at = NOW()
+        WHERE id = ?");
+    $stmt->bind_param('ii', $max, $id);
+    $stmt->execute();
+    $stmt->close();
+}
+
+function releaseClaim(string $token): void {
+    $db = getDB();
+    $stmt = $db->prepare("UPDATE scratchers SET claim_token = NULL, claimed_at = NULL WHERE claim_token = ? AND status = 'pending'");
+    $stmt->bind_param('s', $token);
+    $stmt->execute();
+    $stmt->close();
+}
+
+// Last run's numbers, for cron/crawl.php's text output.
+function crawlStats(?array $set = null): array {
+    static $s = ['fetched' => 0, 'errors' => 0, 'retried' => 0, 'queued' => 0, 'rate_limited' => false];
+    if ($set !== null) $s = $set;
+    return $s;
+}
+
+// One round: claim rows, fetch all their follower counts in parallel, classify
+// each result, then run discovery in parallel for the ones that qualify.
+// Returns rows finalized (fetched or permanent error) and whether Scratch
+// rate-limited us.
+function crawlChunk(array $claim, array &$stats): array {
+    $rows = $claim['rows'];
+    $urls = [];
+    foreach ($rows as $row) $urls[$row['id']] = followersPageUrl($row['username']);
+    $r = httpMultiGet($urls);
+    $rateLimited = $r['rate_limited'];
+
+    $done = 0;
+    $jobs = [];
     foreach ($rows as $row) {
-        $username = $row['username'];
-        $count = fetchFollowerCount($username);
+        $id = (int)$row['id'];
+        $res = $r['results'][$id] ?? null;
+        if ($res === null) continue; // never attempted (rate limit stopped the run): released below, no penalty
 
-        if ($count === null) {
-            $upd = $db->prepare("UPDATE scratchers SET status = 'error', checked_at = NOW() WHERE id = ?");
-            $upd->bind_param('i', $row['id']);
-            $upd->execute();
-            $upd->close();
+        $count = $res['code'] === 200 ? parseFollowerCount($res['body']) : null;
+        if ($count !== null) {
+            markFetched($id, $count);
+            $jobs[$row['username']] = discoveryJobFor($count);
+            $stats['fetched']++;
+            $done++;
+        } elseif ($res['code'] === 404) {
+            markError($id);
+            $stats['errors']++;
+            $done++;
+        } elseif ($res['code'] === 429) {
+            // rate limited: not this user's fault, leave the row alone
         } else {
-            $upd = $db->prepare("UPDATE scratchers SET follower_count = ?, status = 'fetched', checked_at = NOW() WHERE id = ?");
-            $upd->bind_param('ii', $count, $row['id']);
-            $upd->execute();
-            $upd->close();
-
-            usleep(300000); // be polite between the two requests per user
-            foreach (discoverFollowerUsernames($username) as $found) {
-                queueUsername($found, $username);
-            }
-            usleep(300000);
-            foreach (discoverFollowingUsernames($username) as $found) {
-                queueUsername($found, $username);
-            }
+            markRetry($id);
+            $stats['retried']++;
         }
-
-        $processed++;
-        usleep(300000); // be polite between users too
     }
+
+    $jobs = array_filter($jobs, function ($j) { return $j['followers'] || $j['following']; });
+    if ($jobs && !$rateLimited) {
+        $d = discoverBatch($jobs);
+        if ($d['rate_limited']) $rateLimited = true;
+        queueUsernamesBulk($d['items']);
+        $stats['queued'] += count($d['items']);
+    }
+
+    releaseClaim($claim['token']);
+    return ['done' => $done, 'rate_limited' => $rateLimited];
+}
+
+// Processes up to $limit pending scratchers in rounds of CRAWL_CHUNK_SIZE,
+// stopping early when the time budget runs out, the queue is empty, or Scratch
+// answers 429. Returns how many rows were finalized this run.
+function crawlBatch(int $limit, int $budgetSec = CRAWL_TIME_BUDGET_SEC): int {
+    @set_time_limit($budgetSec + 30);
+    $start = microtime(true);
+    $stats = ['fetched' => 0, 'errors' => 0, 'retried' => 0, 'queued' => 0, 'rate_limited' => false];
+    $processed = 0;
+
+    while ($processed < $limit && (microtime(true) - $start) < $budgetSec) {
+        $claim = claimPendingRows(min(CRAWL_CHUNK_SIZE, $limit - $processed));
+        if (!$claim['rows']) break;
+        $res = crawlChunk($claim, $stats);
+        $processed += $res['done'];
+        if ($res['rate_limited']) {
+            $stats['rate_limited'] = true;
+            break;
+        }
+    }
+    crawlStats($stats);
     return $processed;
 }
 
@@ -201,10 +416,9 @@ function getExactScratcher(string $username): ?array {
 // separate from the cron's own CRAWL_BATCH_SIZE/CRON_SECRET: this one has no
 // secret (anyone can click it) so it processes far fewer usernames per click
 // and is rate-limited per IP via crawl_triggers, same pattern as the main
-// ScratchNews site's form_submissions rate limiting. Two clicks overlapping
-// across different IPs could still grab the same pending rows (crawlBatch
-// doesn't lock them) - harmless double-fetching, not worth guarding against
-// at this scale.
+// ScratchNews site's form_submissions rate limiting. Rows are claimed
+// atomically (claimPendingRows), so overlapping clicks and cron runs never
+// fetch the same row twice.
 const PUBLIC_CRAWL_BATCH_SIZE = 5; // halved back down - each user now costs ~2x the requests (follower + following discovery)
 const CRAWL_TRIGGER_COOLDOWN_SEC = 20; // per-IP cooldown between button clicks
 
@@ -247,29 +461,33 @@ function isValidScratchUsername(string $username): bool {
 
 function crawlSingleUsername(string $username): array {
     queueUsername($username); // ensures a row exists if this is a brand new username
-    $count = fetchFollowerCount($username);
     $db = getDB();
 
+    $r = httpMultiGet(['c' => followersPageUrl($username)]);
+    $res = $r['results']['c'] ?? ['code' => 0, 'body' => null];
+    $count = $res['code'] === 200 ? parseFollowerCount($res['body']) : null;
+
     if ($count === null) {
-        $stmt = $db->prepare("UPDATE scratchers SET status = 'error', checked_at = NOW() WHERE username = ?");
-        $stmt->bind_param('s', $username);
-        $stmt->execute();
-        $stmt->close();
-        return ['ok' => false];
+        // Only a real 404 means "no such user". A timeout/429/5xx says nothing
+        // about the account, so don't mark it error.
+        if ($res['code'] === 404) {
+            $stmt = $db->prepare("UPDATE scratchers SET status = 'error', checked_at = NOW() WHERE username = ?");
+            $stmt->bind_param('s', $username);
+            $stmt->execute();
+            $stmt->close();
+        }
+        return ['ok' => false, 'transient' => $res['code'] !== 404];
     }
 
-    $stmt = $db->prepare("UPDATE scratchers SET follower_count = ?, status = 'fetched', checked_at = NOW() WHERE username = ?");
+    $stmt = $db->prepare("UPDATE scratchers SET follower_count = ?, status = 'fetched', checked_at = NOW(), claim_token = NULL, claimed_at = NULL WHERE username = ?");
     $stmt->bind_param('is', $count, $username);
     $stmt->execute();
     $stmt->close();
 
-    usleep(300000); // same politeness pause as crawlBatch()
-    foreach (discoverFollowerUsernames($username) as $found) {
-        queueUsername($found, $username);
-    }
-    usleep(300000);
-    foreach (discoverFollowingUsernames($username) as $found) {
-        queueUsername($found, $username);
+    $job = discoveryJobFor($count);
+    if ($job['followers'] || $job['following']) {
+        $d = discoverBatch([$username => $job]);
+        queueUsernamesBulk($d['items']);
     }
 
     return ['ok' => true, 'count' => $count];
