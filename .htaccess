@@ -1,0 +1,3 @@
+RewriteEngine On
+RewriteRule ^changelog/?$ changelog.php [L,QSA]
+RewriteRule ^faq/?$ faq.php [L,QSA]
