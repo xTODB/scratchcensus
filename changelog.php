@@ -20,6 +20,8 @@ li { margin: 0.15rem 0; }
 <body>
     <h1>Changelog</h1>
     <p class="sub"><a href="/s/census/">&larr; Back to ScratchCensus</a></p>
+    <p>[Sep28] v2.0 - Search, a better way to crawl users, FAQ and a new UI!</p>
     <p>[Sep27] v1.0 - ScratchCensus launches! A comprehensive, community-crawled list of every Scratcher, by followers.</p>
+    <?php require __DIR__ . '/includes/footer.php'; ?>
 </body>
 </html>
