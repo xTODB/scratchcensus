@@ -64,16 +64,11 @@ th { color: #999; font-size: 0.85rem; }
 .rank { color: #999; width: 3rem; }
 .count { text-align: right; }
 a { color: #ffaa33; }
-.crawl-btn { display: inline-block; margin-top: 0.8rem; padding: 0.5rem 1rem; background: #ffaa33; color: #17191c; font-weight: bold; text-decoration: none; border-radius: 6px; }
-.crawl-note { color: #888; font-size: 0.85rem; margin: 0.4rem 0 0; }
 .flash { margin-top: 1rem; padding: 0.6rem 0.9rem; border-radius: 6px; background: #2a2d31; border: 1px solid #444; }
-.crawl-user-form { display: flex; gap: 0.5rem; margin-top: 1rem; }
-.crawl-user-form input[type="text"] { flex: 1; padding: 0.5rem 0.7rem; border-radius: 6px; border: 1px solid #444; background: #1e2023; color: #eee; }
-.crawl-user-form button { padding: 0.5rem 1rem; border-radius: 6px; border: none; background: #ffaa33; color: #17191c; font-weight: bold; cursor: pointer; }
-.search-form { display: flex; gap: 0.5rem; margin-top: 1.5rem; }
-.search-form input[type="text"] { flex: 1; padding: 0.5rem 0.7rem; border-radius: 6px; border: 1px solid #444; background: #1e2023; color: #eee; }
-.search-form button { padding: 0.5rem 1rem; border-radius: 6px; border: none; background: #ffaa33; color: #17191c; font-weight: bold; cursor: pointer; }
-.search-meta { color: #888; font-size: 0.85rem; margin: 0.4rem 0 0; }
+.control-row { display: flex; gap: 0.5rem; margin-top: 1rem; flex-wrap: wrap; }
+.control-row input[type="text"] { flex: 1; min-width: 10rem; padding: 0.5rem 0.7rem; border-radius: 6px; border: 1px solid #444; background: #1e2023; color: #eee; }
+.control-row button, .control-row a.btn { padding: 0.5rem 1rem; border-radius: 6px; border: none; background: #ffaa33; color: #17191c; font-weight: bold; font-size: 1rem; cursor: pointer; text-decoration: none; white-space: nowrap; }
+.search-meta { color: #888; font-size: 0.85rem; margin: 0.6rem 0 0; }
 .page-jump { display: flex; align-items: center; gap: 0.6rem; margin-top: 1.5rem; }
 .page-jump a { padding: 0.4rem 0.9rem; border-radius: 20px; border: 1px solid #444; text-decoration: none; }
 .page-jump a.disabled { color: #555; border-color: #333; pointer-events: none; }
@@ -82,7 +77,7 @@ a { color: #ffaa33; }
 </head>
 <body>
     <h1>ScratchCensus</h1>
-    <p class="sub">A comprehensive list of every Scratcher, by followers. <?= number_format($total) ?> tracked so far. <a href="/s/census/changelog.php">Changelog</a></p>
+    <p class="sub">A comprehensive list of every Scratcher, by followers. <?= number_format($total) ?> tracked so far.</p>
 
     <?php
     $msg = $_GET['msg'] ?? '';
@@ -115,30 +110,34 @@ a { color: #ffaa33; }
         </script>
     <?php endif; ?>
 
-    <a class="crawl-btn" href="/s/census/crawl-now.php">Crawl now</a>
-    <p class="crawl-note">Triggers a small batch immediately instead of waiting for the next scheduled crawl. Limited to once every <?= CRAWL_TRIGGER_COOLDOWN_SEC ?>s per visitor.</p>
+    <div class="control-row">
+        <a class="btn" href="/s/census/crawl-now.php">Crawl Users</a>
+        <form method="post" action="/s/census/crawl-user.php" style="display: contents;">
+            <input type="text" name="username" placeholder="username..." maxlength="50" required>
+            <button type="submit">Crawl User</button>
+        </form>
+    </div>
 
-    <form class="crawl-user-form" method="post" action="/s/census/crawl-user.php">
-        <input type="text" name="username" placeholder="Scratch username to crawl" maxlength="50" required>
-        <button type="submit">Crawl user</button>
-    </form>
-    <p class="crawl-note">Adds and crawls one specific Scratcher right away. Shares the same <?= CRAWL_TRIGGER_COOLDOWN_SEC ?>s cooldown as Crawl Now.</p>
-
-    <form class="search-form" method="get">
-        <input type="text" name="q" value="<?= e($q) ?>" placeholder="Search username, or exact:username for one exact match" maxlength="60">
+    <form class="control-row" method="get">
+        <input type="text" name="q" value="<?= e($q) ?>" placeholder="search username..." maxlength="60">
         <button type="submit">Search</button>
     </form>
+
     <?php if ($q !== ''): ?>
         <p class="search-meta">
             <?php if ($isExact && $exactMissing !== null): ?>
-                No fetched entry for <?= e($exactMissing) ?> yet (<?= number_format($searchTime * 1000) ?>ms) - <a href="/s/census/crawl-user.php" onclick="document.getElementById('quick-crawl-u').value=<?= json_encode($exactMissing) ?>; document.getElementById('quick-crawl-form').submit(); return false;">crawl it now</a>?
-                <form id="quick-crawl-form" method="post" action="/s/census/crawl-user.php" style="display:none;"><input type="hidden" id="quick-crawl-u" name="username"></form>
+                No fetched entry for <?= e($exactMissing) ?> yet (<?= number_format($searchTime * 1000) ?>ms) - <a href="#" onclick="document.getElementById('quick-crawl-form').submit(); return false;">crawl it now</a>?
             <?php else: ?>
                 <?= number_format($searchTotal) ?> result<?= $searchTotal === 1 ? '' : 's' ?> found in <?= number_format($searchTime, 2) ?> seconds
                 <?php if (!$isExact): ?> - <a href="?q=<?= urlencode('exact:' . $q) ?>">search exact:<?= e($q) ?> instead</a><?php endif; ?>
             <?php endif; ?>
             &middot; <a href="?">clear search</a>
         </p>
+        <?php if ($isExact && $exactMissing !== null): ?>
+        <form id="quick-crawl-form" method="post" action="/s/census/crawl-user.php" style="display: none;">
+            <input type="hidden" name="username" value="<?= e($exactMissing) ?>">
+        </form>
+        <?php endif; ?>
     <?php endif; ?>
 
     <?php if (!$scratchers): ?>
@@ -168,5 +167,7 @@ a { color: #ffaa33; }
         <a class="<?= $page >= $totalPages ? 'disabled' : '' ?>" href="?<?= http_build_query(array_filter(['q' => $q, 'page' => $page + 1])) ?>">Next &rarr;</a>
     </form>
     <?php endif; ?>
+
+    <?php require __DIR__ . '/includes/footer.php'; ?>
 </body>
 </html>
