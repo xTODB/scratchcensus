@@ -69,7 +69,7 @@ a { color: #ffaa33; }
 .control-row input[type="text"] { flex: 1; min-width: 10rem; padding: 0.5rem 0.7rem; border-radius: 6px; border: 1px solid #444; background: #1e2023; color: #eee; }
 .control-row button, .control-row a.btn { padding: 0.5rem 1rem; border-radius: 6px; border: none; background: #ffaa33; color: #17191c; font-weight: bold; font-size: 1rem; cursor: pointer; text-decoration: none; white-space: nowrap; }
 .search-meta { color: #888; font-size: 0.85rem; margin: 0.6rem 0 0; }
-.page-jump { display: flex; align-items: center; gap: 0.6rem; margin-top: 1.5rem; }
+.page-jump { display: flex; align-items: center; gap: 0.6rem; margin-top: 1.5rem; flex-wrap: wrap; }
 .page-jump a { padding: 0.4rem 0.9rem; border-radius: 20px; border: 1px solid #444; text-decoration: none; }
 .page-jump a.disabled { color: #555; border-color: #333; pointer-events: none; }
 .page-jump input[type="number"] { width: 3.5rem; text-align: center; padding: 0.3rem; border-radius: 6px; border: 1px solid #444; background: #1e2023; color: #eee; }
