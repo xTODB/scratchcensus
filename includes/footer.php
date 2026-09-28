@@ -1,4 +1,10 @@
 <style>
+/* Same font file the main ScratchNews site loads for its logo wordmark -
+   ScratchCensus lives on the same domain, so a root-relative URL works. */
+@font-face {
+    font-family: 'Scratch';
+    src: url('/assets/BLACKBOYSONMOPEDS.ttf') format('truetype');
+}
 .site-footer { margin-top: 2.5rem; padding: 1.5rem 0 2rem; border-top: 1px solid #333; }
 .footer-heading { display: flex; align-items: center; gap: 0.4rem; margin: 0 0 1rem; font-size: 1.1rem; color: #ccc; }
 .footer-heading a { display: inline-flex; align-items: center; }
