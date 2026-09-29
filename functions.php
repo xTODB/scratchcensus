@@ -5,7 +5,7 @@ require_once __DIR__ . '/config.php';
 // (config.php is loaded first, so its value wins).
 defined('CRAWL_CONCURRENCY')          || define('CRAWL_CONCURRENCY', 8);      // simultaneous requests to Scratch. Was 4; the 5.42/s measured rate lines up almost exactly with 4 slots at Scratch's observed ~0.7s response time, so this was concurrency-bound, not rate-limited. Watch the next few runs for a 429 - if one shows up, drop this back down
 defined('CRAWL_REQUEST_GAP')          || define('CRAWL_REQUEST_GAP', 0.1);    // min seconds between request STARTS (0.1 = max ~10 req/s)
-defined('CRAWL_CHUNK_SIZE')           || define('CRAWL_CHUNK_SIZE', 20);      // rows claimed + processed per round
+defined('CRAWL_CHUNK_SIZE')           || define('CRAWL_CHUNK_SIZE', 40);      // rows claimed + processed per round. Was 20; row writes are now batched (see markFetchedBulk etc.), so bigger chunks spread the fixed claim/release overhead over more rows instead of adding more per-row DB round trips
 defined('CRAWL_TIME_BUDGET_SEC')      || define('CRAWL_TIME_BUDGET_SEC', 45); // stop starting new rounds after this long. Back at the proven-safe 45s: the 120s test hit a 500, almost certainly iFastNet's own request timeout (unrelated to this budget's own bookkeeping) - see crawl.php for how to diagnose and raise this safely
 defined('CRAWL_MAX_RETRIES')          || define('CRAWL_MAX_RETRIES', 3);      // transient failures before a row becomes 'error'
 defined('CRAWL_CLAIM_TTL_SEC')        || define('CRAWL_CLAIM_TTL_SEC', 300);  // a claim (or retry cooldown) expires after this
@@ -226,19 +226,41 @@ function claimPendingRows(int $n): array {
     return ['token' => $token, 'rows' => $rows];
 }
 
-function markFetched(int $id, int $count): void {
+// $idToCount: id => follower_count. One query however many rows are in it,
+// via CASE, instead of one UPDATE per row.
+function markFetchedBulk(array $idToCount): void {
+    if (!$idToCount) return;
     $db = getDB();
-    $stmt = $db->prepare("UPDATE scratchers SET follower_count = ?, status = 'fetched', checked_at = NOW(), claim_token = NULL, claimed_at = NULL WHERE id = ?");
-    $stmt->bind_param('ii', $count, $id);
+    $case = 'CASE id ';
+    $types = '';
+    $params = [];
+    foreach ($idToCount as $id => $count) {
+        $case .= 'WHEN ? THEN ? ';
+        $types .= 'ii';
+        $params[] = $id;
+        $params[] = $count;
+    }
+    $case .= 'END';
+    $ids = array_keys($idToCount);
+    $inClause = implode(',', array_fill(0, count($ids), '?'));
+    $types .= str_repeat('i', count($ids));
+    $params = array_merge($params, $ids);
+
+    $stmt = $db->prepare("UPDATE scratchers SET follower_count = $case,
+        status = 'fetched', checked_at = NOW(), claim_token = NULL, claimed_at = NULL
+        WHERE id IN ($inClause)");
+    $stmt->bind_param($types, ...$params);
     $stmt->execute();
     $stmt->close();
 }
 
 // Permanent: Scratch answered 404, so the account is deleted or never existed.
-function markError(int $id): void {
+function markErrorBulk(array $ids): void {
+    if (!$ids) return;
     $db = getDB();
-    $stmt = $db->prepare("UPDATE scratchers SET status = 'error', checked_at = NOW(), claim_token = NULL, claimed_at = NULL WHERE id = ?");
-    $stmt->bind_param('i', $id);
+    $inClause = implode(',', array_fill(0, count($ids), '?'));
+    $stmt = $db->prepare("UPDATE scratchers SET status = 'error', checked_at = NOW(), claim_token = NULL, claimed_at = NULL WHERE id IN ($inClause)");
+    $stmt->bind_param(str_repeat('i', count($ids)), ...$ids);
     $stmt->execute();
     $stmt->close();
 }
@@ -247,16 +269,20 @@ function markError(int $id): void {
 // claim cooldown (claim_token 'retry' + claimed_at now = ineligible until the
 // claim TTL passes). status only flips to 'error' after CRAWL_MAX_RETRIES.
 // status is assigned before retries on purpose: MySQL evaluates SET left to
-// right, so it must see the OLD retries value.
-function markRetry(int $id): void {
+// right, so it must see the OLD retries value. retries is a per-row column
+// already, so unlike follower_count this needs no CASE to batch it - the
+// same SET clause is correct for every matched row.
+function markRetryBulk(array $ids): void {
+    if (!$ids) return;
     $db = getDB();
     $max = CRAWL_MAX_RETRIES;
+    $inClause = implode(',', array_fill(0, count($ids), '?'));
     $stmt = $db->prepare("UPDATE scratchers
         SET status = IF(retries + 1 >= ?, 'error', 'pending'),
             retries = retries + 1,
             claim_token = 'retry', claimed_at = NOW()
-        WHERE id = ?");
-    $stmt->bind_param('ii', $max, $id);
+        WHERE id IN ($inClause)");
+    $stmt->bind_param('i' . str_repeat('i', count($ids)), $max, ...$ids);
     $stmt->execute();
     $stmt->close();
 }
@@ -289,6 +315,9 @@ function crawlChunk(array $claim, array &$stats, bool $discover = true): array {
 
     $done = 0;
     $jobs = [];
+    $toFetch = []; // id => count
+    $toError = []; // ids
+    $toRetry = []; // ids
     foreach ($rows as $row) {
         $id = (int)$row['id'];
         $res = $r['results'][$id] ?? null;
@@ -296,21 +325,25 @@ function crawlChunk(array $claim, array &$stats, bool $discover = true): array {
 
         $count = $res['code'] === 200 ? parseFollowerCount($res['body']) : null;
         if ($count !== null) {
-            markFetched($id, $count);
+            $toFetch[$id] = $count;
             $jobs[$row['username']] = discoveryJobFor($count);
             $stats['fetched']++;
             $done++;
         } elseif ($res['code'] === 404) {
-            markError($id);
+            $toError[] = $id;
             $stats['errors']++;
             $done++;
         } elseif ($res['code'] === 429) {
             // rate limited: not this user's fault, leave the row alone
         } else {
-            markRetry($id);
+            $toRetry[] = $id;
             $stats['retried']++;
         }
     }
+    // At most 3 queries for the whole chunk instead of one per row.
+    markFetchedBulk($toFetch);
+    markErrorBulk($toError);
+    markRetryBulk($toRetry);
 
     $jobs = array_filter($jobs, function ($j) { return $j['followers'] || $j['following']; });
     if ($discover && $jobs && !$rateLimited) {
