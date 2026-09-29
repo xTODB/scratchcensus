@@ -406,17 +406,33 @@ function getScratchersPage(int $page, int $perPage = 100): array {
 // DESC, username ASC) so a searched-up username shows its real position in
 // the full list, not just a 1/2/3 within the search results. No window
 // functions (ROW_NUMBER etc.) - can't assume MySQL 8 on iFastNet.
+//
+// This subquery runs once per matched row (up to 100 times per search page).
+// Unindexed, each run is a full table scan - with ~40k rows that's up to 4
+// million row comparisons for one search. Run this once in phpMyAdmin (it's
+// the same index that also makes getScratchersPage's ORDER BY and
+// getExactScratcher's lookup fast, so this one ALTER covers all three):
+//   ALTER TABLE scratchers ADD INDEX idx_status_followers_username (status, follower_count, username);
 const RANK_SUBQUERY = "(SELECT COUNT(*) FROM scratchers s2 WHERE s2.status = 'fetched'
     AND (s2.follower_count > s1.follower_count
          OR (s2.follower_count = s1.follower_count AND s2.username < s1.username))) + 1";
+
+// Escapes LIKE's own wildcards (% and _) plus the escape character itself, so
+// a literal "_" - a normal character in Scratch usernames - or "%" in a
+// search term is matched literally instead of as a wildcard. Backslash is
+// LIKE's default escape character, no ESCAPE clause needed.
+function likeEscape(string $s): string {
+    return str_replace(['\\', '%', '_'], ['\\\\', '\\%', '\\_'], $s);
+}
 
 // Partial, case-insensitive username search (the `username` query box).
 // Returns ['rows' => [...with 'rank'...], 'total' => int].
 function searchScratchers(string $term, int $page, int $perPage = 100): array {
     $db = getDB();
-    // Bound as a parameter below, not concatenated into the SQL string, so
-    // no manual escaping needed here - just wrap it for LIKE's wildcards.
-    $like = '%' . $term . '%';
+    // Bound as a parameter below (safe from SQL injection either way), but
+    // LIKE's own % and _ wildcards inside $term still need escaping so they
+    // match literally instead of as wildcards.
+    $like = '%' . likeEscape($term) . '%';
 
     $stmt = $db->prepare("SELECT COUNT(*) AS c FROM scratchers WHERE status = 'fetched' AND username LIKE ?");
     $stmt->bind_param('s', $like);
@@ -458,7 +474,7 @@ function getExactScratcher(string $username): ?array {
 // ScratchNews site's form_submissions rate limiting. Rows are claimed
 // atomically (claimPendingRows), so overlapping clicks and cron runs never
 // fetch the same row twice.
-const PUBLIC_CRAWL_BATCH_SIZE = 5; // halved back down - each user now costs ~2x the requests (follower + following discovery)
+const PUBLIC_CRAWL_BATCH_SIZE = 150; // was 5, sized for the old per-user request cost. crawlBatch is still capped by CRAWL_TIME_BUDGET_SEC (45s) either way, so this just lets one click use that same 45s instead of stopping at 5 users
 const CRAWL_TRIGGER_COOLDOWN_SEC = 20; // per-IP cooldown between button clicks
 
 function getClientIp(): string {
