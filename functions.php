@@ -466,6 +466,49 @@ function getExactScratcher(string $username): ?array {
     return $row ?: null;
 }
 
+// f=100 / f<100 / f<=100 / f>100 / f>=100 operator. Returns
+// ['op' => one of = < <= > >=, 'value' => int] or null if $q isn't this
+// operator at all (so the caller falls through to plain username search).
+// Order matters in the alternation only for readability, not correctness -
+// the (\d+) after it forces backtracking to the right branch regardless.
+function parseFollowersOperator(string $q): ?array {
+    if (!preg_match('/^f\s*(<=|>=|=|<|>)\s*(\d+)$/i', trim($q), $m)) {
+        return null;
+    }
+    return ['op' => $m[1], 'value' => (int)$m[2]];
+}
+
+// Same shape as searchScratchers()/getExactScratcher(): ['rows' => [...with
+// 'rank'...], 'total' => int]. $op must come from parseFollowersOperator()
+// (or this whitelist) - never interpolate a raw user string as $op, it isn't
+// a bound parameter. Both queries filter on (status, follower_count) and
+// sort by (follower_count, username), exactly the columns the
+// idx_status_followers_username index covers, so this is an index range
+// scan rather than a table scan even before the rank subquery runs.
+function searchByFollowers(string $op, int $value, int $page, int $perPage = 100): array {
+    if (!in_array($op, ['=', '<', '<=', '>', '>='], true)) {
+        $op = '=';
+    }
+    $db = getDB();
+
+    $stmt = $db->prepare("SELECT COUNT(*) AS c FROM scratchers WHERE status = 'fetched' AND follower_count $op ?");
+    $stmt->bind_param('i', $value);
+    $stmt->execute();
+    $total = (int)$stmt->get_result()->fetch_assoc()['c'];
+    $stmt->close();
+
+    $offset = ($page - 1) * $perPage;
+    $stmt = $db->prepare("SELECT username, follower_count, checked_at, " . RANK_SUBQUERY . " AS rank
+        FROM scratchers s1 WHERE status = 'fetched' AND follower_count $op ?
+        ORDER BY follower_count DESC, username ASC LIMIT ? OFFSET ?");
+    $stmt->bind_param('iii', $value, $perPage, $offset);
+    $stmt->execute();
+    $rows = $stmt->get_result()->fetch_all(MYSQLI_ASSOC);
+    $stmt->close();
+
+    return ['rows' => $rows, 'total' => $total];
+}
+
 // ---- Public "crawl now" button (crawl-now.php) - lets visitors trigger a
 // small batch themselves instead of waiting for the next cron run. Kept
 // separate from the cron's own CRAWL_BATCH_SIZE/CRON_SECRET: this one has no

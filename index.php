@@ -7,11 +7,23 @@ $total = getScratcherCount();
 
 $q = trim($_GET['q'] ?? '');
 $isExact = false;
+$isFollowers = false;
 $exactMissing = null; // set if exact: search finds no fetched row, for the "crawl it?" prompt
 $searchTime = null;
 $searchTotal = null;
 
-if ($q !== '' && stripos($q, 'exact:') === 0) {
+$followersOp = $q !== '' ? parseFollowersOperator($q) : null;
+
+if ($followersOp !== null) {
+    $isFollowers = true;
+    $t0 = microtime(true);
+    $result = searchByFollowers($followersOp['op'], $followersOp['value'], $page, $perPage);
+    $searchTime = microtime(true) - $t0;
+    $scratchers = $result['rows'];
+    $searchTotal = $result['total'];
+    $totalPages = max(1, (int)ceil($searchTotal / $perPage));
+    $page = min($page, $totalPages);
+} elseif ($q !== '' && stripos($q, 'exact:') === 0) {
     $isExact = true;
     $exactUsername = trim(substr($q, 6));
     $t0 = microtime(true);
@@ -119,7 +131,7 @@ a { color: #ffaa33; }
     </div>
 
     <form class="control-row" method="get">
-        <input type="text" name="q" value="<?= e($q) ?>" placeholder="search username..." maxlength="60">
+        <input type="text" name="q" value="<?= e($q) ?>" placeholder="search username, f=100, f&lt;50, exact:name..." maxlength="60">
         <button type="submit">Search</button>
     </form>
 
@@ -129,7 +141,7 @@ a { color: #ffaa33; }
                 No fetched entry for <?= e($exactMissing) ?> yet (<?= number_format($searchTime * 1000) ?>ms) - <a href="#" onclick="document.getElementById('quick-crawl-form').submit(); return false;">crawl it now</a>?
             <?php else: ?>
                 <?= number_format($searchTotal) ?> result<?= $searchTotal === 1 ? '' : 's' ?> found in <?= number_format($searchTime, 2) ?> seconds
-                <?php if (!$isExact): ?> - <a href="?q=<?= urlencode('exact:' . $q) ?>">search exact:<?= e($q) ?> instead</a><?php endif; ?>
+                <?php if (!$isExact && !$isFollowers): ?> - <a href="?q=<?= urlencode('exact:' . $q) ?>">search exact:<?= e($q) ?> instead</a><?php endif; ?>
             <?php endif; ?>
             &middot; <a href="?">clear search</a>
         </p>
