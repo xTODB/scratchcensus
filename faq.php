@@ -24,6 +24,7 @@ a { color: #ffaa33; }
     <p>When you crawl for Scratchers, ScratchCensus requests usernames, follower and following lists from the entire database of Scratch users registered on ScratchCensus. Then the data is neatly put into this website for anyone to use.</p>
     <h2>How to search more efficiently?</h2>
     <p>If you want to search on ScratchCensus better, you can use our search operators! By default, your query is being searched as a part from every username ScratchCensus has. You can search for exact:username to give you only that exact username.</p>
+    <p>You can also search by follower count: f=100 for exactly 100 followers, f&lt;100 for less than 100, f&lt;=100 for 100 or fewer, f&gt;100 for more than 100, and f&gt;=100 for 100 or more.</p>
     <?php require __DIR__ . '/includes/footer.php'; ?>
 </body>
 </html>
