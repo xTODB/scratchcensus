@@ -131,7 +131,7 @@ a { color: #ffaa33; }
     </div>
 
     <form class="control-row" method="get">
-        <input type="text" name="q" value="<?= e($q) ?>" placeholder="search username, f=100, f&lt;50, exact:name..." maxlength="60">
+        <input type="text" name="q" value="<?= e($q) ?>" placeholder="Search username..." maxlength="60">
         <button type="submit">Search</button>
     </form>
 
