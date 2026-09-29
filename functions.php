@@ -3,7 +3,7 @@ require_once __DIR__ . '/config.php';
 
 // ---- Crawler tuning. Each can be overridden by defining it in config.php
 // (config.php is loaded first, so its value wins).
-defined('CRAWL_CONCURRENCY')          || define('CRAWL_CONCURRENCY', 4);      // simultaneous requests to Scratch
+defined('CRAWL_CONCURRENCY')          || define('CRAWL_CONCURRENCY', 8);      // simultaneous requests to Scratch. Was 4; the 5.42/s measured rate lines up almost exactly with 4 slots at Scratch's observed ~0.7s response time, so this was concurrency-bound, not rate-limited. Watch the next few runs for a 429 - if one shows up, drop this back down
 defined('CRAWL_REQUEST_GAP')          || define('CRAWL_REQUEST_GAP', 0.1);    // min seconds between request STARTS (0.1 = max ~10 req/s)
 defined('CRAWL_CHUNK_SIZE')           || define('CRAWL_CHUNK_SIZE', 20);      // rows claimed + processed per round
 defined('CRAWL_TIME_BUDGET_SEC')      || define('CRAWL_TIME_BUDGET_SEC', 45); // stop starting new rounds after this long. Back at the proven-safe 45s: the 120s test hit a 500, almost certainly iFastNet's own request timeout (unrelated to this budget's own bookkeeping) - see crawl.php for how to diagnose and raise this safely
@@ -490,8 +490,11 @@ function crawlSingleUsername(string $username): array {
     $stmt->execute();
     $stmt->close();
 
+    // Same pause as the batch crawler: while the queue is already huge, a
+    // public "Crawl User" click shouldn't add thousands more rows on top of it.
+    $pending = (int)$db->query("SELECT COUNT(*) AS c FROM scratchers WHERE status = 'pending'")->fetch_assoc()['c'];
     $job = discoveryJobFor($count);
-    if ($job['followers'] || $job['following']) {
+    if (($job['followers'] || $job['following']) && $pending < DISCOVERY_PAUSE_PENDING) {
         $d = discoverBatch([$username => $job]);
         queueUsernamesBulk($d['items']);
     }
