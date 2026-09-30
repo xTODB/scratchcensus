@@ -503,32 +503,93 @@ function likeEscape(string $s): string {
     return str_replace(['\\', '%', '_'], ['\\\\', '\\%', '\\_'], $s);
 }
 
-// Partial, case-insensitive username search (the `username` query box).
-// Returns ['rows' => [...with 'rank'...], 'total' => int].
-function searchScratchers(string $term, int $page, int $perPage = 100): array {
-    $db = getDB();
-    // Bound as a parameter below (safe from SQL injection either way), but
-    // LIKE's own % and _ wildcards inside $term still need escaping so they
-    // match literally instead of as wildcards.
-    $like = '%' . likeEscape($term) . '%';
+// ---- Combined search. One query string can mix any of:
+//   f>=12 f<=15     follower-count comparisons (=, <, <=, >, >=), all must hold
+//   exact:username  that one user only (still has to pass the other parts)
+//   anything else   partial, case-insensitive username match
+// e.g. "f>=12 f<=15", "f<=300 a", "exact:griffpatch f=787134".
+// Returns ['conds' => [[op, int], ...], 'exact' => ?string, 'text' => string].
+function parseSearchQuery(string $q): array {
+    $conds = [];
+    $q = preg_replace_callback('/(?<![\w-])f\s*(<=|>=|=|<|>)\s*(\d{1,10})(?![\w-])/i', function ($m) use (&$conds) {
+        $conds[] = [$m[1], (int)$m[2]];
+        return ' ';
+    }, $q);
+    $exact = null;
+    $q = preg_replace_callback('/(?<!\S)exact:(\S*)/i', function ($m) use (&$exact) {
+        if ($m[1] !== '') $exact = $m[1];
+        return ' ';
+    }, $q);
+    $text = trim(preg_replace('/\s+/', ' ', $q));
+    return ['conds' => $conds, 'exact' => $exact, 'text' => $text];
+}
 
-    $stmt = $db->prepare("SELECT COUNT(*) AS c FROM scratchers WHERE status = 'fetched' AND username LIKE ?");
-    $stmt->bind_param('s', $like);
+// Does an already-loaded row pass the follower comparisons and text part?
+// (Used for exact:, where the row is fetched by name first.)
+function rowMatchesSearch(array $row, array $conds, string $text): bool {
+    $fc = (int)$row['follower_count'];
+    foreach ($conds as [$op, $v]) {
+        if ($op === '=' && !($fc == $v)) return false;
+        if ($op === '<' && !($fc < $v)) return false;
+        if ($op === '<=' && !($fc <= $v)) return false;
+        if ($op === '>' && !($fc > $v)) return false;
+        if ($op === '>=' && !($fc >= $v)) return false;
+    }
+    return $text === '' || stripos($row['username'], $text) !== false;
+}
+
+// $conds ops are whitelisted here - never interpolate a raw user string as an
+// operator, it isn't a bound parameter. Returns [where, types, params].
+function buildSearchWhere(array $conds, string $text): array {
+    $where = "status = 'fetched'";
+    $types = '';
+    $params = [];
+    foreach ($conds as [$op, $v]) {
+        if (!in_array($op, ['=', '<', '<=', '>', '>='], true)) continue;
+        $where .= " AND follower_count $op ?";
+        $types .= 'i';
+        $params[] = $v;
+    }
+    if ($text !== '') {
+        $where .= " AND username LIKE ?";
+        $types .= 's';
+        $params[] = '%' . likeEscape($text) . '%';
+    }
+    return [$where, $types, $params];
+}
+
+// Same shape as before: ['rows' => [...with 'rank'...], 'total' => int].
+// With only follower comparisons the matches are one CONTIGUOUS block of the
+// leaderboard (rank the first row, the rest are +1 each). Adding a username
+// part breaks that, so those use the histogram ranks.
+function searchScratchersAdvanced(array $conds, string $text, int $page, int $perPage = 100): array {
+    $db = getDB();
+    [$where, $types, $params] = buildSearchWhere($conds, $text);
+
+    $stmt = $db->prepare("SELECT COUNT(*) AS c FROM scratchers WHERE $where");
+    if ($params) $stmt->bind_param($types, ...$params);
     $stmt->execute();
     $total = (int)$stmt->get_result()->fetch_assoc()['c'];
     $stmt->close();
 
     $offset = ($page - 1) * $perPage;
-    $stmt = $db->prepare("SELECT username, follower_count
-        FROM scratchers WHERE status = 'fetched' AND username LIKE ?
+    $stmt = $db->prepare("SELECT username, follower_count FROM scratchers WHERE $where
         ORDER BY follower_count DESC, username ASC LIMIT ? OFFSET ?");
-    $stmt->bind_param('sii', $like, $perPage, $offset);
+    $stmt->bind_param($types . 'ii', ...array_merge($params, [$perPage, $offset]));
     $stmt->execute();
     $rows = $stmt->get_result()->fetch_all(MYSQLI_ASSOC);
     $stmt->close();
-    attachCheckedAt($rows);
-    attachRanks($rows);
 
+    attachCheckedAt($rows);
+    if ($rows) {
+        if ($text === '') {
+            $first = rankOf((int)$rows[0]['follower_count'], $rows[0]['username']);
+            foreach ($rows as $i => &$row) $row['rank'] = $first + $i;
+            unset($row);
+        } else {
+            attachRanks($rows);
+        }
+    }
     return ['rows' => $rows, 'total' => $total];
 }
 
@@ -546,57 +607,6 @@ function getExactScratcher(string $username): ?array {
     if (!$row) return null;
     $row['rank'] = rankOf((int)$row['follower_count'], $row['username']);
     return $row;
-}
-
-// f=100 / f<100 / f<=100 / f>100 / f>=100 operator. Returns
-// ['op' => one of = < <= > >=, 'value' => int] or null if $q isn't this
-// operator at all (so the caller falls through to plain username search).
-// Order matters in the alternation only for readability, not correctness -
-// the (\d+) after it forces backtracking to the right branch regardless.
-function parseFollowersOperator(string $q): ?array {
-    if (!preg_match('/^f\s*(<=|>=|=|<|>)\s*(\d+)$/i', trim($q), $m)) {
-        return null;
-    }
-    return ['op' => $m[1], 'value' => (int)$m[2]];
-}
-
-// Same shape as searchScratchers()/getExactScratcher(): ['rows' => [...with
-// 'rank'...], 'total' => int]. $op must come from parseFollowersOperator()
-// (or this whitelist) - never interpolate a raw user string as $op, it isn't
-// a bound parameter. Both queries filter on (status, follower_count) and
-// sort by (follower_count, username), exactly the columns the
-// idx_status_followers_username index covers, so this is an index range
-// scan rather than a table scan even before the rank subquery runs.
-function searchByFollowers(string $op, int $value, int $page, int $perPage = 100): array {
-    if (!in_array($op, ['=', '<', '<=', '>', '>='], true)) {
-        $op = '=';
-    }
-    $db = getDB();
-
-    $stmt = $db->prepare("SELECT COUNT(*) AS c FROM scratchers WHERE status = 'fetched' AND follower_count $op ?");
-    $stmt->bind_param('i', $value);
-    $stmt->execute();
-    $total = (int)$stmt->get_result()->fetch_assoc()['c'];
-    $stmt->close();
-
-    $offset = ($page - 1) * $perPage;
-    $stmt = $db->prepare("SELECT username, follower_count
-        FROM scratchers WHERE status = 'fetched' AND follower_count $op ?
-        ORDER BY follower_count DESC, username ASC LIMIT ? OFFSET ?");
-    $stmt->bind_param('iii', $value, $perPage, $offset);
-    $stmt->execute();
-    $rows = $stmt->get_result()->fetch_all(MYSQLI_ASSOC);
-    $stmt->close();
-    attachCheckedAt($rows);
-    // Results are one contiguous block of the leaderboard: rank the first row
-    // on the page, the rest follow one by one.
-    if ($rows) {
-        $first = rankOf((int)$rows[0]['follower_count'], $rows[0]['username']);
-        foreach ($rows as $i => &$row) $row['rank'] = $first + $i;
-        unset($row);
-    }
-
-    return ['rows' => $rows, 'total' => $total];
 }
 
 // ---- Public "crawl now" button (crawl-now.php) - lets visitors trigger a
