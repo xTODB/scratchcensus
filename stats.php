@@ -83,7 +83,7 @@ h2 { margin: 2rem 0 0; font-size: 1.2rem; }
         <tr><th>People mined</th><td class="num"><?= number_format($pc['mined']) ?></td></tr>
         <tr><th>People pending</th><td class="num"><?= number_format($pc['pending']) ?></td></tr>
         <tr><th>People error</th><td class="num"><?= number_format($pc['error']) ?></td></tr>
-        <tr><th>Discovery</th><td class="num"><?= STUDIO_DISCOVERY_ENABLED ? 'on' : 'off' ?></td></tr>
+        <tr><th>Discovery</th><td class="num"><?= !STUDIO_DISCOVERY_ENABLED ? 'off' : (studioDiscoveryAllowed($sc['pending']) ? 'on' : 'paused (queue over ' . number_format(STUDIO_DISCOVERY_PAUSE_PENDING) . ')') ?></td></tr>
         <tr><th>Last crawled</th><td class="num"><?= $studioLast ? e($studioLast) : 'never' ?></td></tr>
         <?php if ($topStudio): ?>
         <tr><th>Top studio</th><td class="num"><?= e(shortTitle((string)$topStudio['title'], 40)) ?> (<?= number_format((int)$topStudio['follower_count']) ?>)</td></tr>
