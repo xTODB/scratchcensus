@@ -73,7 +73,9 @@ try {
     echo "people mined={$st['people_mined']} errors={$st['people_errors']} new_people_queued={$st['people_queued']}\n";
     echo "studios in DB: fetched={$sc['fetched']} pending={$sc['pending']} error={$sc['error']}\n";
     echo "people in DB: mined={$pc['mined']} pending={$pc['pending']} error={$pc['error']}\n";
-    echo "discovery: " . (STUDIO_DISCOVERY_ENABLED ? "on" : "OFF (STUDIO_DISCOVERY_ENABLED is false)") . "\n";
+    if (!STUDIO_DISCOVERY_ENABLED) echo "discovery: OFF (STUDIO_DISCOVERY_ENABLED is false)\n";
+    elseif (studioDiscoveryAllowed($sc['pending'])) echo "discovery: on\n";
+    else echo "discovery: paused (studios pending >= " . number_format(STUDIO_DISCOVERY_PAUSE_PENDING) . ")\n";
     if ($st['rate_limited']) echo "Scratch returned 429 - stopped early.\n";
 
     $top = $db->query("SELECT id, title, follower_count, open_to_all FROM studios WHERE status = 'fetched' ORDER BY follower_count DESC LIMIT 5");
