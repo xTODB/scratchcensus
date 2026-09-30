@@ -12,7 +12,10 @@ defined('CRAWL_CLAIM_TTL_SEC')        || define('CRAWL_CLAIM_TTL_SEC', 300);  //
 defined('CRAWL_PRIORITY_LANE_SHARE')  || define('CRAWL_PRIORITY_LANE_SHARE', 0.7); // rest of each round is plain oldest-first
 defined('DISCOVER_FOLLOWERS_MIN')     || define('DISCOVER_FOLLOWERS_MIN', 25); // only mine "followers" of users at/above this
 defined('DISCOVER_FOLLOWING_MIN')     || define('DISCOVER_FOLLOWING_MIN', 5);  // only mine "following" of users at/above this
-defined('DISCOVERY_PAUSE_PENDING')    || define('DISCOVERY_PAUSE_PENDING', 20000); // queue already this long? skip discovery, count-only fetches (~4x faster)
+defined('DISCOVERY_PAUSE_PENDING')    || define('DISCOVERY_PAUSE_PENDING', 500);   // discovery only runs while fewer than this many rows are pending, i.e. once the queue is basically drained (was 20000). Not 0 on purpose: discovery seeds from the users being crawled right now, so at exactly 0 pending nothing would ever restart it. Checked every round, not once per batch
+defined('DISCOVER_PAGE_SIZE')          || define('DISCOVER_PAGE_SIZE', 40);        // names per API request (Scratch's max; was 20, so every request now returns twice as many)
+defined('DISCOVER_FOLLOWERS_MAX_PAGES')|| define('DISCOVER_FOLLOWERS_MAX_PAGES', 5); // up to 200 followers per user (was 40). Also capped by the user's real follower count, so small accounts never cost a wasted request
+defined('DISCOVER_FOLLOWING_MAX_PAGES')|| define('DISCOVER_FOLLOWING_MAX_PAGES', 5); // up to 200 followed accounts per user (was 40)
 
 function e(?string $s): string {
     return htmlspecialchars($s ?? '', ENT_QUOTES, 'UTF-8');
@@ -147,10 +150,12 @@ function queueUsernamesBulk(array $items): void {
     }
 }
 
-// Discovery only, not a full crawl: up to 2 pages (40 people) per direction.
+// Discovery only, not a full crawl: up to DISCOVER_*_MAX_PAGES pages of
+// DISCOVER_PAGE_SIZE people per direction. Followers paging is also capped by
+// the user's known follower count, so nobody costs an empty extra request.
 // $jobs: username => ['followers' => bool, 'following' => bool, 'count' => int].
-// Everything is fetched in parallel. Returns ['items' => queue items,
-// 'rate_limited' => bool].
+// Everything is fetched in parallel, one round per page number. Returns
+// ['items' => queue items, 'rate_limited' => bool].
 //  - "following" finds peers (big creators follow each other), so those get
 //    priority = the discovering user's follower count and are crawled first.
 //  - "followers" mostly finds brand-new accounts, priority 0 (still crawled
@@ -161,17 +166,21 @@ function discoverBatch(array $jobs): array {
     $requests = [];
     foreach ($jobs as $username => $job) {
         foreach (['followers', 'following'] as $kind) {
-            if (!empty($job[$kind])) {
-                $requests[$username . '|' . $kind] = ['user' => (string)$username, 'kind' => $kind, 'offset' => 0];
+            if (empty($job[$kind])) continue;
+            if ($kind === 'followers') {
+                $maxPages = min(DISCOVER_FOLLOWERS_MAX_PAGES, max(1, (int)ceil($job['count'] / DISCOVER_PAGE_SIZE)));
+            } else {
+                $maxPages = max(1, DISCOVER_FOLLOWING_MAX_PAGES);
             }
+            $requests[$username . '|' . $kind] = ['user' => (string)$username, 'kind' => $kind, 'offset' => 0, 'page' => 1, 'max' => $maxPages];
         }
     }
 
-    for ($round = 0; $round < 2 && $requests && !$rateLimited; $round++) {
+    while ($requests && !$rateLimited) {
         $urls = [];
         foreach ($requests as $k => $rq) {
             $urls[$k] = 'https://api.scratch.mit.edu/users/' . rawurlencode($rq['user'])
-                . '/' . $rq['kind'] . '?limit=20&offset=' . $rq['offset'];
+                . '/' . $rq['kind'] . '?limit=' . DISCOVER_PAGE_SIZE . '&offset=' . $rq['offset'];
         }
         $r = httpMultiGet($urls);
         if ($r['rate_limited']) $rateLimited = true;
@@ -186,8 +195,9 @@ function discoverBatch(array $jobs): array {
             foreach ($data as $u) {
                 if (!empty($u['username'])) $items[] = [$u['username'], $rq['user'], $priority];
             }
-            if (count($data) >= 20) {
-                $next[$k] = ['user' => $rq['user'], 'kind' => $rq['kind'], 'offset' => 20];
+            // A short page means that was the last one; otherwise keep going up to the cap.
+            if (count($data) >= DISCOVER_PAGE_SIZE && $rq['page'] < $rq['max']) {
+                $next[$k] = ['user' => $rq['user'], 'kind' => $rq['kind'], 'offset' => $rq['offset'] + DISCOVER_PAGE_SIZE, 'page' => $rq['page'] + 1, 'max' => $rq['max']];
             }
         }
         $requests = $next;
@@ -373,15 +383,23 @@ function crawlChunk(array $claim, array &$stats, bool $discover = true): array {
 function crawlBatch(int $limit, int $budgetSec = CRAWL_TIME_BUDGET_SEC): int {
     @set_time_limit($budgetSec + 30);
     $start = microtime(true);
-    // Discovery is ~4 of every 5 requests, and it only matters while the queue
-    // is short. With a long queue, fetch counts only and drain it fast.
+    // Discovery is most of the requests, and it only matters once the queue is
+    // nearly empty. Re-checked before every round so it switches on the moment
+    // the queue drains mid-batch. 'discovery' in the stats means "at least one
+    // round ran with it on".
     $pending = (int)getDB()->query("SELECT COUNT(*) AS c FROM scratchers WHERE status = 'pending'")->fetch_assoc()['c'];
-    $discover = $pending < DISCOVERY_PAUSE_PENDING;
     $stats = ['fetched' => 0, 'errors' => 0, 'retried' => 0, 'queued' => 0, 'rate_limited' => false,
-              'discovery' => $discover, 'pending_at_start' => $pending];
+              'discovery' => false, 'pending_at_start' => $pending];
     $processed = 0;
+    $first = true;
 
     while ($processed < $limit && (microtime(true) - $start) < $budgetSec) {
+        if (!$first) {
+            $pending = (int)getDB()->query("SELECT COUNT(*) AS c FROM scratchers WHERE status = 'pending'")->fetch_assoc()['c'];
+        }
+        $first = false;
+        $discover = $pending < DISCOVERY_PAUSE_PENDING;
+        if ($discover) $stats['discovery'] = true;
         $claim = claimPendingRows(min(CRAWL_CHUNK_SIZE, $limit - $processed));
         if (!$claim['rows']) break;
         $res = crawlChunk($claim, $stats, $discover);
