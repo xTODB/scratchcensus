@@ -3,9 +3,9 @@ require_once __DIR__ . '/config.php';
 
 // ---- Crawler tuning. Each can be overridden by defining it in config.php
 // (config.php is loaded first, so its value wins).
-defined('CRAWL_CONCURRENCY')          || define('CRAWL_CONCURRENCY', 8);      // simultaneous requests to Scratch. Was 4; the 5.42/s measured rate lines up almost exactly with 4 slots at Scratch's observed ~0.7s response time, so this was concurrency-bound, not rate-limited. Watch the next few runs for a 429 - if one shows up, drop this back down
-defined('CRAWL_REQUEST_GAP')          || define('CRAWL_REQUEST_GAP', 0.1);    // min seconds between request STARTS (0.1 = max ~10 req/s)
-defined('CRAWL_CHUNK_SIZE')           || define('CRAWL_CHUNK_SIZE', 40);      // rows claimed + processed per round. Was 20; row writes are now batched (see markFetchedBulk etc.), so bigger chunks spread the fixed claim/release overhead over more rows instead of adding more per-row DB round trips
+defined('CRAWL_CONCURRENCY')          || define('CRAWL_CONCURRENCY', 12);     // simultaneous requests to Scratch (was 8). Override in config.php to tune without redeploying; if a 429 shows up, drop this and raise CRAWL_REQUEST_GAP
+defined('CRAWL_REQUEST_GAP')          || define('CRAWL_REQUEST_GAP', 0.06);   // min seconds between request STARTS (0.06 = max ~16 req/s; was 0.1 = 10/s, which is what capped the crawler at ~8/s)
+defined('CRAWL_CHUNK_SIZE')           || define('CRAWL_CHUNK_SIZE', 60);      // rows claimed + processed per round (was 40): fewer rounds = fewer claim/write round trips and fewer end-of-round drains
 defined('CRAWL_TIME_BUDGET_SEC')      || define('CRAWL_TIME_BUDGET_SEC', 45); // stop starting new rounds after this long. Back at the proven-safe 45s: the 120s test hit a 500, almost certainly iFastNet's own request timeout (unrelated to this budget's own bookkeeping) - see crawl.php for how to diagnose and raise this safely
 defined('CRAWL_MAX_RETRIES')          || define('CRAWL_MAX_RETRIES', 3);      // transient failures before a row becomes 'error'
 defined('CRAWL_CLAIM_TTL_SEC')        || define('CRAWL_CLAIM_TTL_SEC', 300);  // a claim (or retry cooldown) expires after this
@@ -28,6 +28,8 @@ function newCurlHandle(string $url) {
         CURLOPT_USERAGENT => 'ScratchCensus/0.1 (+https://scratchnews.net/s/census - contact via ScratchNews)',
         CURLOPT_FOLLOWLOCATION => true,
     ]);
+    // HTTP/2 if this libcurl has it (falls back to 1.1 silently if not).
+    if (defined('CURL_HTTP_VERSION_2TLS')) curl_setopt($ch, CURLOPT_HTTP_VERSION, CURL_HTTP_VERSION_2TLS);
     return $ch;
 }
 
@@ -43,7 +45,16 @@ function httpMultiGet(array $urls): array {
     $rateLimited = false;
     if (!$urls) return ['results' => $results, 'rate_limited' => false];
 
-    $mh = curl_multi_init();
+    // One multi handle for the whole process: its connection cache survives
+    // between chunks, so requests reuse open TLS connections to scratch.mit.edu
+    // instead of paying a new handshake every time (the old code closed the
+    // multi handle after every chunk).
+    static $mh = null;
+    if ($mh === null) {
+        $mh = curl_multi_init();
+        if (defined('CURLMOPT_MAX_HOST_CONNECTIONS')) curl_multi_setopt($mh, CURLMOPT_MAX_HOST_CONNECTIONS, CRAWL_CONCURRENCY);
+        if (defined('CURLPIPE_MULTIPLEX')) curl_multi_setopt($mh, CURLMOPT_PIPELINING, CURLPIPE_MULTIPLEX);
+    }
     $keys = array_keys($urls);
     $total = count($keys);
     $next = 0;
@@ -83,7 +94,6 @@ function httpMultiGet(array $urls): array {
             unset($handles[$id]);
         }
     }
-    curl_multi_close($mh);
     return ['results' => $results, 'rate_limited' => $rateLimited];
 }
 
