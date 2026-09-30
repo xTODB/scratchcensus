@@ -64,7 +64,7 @@ a { color: #ffaa33; }
 
     <div class="tabs">
         <a href="/s/census/">Users</a>
-        <a class="on" href="/s/census/studios.php">Studios</a>
+        <a class="on" href="/s/census/studios">Studios</a>
     </div>
 
     <form class="control-row" method="get">
@@ -75,7 +75,7 @@ a { color: #ffaa33; }
     <?php if ($q !== ''): ?>
         <p class="search-meta">
             <?= number_format($found) ?> result<?= $found === 1 ? '' : 's' ?> found in <?= number_format($searchTime, 2) ?> seconds
-            &middot; <a href="studios.php">clear search</a>
+            &middot; <a href="/s/census/studios">clear search</a>
         </p>
     <?php endif; ?>
 
@@ -93,7 +93,7 @@ a { color: #ffaa33; }
                 <td><a href="https://scratch.mit.edu/studios/<?= (int)$s['id'] ?>/" target="_blank" rel="noopener"><?= e($s['title'] !== null && $s['title'] !== '' ? $s['title'] : 'Studio ' . $s['id']) ?></a> <span class="muted">#<?= (int)$s['id'] ?></span></td>
                 <td><?php if (!empty($s['host_username'])): ?><a href="https://scratch.mit.edu/users/<?= e($s['host_username']) ?>/" target="_blank" rel="noopener"><?= e($s['host_username']) ?></a><?php else: ?><span class="muted">-</span><?php endif; ?></td>
                 <td><span class="tag <?= $s['open_to_all'] ? 'open' : 'closed' ?>"><?= $s['open_to_all'] ? 'Open' : 'Closed' ?></span></td>
-                <td class="count"><?= number_format((int)$s['project_count']) ?></td>
+                <td class="count"><?= (int)$s['project_count'] >= 100 ? '100+' : number_format((int)$s['project_count']) ?></td>
                 <td class="count"><?= number_format((int)$s['follower_count']) ?></td>
             </tr>
             <?php endforeach; ?>
