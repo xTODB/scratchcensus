@@ -13,7 +13,7 @@ defined('CRAWL_PRIORITY_LANE_SHARE')  || define('CRAWL_PRIORITY_LANE_SHARE', 0.7
 defined('DISCOVER_FOLLOWERS_MIN')     || define('DISCOVER_FOLLOWERS_MIN', 25); // only mine "followers" of users at/above this
 defined('DISCOVER_FOLLOWING_MIN')     || define('DISCOVER_FOLLOWING_MIN', 5);  // only mine "following" of users at/above this
 defined('DISCOVERY_ENABLED')          || define('DISCOVERY_ENABLED', true);    // master switch. false = never discover, count-only fetches always. Override in config.php: define('DISCOVERY_ENABLED', false);
-defined('DISCOVERY_PAUSE_PENDING')    || define('DISCOVERY_PAUSE_PENDING', 5000);  // with the switch on, discovery runs only while fewer than this many rows are pending (was 500). Not 0 on purpose: discovery seeds from users being crawled right now, so at exactly 0 nothing would restart it. Checked every round
+defined('DISCOVERY_PAUSE_PENDING')    || define('DISCOVERY_PAUSE_PENDING', 0);     // 0 = NO CAP: discovery runs no matter how long the queue is. Set a number (e.g. 5000) to pause discovery whenever that many rows are pending. Only applies while DISCOVERY_ENABLED is true
 defined('DISCOVER_PAGE_SIZE')          || define('DISCOVER_PAGE_SIZE', 40);        // names per API request (Scratch's max; was 20, so every request now returns twice as many)
 defined('DISCOVER_FOLLOWERS_MAX_PAGES')|| define('DISCOVER_FOLLOWERS_MAX_PAGES', 5); // up to 200 followers per user (was 40). Also capped by the user's real follower count, so small accounts never cost a wasted request
 defined('DISCOVER_FOLLOWING_MAX_PAGES')|| define('DISCOVER_FOLLOWING_MAX_PAGES', 5); // up to 200 followed accounts per user (was 40)
@@ -206,6 +206,12 @@ function discoverBatch(array $jobs): array {
     return ['items' => $items, 'rate_limited' => $rateLimited];
 }
 
+// Single place that decides whether discovery may run right now.
+function discoveryAllowed(int $pending): bool {
+    if (!DISCOVERY_ENABLED) return false;
+    return DISCOVERY_PAUSE_PENDING <= 0 || $pending < DISCOVERY_PAUSE_PENDING;
+}
+
 function discoveryJobFor(int $count): array {
     return [
         'followers' => $count >= DISCOVER_FOLLOWERS_MIN,
@@ -395,11 +401,11 @@ function crawlBatch(int $limit, int $budgetSec = CRAWL_TIME_BUDGET_SEC): int {
     $first = true;
 
     while ($processed < $limit && (microtime(true) - $start) < $budgetSec) {
-        if (!$first) {
+        if (!$first && DISCOVERY_PAUSE_PENDING > 0) { // no cap = no need to recount every round
             $pending = (int)getDB()->query("SELECT COUNT(*) AS c FROM scratchers WHERE status = 'pending'")->fetch_assoc()['c'];
         }
         $first = false;
-        $discover = DISCOVERY_ENABLED && $pending < DISCOVERY_PAUSE_PENDING;
+        $discover = discoveryAllowed($pending);
         if ($discover) $stats['discovery'] = true;
         $claim = claimPendingRows(min(CRAWL_CHUNK_SIZE, $limit - $processed));
         if (!$claim['rows']) break;
@@ -705,7 +711,7 @@ function crawlSingleUsername(string $username): array {
     // public "Crawl User" click shouldn't add thousands more rows on top of it.
     $pending = (int)$db->query("SELECT COUNT(*) AS c FROM scratchers WHERE status = 'pending'")->fetch_assoc()['c'];
     $job = discoveryJobFor($count);
-    if (($job['followers'] || $job['following']) && DISCOVERY_ENABLED && $pending < DISCOVERY_PAUSE_PENDING) {
+    if (($job['followers'] || $job['following']) && discoveryAllowed($pending)) {
         $d = discoverBatch([$username => $job]);
         queueUsernamesBulk($d['items']);
     }
