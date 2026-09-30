@@ -13,7 +13,7 @@ defined('CRAWL_PRIORITY_LANE_SHARE')  || define('CRAWL_PRIORITY_LANE_SHARE', 0.7
 defined('DISCOVER_FOLLOWERS_MIN')     || define('DISCOVER_FOLLOWERS_MIN', 25); // only mine "followers" of users at/above this
 defined('DISCOVER_FOLLOWING_MIN')     || define('DISCOVER_FOLLOWING_MIN', 5);  // only mine "following" of users at/above this
 defined('DISCOVERY_ENABLED')          || define('DISCOVERY_ENABLED', true);    // master switch. false = never discover, count-only fetches always. Override in config.php: define('DISCOVERY_ENABLED', false);
-defined('DISCOVERY_PAUSE_PENDING')    || define('DISCOVERY_PAUSE_PENDING', 0);     // 0 = NO CAP: discovery runs no matter how long the queue is. Set a number (e.g. 5000) to pause discovery whenever that many rows are pending. Only applies while DISCOVERY_ENABLED is true
+defined('DISCOVERY_PAUSE_PENDING')    || define('DISCOVERY_PAUSE_PENDING', 10000); // pause discovery whenever this many rows are pending (resumes by itself once the queue drops below it). 0 = NO CAP: discovery runs no matter how long the queue is. Only applies while DISCOVERY_ENABLED is true
 defined('DISCOVER_PAGE_SIZE')          || define('DISCOVER_PAGE_SIZE', 40);        // names per API request (Scratch's max; was 20, so every request now returns twice as many)
 defined('DISCOVER_FOLLOWERS_MAX_PAGES')|| define('DISCOVER_FOLLOWERS_MAX_PAGES', 5); // up to 200 followers per user (was 40). Also capped by the user's real follower count, so small accounts never cost a wasted request
 defined('DISCOVER_FOLLOWING_MAX_PAGES')|| define('DISCOVER_FOLLOWING_MAX_PAGES', 5); // up to 200 followed accounts per user (was 40)
