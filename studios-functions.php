@@ -352,3 +352,95 @@ function crawlStudiosBatch(int $budgetSec = STUDIO_TIME_BUDGET_SEC): array {
     }
     return $st;
 }
+
+// ---- Public studios page (studios.php) ------------------------------------
+// Search mirrors the users page. One query string can mix:
+//   f>=100 f<=500   follower comparisons (=, <, <=, >, >=)
+//   open / closed   open_to_all = 1 / 0
+//   id:56           that one studio
+//   anything else   partial, case-insensitive title match
+function parseStudioSearch(string $q): array {
+    $base = parseSearchQuery($q); // f ops; "exact:" is pulled out but unused here
+    $text = $base['text'];
+    if ($base['exact'] !== null) $text = trim($text . ' ' . $base['exact']);
+    $id = null;
+    $open = null;
+    $text = preg_replace_callback('/(?<!\S)id:(\d{1,10})(?!\S)/i', function ($m) use (&$id) {
+        $id = (int)$m[1];
+        return ' ';
+    }, $text);
+    $text = preg_replace_callback('/(?<!\S)(open|closed)(?!\S)/i', function ($m) use (&$open) {
+        $open = strtolower($m[1]) === 'open' ? 1 : 0;
+        return ' ';
+    }, $text);
+    $text = trim(preg_replace('/\s+/', ' ', $text));
+    return ['conds' => $base['conds'], 'id' => $id, 'open' => $open, 'text' => $text];
+}
+
+function buildStudioWhere(array $p): array {
+    $where = "status = 'fetched'";
+    $types = '';
+    $params = [];
+    foreach ($p['conds'] as [$op, $v]) {
+        if (!in_array($op, ['=', '<', '<=', '>', '>='], true)) continue;
+        $where .= " AND follower_count $op ?";
+        $types .= 'i';
+        $params[] = $v;
+    }
+    if ($p['id'] !== null) { $where .= " AND id = ?"; $types .= 'i'; $params[] = $p['id']; }
+    if ($p['open'] !== null) { $where .= " AND open_to_all = ?"; $types .= 'i'; $params[] = $p['open']; }
+    if ($p['text'] !== '') { $where .= " AND title LIKE ?"; $types .= 's'; $params[] = '%' . likeEscape($p['text']) . '%'; }
+    return [$where, $types, $params];
+}
+
+function getStudioCount(): int {
+    return (int)getDB()->query("SELECT COUNT(*) AS c FROM studios WHERE status = 'fetched'")->fetch_assoc()['c'];
+}
+
+// Rank in the full list: follower_count DESC, id ASC.
+function studioRankOf(int $followers, int $id): int {
+    $stmt = getDB()->prepare("SELECT
+        (SELECT COUNT(*) FROM studios WHERE status = 'fetched' AND follower_count > ?)
+      + (SELECT COUNT(*) FROM studios WHERE status = 'fetched' AND follower_count = ? AND id < ?)
+      + 1 AS r");
+    $stmt->bind_param('iii', $followers, $followers, $id);
+    $stmt->execute();
+    $r = (int)$stmt->get_result()->fetch_assoc()['r'];
+    $stmt->close();
+    return $r;
+}
+
+// $p = null for plain browsing. Returns ['rows' => [...with 'rank'...], 'total' => int].
+function getStudiosPage(?array $p, int $page, int $perPage = 100): array {
+    $db = getDB();
+    [$where, $types, $params] = $p ? buildStudioWhere($p) : ["status = 'fetched'", '', []];
+
+    $stmt = $db->prepare("SELECT COUNT(*) AS c FROM studios WHERE $where");
+    if ($params) $stmt->bind_param($types, ...$params);
+    $stmt->execute();
+    $total = (int)$stmt->get_result()->fetch_assoc()['c'];
+    $stmt->close();
+
+    $offset = ($page - 1) * $perPage;
+    $stmt = $db->prepare("SELECT id, title, host_username, follower_count, project_count, open_to_all, created_on
+        FROM studios WHERE $where ORDER BY follower_count DESC, id ASC LIMIT ? OFFSET ?");
+    $stmt->bind_param($types . 'ii', ...array_merge($params, [$perPage, $offset]));
+    $stmt->execute();
+    $rows = $stmt->get_result()->fetch_all(MYSQLI_ASSOC);
+    $stmt->close();
+
+    $plain = !$p || ($p['text'] === '' && $p['id'] === null && $p['open'] === null);
+    if ($rows && !$p) {
+        foreach ($rows as $i => &$r) $r['rank'] = $offset + $i + 1;
+        unset($r);
+    } elseif ($rows && $plain) {
+        // only follower comparisons: one contiguous block of the leaderboard
+        $first = studioRankOf((int)$rows[0]['follower_count'], (int)$rows[0]['id']);
+        foreach ($rows as $i => &$r) $r['rank'] = $first + $i;
+        unset($r);
+    } else {
+        foreach ($rows as &$r) $r['rank'] = studioRankOf((int)$r['follower_count'], (int)$r['id']);
+        unset($r);
+    }
+    return ['rows' => $rows, 'total' => $total];
+}

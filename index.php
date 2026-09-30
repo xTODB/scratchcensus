@@ -118,6 +118,7 @@ a { color: #ffaa33; }
     <?php endif; ?>
 
     <div class="control-row">
+        <a class="btn" href="/s/census/studios.php" style="background: #2a2d31; color: #ffaa33; border: 1px solid #ffaa33;">Studios</a>
         <a class="btn" href="/s/census/crawl-now.php">Crawl Users</a>
         <form method="post" action="/s/census/crawl-user.php" style="display: contents;">
             <input type="text" name="username" placeholder="username..." maxlength="50" required>

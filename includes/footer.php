@@ -31,6 +31,7 @@
         </div>
         <div>
             <p><a href="/s/census/">ScratchCensus</a></p>
+            <p><a href="/s/census/studios.php">Studios</a></p>
             <p><a href="/s/census/changelog">Changelog</a></p>
             <p><a href="/s/census/faq">FAQ</a></p>
         </div>
