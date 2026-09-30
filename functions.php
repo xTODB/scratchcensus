@@ -412,20 +412,88 @@ function getScratchersPage(int $page, int $perPage = 100): array {
     return $rows;
 }
 
-// The rank subquery mirrors the leaderboard's own ordering (follower_count
-// DESC, username ASC) so a searched-up username shows its real position in
-// the full list, not just a 1/2/3 within the search results. No window
-// functions (ROW_NUMBER etc.) - can't assume MySQL 8 on iFastNet.
+// Ranks mirror the leaderboard's own ordering (follower_count DESC, username
+// ASC), so a searched-up username shows its real position in the full list.
+// No window functions (ROW_NUMBER etc.) - can't assume MySQL 8 on iFastNet.
 //
-// This subquery runs once per matched row (up to 100 times per search page).
-// Unindexed, each run is a full table scan - with ~40k rows that's up to 4
-// million row comparisons for one search. Run this once in phpMyAdmin (it's
-// the same index that also makes getScratchersPage's ORDER BY and
-// getExactScratcher's lookup fast, so this one ALTER covers all three):
-//   ALTER TABLE scratchers ADD INDEX idx_status_followers_username (status, follower_count, username);
-const RANK_SUBQUERY = "(SELECT COUNT(*) FROM scratchers s2 WHERE s2.status = 'fetched'
-    AND (s2.follower_count > s1.follower_count
-         OR (s2.follower_count = s1.follower_count AND s2.username < s1.username))) + 1";
+// The old version ran a correlated COUNT(*) subquery once per result row (up
+// to 100 per page), each scanning up to the whole table: seconds at 100k+
+// rows. Now:
+//  - rankOf(): one row's rank, two OR-free range counts on
+//    idx_status_followers_username (status, follower_count, username).
+//  - f= / f< / f> searches return one CONTIGUOUS block of the leaderboard, so
+//    only the first row on the page needs rankOf(); the rest are +1 each.
+//  - username searches (not contiguous) use one follower_count histogram for
+//    "how many are above this count" plus a tie-break count only for rows that
+//    share their follower count with someone else.
+function rankOf(int $followers, string $username): int {
+    $db = getDB();
+    $stmt = $db->prepare("SELECT
+        (SELECT COUNT(*) FROM scratchers WHERE status = 'fetched' AND follower_count > ?)
+      + (SELECT COUNT(*) FROM scratchers WHERE status = 'fetched' AND follower_count = ? AND username < ?)
+      + 1 AS r");
+    $stmt->bind_param('iis', $followers, $followers, $username);
+    $stmt->execute();
+    $r = (int)$stmt->get_result()->fetch_assoc()['r'];
+    $stmt->close();
+    return $r;
+}
+
+// follower_count => how many fetched rows have exactly that count. One
+// covering-index scan; a few thousand distinct values, so the result is small.
+function getFollowerHistogram(): array {
+    $db = getDB();
+    $res = $db->query("SELECT follower_count, COUNT(*) AS c FROM scratchers WHERE status = 'fetched' GROUP BY follower_count");
+    $hist = [];
+    while ($row = $res->fetch_assoc()) $hist[(int)$row['follower_count']] = (int)$row['c'];
+    return $hist;
+}
+
+// Adds 'rank' to rows that are NOT a contiguous slice of the leaderboard.
+function attachRanks(array &$rows): void {
+    if (!$rows) return;
+    $hist = getFollowerHistogram();
+    krsort($hist);
+    $above = []; // follower_count => rows with a strictly higher count
+    $run = 0;
+    foreach ($hist as $fc => $c) {
+        $above[$fc] = $run;
+        $run += $c;
+    }
+    $db = getDB();
+    $stmt = $db->prepare("SELECT COUNT(*) AS c FROM scratchers WHERE status = 'fetched' AND follower_count = ? AND username < ?");
+    foreach ($rows as &$row) {
+        $fc = (int)$row['follower_count'];
+        $ties = 0;
+        if (($hist[$fc] ?? 1) > 1) { // only rows sharing a count need the tie-break query
+            $stmt->bind_param('is', $fc, $row['username']);
+            $stmt->execute();
+            $ties = (int)$stmt->get_result()->fetch_assoc()['c'];
+        }
+        $row['rank'] = ($above[$fc] ?? 0) + $ties + 1;
+    }
+    unset($row);
+    $stmt->close();
+}
+
+// The list queries below sort with follower_count DESC + username ASC, which
+// MySQL can't do straight off the index, so it sorts. Selecting only indexed
+// columns keeps that sort index-only; checked_at (not in the index) is then
+// looked up for just the <=100 rows on the page instead of every matched row.
+function attachCheckedAt(array &$rows): void {
+    if (!$rows) return;
+    $names = array_column($rows, 'username');
+    $db = getDB();
+    $in = implode(',', array_fill(0, count($names), '?'));
+    $stmt = $db->prepare("SELECT username, checked_at FROM scratchers WHERE username IN ($in)");
+    $stmt->bind_param(str_repeat('s', count($names)), ...$names);
+    $stmt->execute();
+    $map = [];
+    foreach ($stmt->get_result()->fetch_all(MYSQLI_ASSOC) as $r) $map[$r['username']] = $r['checked_at'];
+    $stmt->close();
+    foreach ($rows as &$row) $row['checked_at'] = $map[$row['username']] ?? null;
+    unset($row);
+}
 
 // Escapes LIKE's own wildcards (% and _) plus the escape character itself, so
 // a literal "_" - a normal character in Scratch usernames - or "%" in a
@@ -451,13 +519,15 @@ function searchScratchers(string $term, int $page, int $perPage = 100): array {
     $stmt->close();
 
     $offset = ($page - 1) * $perPage;
-    $stmt = $db->prepare("SELECT username, follower_count, checked_at, " . RANK_SUBQUERY . " AS rank
-        FROM scratchers s1 WHERE status = 'fetched' AND username LIKE ?
+    $stmt = $db->prepare("SELECT username, follower_count
+        FROM scratchers WHERE status = 'fetched' AND username LIKE ?
         ORDER BY follower_count DESC, username ASC LIMIT ? OFFSET ?");
     $stmt->bind_param('sii', $like, $perPage, $offset);
     $stmt->execute();
     $rows = $stmt->get_result()->fetch_all(MYSQLI_ASSOC);
     $stmt->close();
+    attachCheckedAt($rows);
+    attachRanks($rows);
 
     return ['rows' => $rows, 'total' => $total];
 }
@@ -467,13 +537,15 @@ function searchScratchers(string $term, int $page, int $perPage = 100): array {
 // still pending, or errored) so the caller can offer to crawl it.
 function getExactScratcher(string $username): ?array {
     $db = getDB();
-    $stmt = $db->prepare("SELECT username, follower_count, checked_at, " . RANK_SUBQUERY . " AS rank
-        FROM scratchers s1 WHERE status = 'fetched' AND username = ?");
+    $stmt = $db->prepare("SELECT username, follower_count, checked_at
+        FROM scratchers WHERE status = 'fetched' AND username = ?");
     $stmt->bind_param('s', $username);
     $stmt->execute();
     $row = $stmt->get_result()->fetch_assoc();
     $stmt->close();
-    return $row ?: null;
+    if (!$row) return null;
+    $row['rank'] = rankOf((int)$row['follower_count'], $row['username']);
+    return $row;
 }
 
 // f=100 / f<100 / f<=100 / f>100 / f>=100 operator. Returns
@@ -508,13 +580,21 @@ function searchByFollowers(string $op, int $value, int $page, int $perPage = 100
     $stmt->close();
 
     $offset = ($page - 1) * $perPage;
-    $stmt = $db->prepare("SELECT username, follower_count, checked_at, " . RANK_SUBQUERY . " AS rank
-        FROM scratchers s1 WHERE status = 'fetched' AND follower_count $op ?
+    $stmt = $db->prepare("SELECT username, follower_count
+        FROM scratchers WHERE status = 'fetched' AND follower_count $op ?
         ORDER BY follower_count DESC, username ASC LIMIT ? OFFSET ?");
     $stmt->bind_param('iii', $value, $perPage, $offset);
     $stmt->execute();
     $rows = $stmt->get_result()->fetch_all(MYSQLI_ASSOC);
     $stmt->close();
+    attachCheckedAt($rows);
+    // Results are one contiguous block of the leaderboard: rank the first row
+    // on the page, the rest follow one by one.
+    if ($rows) {
+        $first = rankOf((int)$rows[0]['follower_count'], $rows[0]['username']);
+        foreach ($rows as $i => &$row) $row['rank'] = $first + $i;
+        unset($row);
+    }
 
     return ['rows' => $rows, 'total' => $total];
 }
