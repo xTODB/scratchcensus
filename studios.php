@@ -30,6 +30,7 @@ $found = $res['total'];
 <meta charset="UTF-8">
 <meta name="viewport" content="width=device-width, initial-scale=1.0">
 <title>Studios - ScratchCensus</title>
+<?php require __DIR__ . '/includes/favicon.php'; ?>
 <meta name="description" content="Scratch studios ranked by followers, with whether they are open to all.">
 <style>
 body { font-family: -apple-system, Helvetica, Arial, sans-serif; max-width: 760px; margin: 2rem auto; padding: 0 1rem; background: #17191c; color: #eee; }

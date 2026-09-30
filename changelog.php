@@ -7,6 +7,7 @@ require_once __DIR__ . '/functions.php';
 <meta charset="UTF-8">
 <meta name="viewport" content="width=device-width, initial-scale=1.0">
 <title>Changelog - ScratchCensus</title>
+<?php require __DIR__ . '/includes/favicon.php'; ?>
 <meta name="description" content="What's changed in ScratchCensus over time.">
 <style>
 body { font-family: -apple-system, Helvetica, Arial, sans-serif; max-width: 700px; margin: 2rem auto; padding: 0 1rem; background: #17191c; color: #eee; }
