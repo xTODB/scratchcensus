@@ -12,36 +12,29 @@ $exactMissing = null; // set if exact: search finds no fetched row, for the "cra
 $searchTime = null;
 $searchTotal = null;
 
-$followersOp = $q !== '' ? parseFollowersOperator($q) : null;
+$parsed = $q !== '' ? parseSearchQuery($q) : null;
 
-if ($followersOp !== null) {
-    $isFollowers = true;
-    $t0 = microtime(true);
-    $result = searchByFollowers($followersOp['op'], $followersOp['value'], $page, $perPage);
-    $searchTime = microtime(true) - $t0;
-    $scratchers = $result['rows'];
-    $searchTotal = $result['total'];
-    $totalPages = max(1, (int)ceil($searchTotal / $perPage));
-    $page = min($page, $totalPages);
-} elseif ($q !== '' && stripos($q, 'exact:') === 0) {
+if ($parsed !== null && $parsed['exact'] !== null) {
+    // exact:username, optionally with f<op> / text parts that it must also pass
     $isExact = true;
-    $exactUsername = trim(substr($q, 6));
+    $isFollowers = (bool)$parsed['conds'];
+    $exactUsername = $parsed['exact'];
     $t0 = microtime(true);
-    $exactRow = $exactUsername !== '' ? getExactScratcher($exactUsername) : null;
+    $exactRow = getExactScratcher($exactUsername);
     $searchTime = microtime(true) - $t0;
-    if ($exactRow) {
+    if ($exactRow && rowMatchesSearch($exactRow, $parsed['conds'], $parsed['text'])) {
         $scratchers = [$exactRow];
-        $searchTotal = 1;
     } else {
         $scratchers = [];
-        $searchTotal = 0;
-        $exactMissing = $exactUsername;
+        if (!$exactRow) $exactMissing = $exactUsername;
     }
+    $searchTotal = count($scratchers);
     $totalPages = 1;
     $page = 1;
-} elseif ($q !== '') {
+} elseif ($parsed !== null) {
+    $isFollowers = (bool)$parsed['conds'];
     $t0 = microtime(true);
-    $result = searchScratchers($q, $page, $perPage);
+    $result = searchScratchersAdvanced($parsed['conds'], $parsed['text'], $page, $perPage);
     $searchTime = microtime(true) - $t0;
     $scratchers = $result['rows'];
     $searchTotal = $result['total'];
