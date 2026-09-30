@@ -1,5 +1,5 @@
 <?php
-require_once __DIR__ . '/functions.php';
+require_once __DIR__ . '/studios-functions.php';
 
 // No accounts on ScratchCensus, so this is gated the same way seed.php and
 // cron/crawl.php already are: ?key=YOUR_CRON_SECRET from config.php. Bookmark
@@ -19,9 +19,24 @@ while ($row = $res->fetch_assoc()) {
 }
 $total = array_sum($counts);
 
-$discoveryOn = $counts['pending'] < DISCOVERY_PAUSE_PENDING;
+$discoveryOn = discoveryAllowed($counts['pending']);
 $lastCrawled = $db->query("SELECT MAX(checked_at) AS t FROM scratchers")->fetch_assoc()['t'];
 $topRow = $db->query("SELECT username, follower_count FROM scratchers WHERE status = 'fetched' ORDER BY follower_count DESC, username ASC LIMIT 1")->fetch_assoc();
+
+$sc = ['pending' => 0, 'fetched' => 0, 'error' => 0];
+$res = $db->query("SELECT status, COUNT(*) AS c FROM studios GROUP BY status");
+while ($row = $res->fetch_assoc()) {
+    $sc[$row['status']] = (int)$row['c'];
+}
+$studioTotal = array_sum($sc);
+$pc = ['pending' => 0, 'mined' => 0, 'error' => 0];
+$res = $db->query("SELECT status, COUNT(*) AS c FROM studio_people GROUP BY status");
+while ($row = $res->fetch_assoc()) {
+    $pc[$row['status']] = (int)$row['c'];
+}
+$openRow = $db->query("SELECT SUM(open_to_all = 1) AS o, SUM(open_to_all = 0) AS c FROM studios WHERE status = 'fetched'")->fetch_assoc();
+$studioLast = $db->query("SELECT MAX(checked_at) AS t FROM studios")->fetch_assoc()['t'];
+$topStudio = $db->query("SELECT id, title, follower_count FROM studios WHERE status = 'fetched' ORDER BY follower_count DESC, id ASC LIMIT 1")->fetch_assoc();
 ?>
 <!DOCTYPE html>
 <html lang="en">
@@ -39,6 +54,7 @@ th, td { text-align: left; padding: 0.5rem 0.7rem; border-bottom: 1px solid #333
 th { color: #999; font-weight: normal; }
 td.num { text-align: right; }
 a { color: #ffaa33; }
+h2 { margin: 2rem 0 0; font-size: 1.2rem; }
 </style>
 </head>
 <body>
@@ -53,6 +69,24 @@ a { color: #ffaa33; }
         <tr><th>Last crawled</th><td class="num"><?= $lastCrawled ? e($lastCrawled) : 'never' ?></td></tr>
         <?php if ($topRow): ?>
         <tr><th>Top user</th><td class="num"><?= e($topRow['username']) ?> (<?= number_format((int)$topRow['follower_count']) ?>)</td></tr>
+        <?php endif; ?>
+    </table>
+
+    <h2>Studios</h2>
+    <table>
+        <tr><th>Total studios</th><td class="num"><?= number_format($studioTotal) ?></td></tr>
+        <tr><th>Fetched</th><td class="num"><?= number_format($sc['fetched']) ?></td></tr>
+        <tr><th>Pending</th><td class="num"><?= number_format($sc['pending']) ?></td></tr>
+        <tr><th>Error</th><td class="num"><?= number_format($sc['error']) ?></td></tr>
+        <tr><th>Open to all</th><td class="num"><?= number_format((int)$openRow['o']) ?></td></tr>
+        <tr><th>Closed</th><td class="num"><?= number_format((int)$openRow['c']) ?></td></tr>
+        <tr><th>People mined</th><td class="num"><?= number_format($pc['mined']) ?></td></tr>
+        <tr><th>People pending</th><td class="num"><?= number_format($pc['pending']) ?></td></tr>
+        <tr><th>People error</th><td class="num"><?= number_format($pc['error']) ?></td></tr>
+        <tr><th>Discovery</th><td class="num"><?= STUDIO_DISCOVERY_ENABLED ? 'on' : 'off' ?></td></tr>
+        <tr><th>Last crawled</th><td class="num"><?= $studioLast ? e($studioLast) : 'never' ?></td></tr>
+        <?php if ($topStudio): ?>
+        <tr><th>Top studio</th><td class="num"><?= e(shortTitle((string)$topStudio['title'], 40)) ?> (<?= number_format((int)$topStudio['follower_count']) ?>)</td></tr>
         <?php endif; ?>
     </table>
     <?php require __DIR__ . '/includes/footer.php'; ?>

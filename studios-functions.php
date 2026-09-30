@@ -444,3 +444,13 @@ function getStudiosPage(?array $p, int $page, int $perPage = 100): array {
     }
     return ['rows' => $rows, 'total' => $total];
 }
+
+// Long titles (and unbroken strings like "AAAAAAAA...") would stretch the
+// table, so cut them at 60 characters. The full title stays in the link's
+// tooltip.
+function shortTitle(string $t, int $max = 60): string {
+    $len = function_exists('mb_strlen') ? mb_strlen($t) : strlen($t);
+    if ($len <= $max) return $t;
+    $cut = function_exists('mb_substr') ? mb_substr($t, 0, $max) : substr($t, 0, $max);
+    return rtrim($cut) . '...';
+}

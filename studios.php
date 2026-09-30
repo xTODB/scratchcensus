@@ -91,7 +91,7 @@ a { color: #ffaa33; }
             <?php foreach ($studios as $s): ?>
             <tr>
                 <td class="rank">#<?= (int)$s['rank'] ?></td>
-                <td><a href="https://scratch.mit.edu/studios/<?= (int)$s['id'] ?>/" target="_blank" rel="noopener"><?= e($s['title'] !== null && $s['title'] !== '' ? $s['title'] : 'Studio ' . $s['id']) ?></a> <span class="muted">#<?= (int)$s['id'] ?></span></td>
+                <td><?php $full = $s['title'] !== null && $s['title'] !== '' ? $s['title'] : 'Studio ' . $s['id']; ?><a href="https://scratch.mit.edu/studios/<?= (int)$s['id'] ?>/" target="_blank" rel="noopener" title="<?= e($full) ?>"><?= e(shortTitle($full)) ?></a> <span class="muted">#<?= (int)$s['id'] ?></span></td>
                 <td><?php if (!empty($s['host_username'])): ?><a href="https://scratch.mit.edu/users/<?= e($s['host_username']) ?>/" target="_blank" rel="noopener"><?= e($s['host_username']) ?></a><?php else: ?><span class="muted">-</span><?php endif; ?></td>
                 <td><span class="tag <?= $s['open_to_all'] ? 'open' : 'closed' ?>"><?= $s['open_to_all'] ? 'Open' : 'Closed' ?></span></td>
                 <td class="count"><?= (int)$s['project_count'] >= 100 ? '100+' : number_format((int)$s['project_count']) ?></td>
