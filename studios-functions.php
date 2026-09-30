@@ -15,6 +15,7 @@ defined('STUDIO_TIME_BUDGET_SEC')        || define('STUDIO_TIME_BUDGET_SEC', 20)
 defined('STUDIO_CHUNK_SIZE')             || define('STUDIO_CHUNK_SIZE', 40);       // studios claimed per round
 defined('STUDIO_PEOPLE_CHUNK_SIZE')      || define('STUDIO_PEOPLE_CHUNK_SIZE', 20);// people claimed per round
 defined('STUDIO_DISCOVERY_ENABLED')      || define('STUDIO_DISCOVERY_ENABLED', true); // false = only fetch studios already queued, never mine people
+defined('STUDIO_DISCOVERY_PAUSE_PENDING')|| define('STUDIO_DISCOVERY_PAUSE_PENDING', 10000); // pause studio discovery (people mining + queueing) while this many studios are pending; resumes by itself below it. 0 = no cap
 defined('STUDIO_DISCOVER_MIN_FOLLOWERS') || define('STUDIO_DISCOVER_MIN_FOLLOWERS', 5); // only read managers/curators of studios with at least this many followers
 defined('STUDIO_CURATOR_PAGES')          || define('STUDIO_CURATOR_PAGES', 1);     // pages of 40 curators per studio
 defined('STUDIO_CURATE_MAX_PAGES')       || define('STUDIO_CURATE_MAX_PAGES', 3);  // pages of 40 curated studios per person
@@ -226,6 +227,16 @@ function studioMarkMined(array $ids): void {
     $stmt->close();
 }
 
+function studioPendingCount(): int {
+    return (int)getDB()->query("SELECT COUNT(*) AS c FROM studios WHERE status = 'pending'")->fetch_assoc()['c'];
+}
+
+// Master switch plus the pending cap. Mirrors discoveryAllowed() for users.
+function studioDiscoveryAllowed(int $pending): bool {
+    if (!STUDIO_DISCOVERY_ENABLED) return false;
+    return STUDIO_DISCOVERY_PAUSE_PENDING <= 0 || $pending < STUDIO_DISCOVERY_PAUSE_PENDING;
+}
+
 // Queues the root studio the first time, so a fresh install just works.
 function studioSeedIfEmpty(): void {
     $c = (int)getDB()->query("SELECT COUNT(*) AS c FROM studios")->fetch_assoc()['c'];
@@ -233,7 +244,7 @@ function studioSeedIfEmpty(): void {
 }
 
 // Step 1 + 2 for one claimed chunk of studios.
-function studioFetchRound(array $claim, array &$st): void {
+function studioFetchRound(array $claim, array &$st, bool $discover = true): void {
     $urls = [];
     foreach ($claim['rows'] as $r) $urls[$r['id']] = studioUrl((int)$r['id']);
     $res = httpMultiGet($urls);
@@ -261,7 +272,7 @@ function studioFetchRound(array $claim, array &$st): void {
     $st['studios_errors'] += count($errors);
     $st['studios_retried'] += count($retry);
 
-    if (!STUDIO_DISCOVERY_ENABLED || $st['rate_limited']) return;
+    if (!$discover || $st['rate_limited']) return;
 
     // Managers (includes the host) and curators of studios worth mining.
     $lists = [];
@@ -335,13 +346,15 @@ function crawlStudiosBatch(int $budgetSec = STUDIO_TIME_BUDGET_SEC): array {
     studioSeedIfEmpty();
 
     while ((microtime(true) - $start) < $budgetSec) {
+        // Only recount pending each round when a cap is set.
+        $discover = studioDiscoveryAllowed(STUDIO_DISCOVERY_PAUSE_PENDING > 0 ? studioPendingCount() : 0);
         $sc = studioClaim('studios', 'id', STUDIO_CHUNK_SIZE);
-        $pc = STUDIO_DISCOVERY_ENABLED
+        $pc = $discover
             ? studioClaim('studio_people', 'id, username', STUDIO_PEOPLE_CHUNK_SIZE)
             : ['token' => '', 'rows' => []];
         if (!$sc['rows'] && !$pc['rows']) break;
 
-        if ($sc['rows']) studioFetchRound($sc, $st);
+        if ($sc['rows']) studioFetchRound($sc, $st, $discover);
         if ($pc['rows'] && !$st['rate_limited']) studioPeopleRound($pc, $st);
 
         // Anything still pending under our tokens was not attempted (429 or
