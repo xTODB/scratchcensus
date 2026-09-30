@@ -53,7 +53,11 @@ try {
         . ($rate > 0 ? " (" . number_format($rate, 2) . "/s)" : "") . ".\n";
     echo "fetched={$s['fetched']} errors={$s['errors']} retried={$s['retried']} queued={$s['queued']}\n";
     echo "pending in queue: {$pending}\n";
-    echo "discovery: " . ($s['discovery'] ? "on" : "paused, count-only (queue was " . number_format($s['pending_at_start']) . ", over " . number_format(DISCOVERY_PAUSE_PENDING) . ")") . "\n";
+    if (!DISCOVERY_ENABLED) {
+        echo "discovery: OFF (DISCOVERY_ENABLED is false), count-only\n";
+    } else {
+        echo "discovery: " . ($s['discovery'] ? "on" : "paused, count-only (queue was " . number_format($s['pending_at_start']) . ", at or over " . number_format(DISCOVERY_PAUSE_PENDING) . ")") . "\n";
+    }
     if ($rate > 0 && $pending > 0) {
         // Rough only: assumes this run's rate holds and cron fires back-to-back,
         // which it won't (5 min apart) - just a ballpark for "is this working".
