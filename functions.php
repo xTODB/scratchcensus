@@ -1,6 +1,41 @@
 <?php
 require_once __DIR__ . '/config.php';
 
+// ---- Settings editable from stats.php (stored in the census_settings table).
+// Precedence: config.php, then the table, then the defaults below.
+const ADMIN_SETTINGS = [
+    // NAME => [label, min, max]
+    'DISCOVER_FOLLOWERS_MAX_PAGES' => ['Followers pages per user (40 names each)', 1, 50],
+    'DISCOVER_FOLLOWING_MAX_PAGES' => ['Following pages per user (40 names each)', 1, 50],
+    'DISCOVER_FOLLOWERS_MIN'       => ['Mine followers of users with at least', 0, 1000000],
+    'DISCOVER_FOLLOWING_MIN'       => ['Mine following of users with at least', 0, 1000000],
+];
+
+// Defines the stored values as constants. Returns the names config.php already
+// defined (those are locked: the stats page can't change them). A missing
+// table just means no overrides.
+function loadAdminSettings(): array {
+    static $locked = null;
+    if ($locked !== null) return $locked;
+    $locked = [];
+    foreach (ADMIN_SETTINGS as $k => $_) {
+        if (defined($k)) $locked[$k] = true;
+    }
+    try {
+        $res = getDB()->query("SELECT k, v FROM census_settings");
+        if ($res) {
+            while ($row = $res->fetch_assoc()) {
+                $k = $row['k'];
+                if (!isset(ADMIN_SETTINGS[$k]) || defined($k)) continue;
+                define($k, max(ADMIN_SETTINGS[$k][1], min(ADMIN_SETTINGS[$k][2], (int)$row['v'])));
+            }
+        }
+    } catch (\Throwable $e) {
+    }
+    return $locked;
+}
+loadAdminSettings();
+
 // ---- Crawler tuning. Each can be overridden by defining it in config.php
 // (config.php is loaded first, so its value wins).
 defined('CRAWL_CONCURRENCY')          || define('CRAWL_CONCURRENCY', 12);     // simultaneous requests to Scratch (was 8). Override in config.php to tune without redeploying; if a 429 shows up, drop this and raise CRAWL_REQUEST_GAP
@@ -15,7 +50,7 @@ defined('DISCOVER_FOLLOWING_MIN')     || define('DISCOVER_FOLLOWING_MIN', 5);  /
 defined('DISCOVERY_ENABLED')          || define('DISCOVERY_ENABLED', true);    // master switch. false = never discover, count-only fetches always. Override in config.php: define('DISCOVERY_ENABLED', false);
 defined('DISCOVERY_PAUSE_PENDING')    || define('DISCOVERY_PAUSE_PENDING', 10000); // pause discovery whenever this many rows are pending (resumes by itself once the queue drops below it). 0 = NO CAP: discovery runs no matter how long the queue is. Only applies while DISCOVERY_ENABLED is true
 defined('DISCOVER_PAGE_SIZE')          || define('DISCOVER_PAGE_SIZE', 40);        // names per API request (Scratch's max; was 20, so every request now returns twice as many)
-defined('REMINE_CHUNK_SIZE')          || define('REMINE_CHUNK_SIZE', 40);     // fetched users re-mined per round when the queue is empty (see remineChunk)
+defined('REMINE_CHUNK_SIZE')          || define('REMINE_CHUNK_SIZE', 20);     // fetched users re-mined per round when the queue is empty (see remineChunk). Big accounts cost up to ~20 requests each, so keep a round short enough to stay inside the web server's timeout
 defined('DISCOVER_FOLLOWERS_MAX_PAGES')|| define('DISCOVER_FOLLOWERS_MAX_PAGES', 10); // up to 200 followers per user (was 40). Also capped by the user's real follower count, so small accounts never cost a wasted request
 defined('DISCOVER_FOLLOWING_MAX_PAGES')|| define('DISCOVER_FOLLOWING_MAX_PAGES', 10); // up to 200 followed accounts per user (was 40)
 
