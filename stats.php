@@ -20,6 +20,7 @@ while ($row = $res->fetch_assoc()) {
 $total = array_sum($counts);
 
 $discoveryOn = discoveryAllowed($counts['pending']);
+$unmined = (int)$db->query("SELECT COUNT(*) AS c FROM scratchers WHERE status = 'fetched' AND discovered = 0 AND follower_count >= " . (int)DISCOVER_FOLLOWING_MIN)->fetch_assoc()['c'];
 $lastCrawled = $db->query("SELECT MAX(checked_at) AS t FROM scratchers")->fetch_assoc()['t'];
 $topRow = $db->query("SELECT username, follower_count FROM scratchers WHERE status = 'fetched' ORDER BY follower_count DESC, username ASC LIMIT 1")->fetch_assoc();
 
@@ -65,6 +66,7 @@ h2 { margin: 2rem 0 0; font-size: 1.2rem; }
         <tr><th>Fetched</th><td class="num"><?= number_format($counts['fetched']) ?></td></tr>
         <tr><th>Pending</th><td class="num"><?= number_format($counts['pending']) ?></td></tr>
         <tr><th>Error</th><td class="num"><?= number_format($counts['error']) ?></td></tr>
+        <tr><th>Not yet mined</th><td class="num"><?= number_format($unmined) ?></td></tr>
         <tr><th>Discovery</th><td class="num"><?= $discoveryOn ? 'on' : 'paused (queue over ' . number_format(DISCOVERY_PAUSE_PENDING) . ')' ?></td></tr>
         <tr><th>Last crawled</th><td class="num"><?= $lastCrawled ? e($lastCrawled) : 'never' ?></td></tr>
         <?php if ($topRow): ?>
