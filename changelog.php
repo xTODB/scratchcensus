@@ -21,6 +21,7 @@ li { margin: 0.15rem 0; }
 <body>
     <h1>Changelog</h1>
     <p class="sub"><a href="/s/census/">&larr; Back to ScratchCensus</a></p>
+    <p>[Oct1] v4.0 - Studios! ScratchCensus now crawls Scratch studios too, ranked by followers and showing whether they are open to all. Search them by title, or with open, closed, id:56 and f&gt;=100. There is a new logo and favicon, discovery now goes back for users it hadn't mined yet, and the crawler stops downloading a profile page as soon as it has the follower count.</p>
     <p>[Sep30] v3.0 - The biggest update yet! Search is now nearly instant (it used to take over 10 seconds), search operators can be combined (like f&gt;=12 f&lt;=15 or f&lt;=300 a), and the crawler is faster than ever.</p>
     <p>[Sep29] v2.1 - Way faster crawler! Parallel fetching, smarter queuing, and already bigger than ScratchViews's list.</p>
     <p>[Sep28] v2.0 - Search, a better way to crawl users, FAQ and a new UI!</p>
