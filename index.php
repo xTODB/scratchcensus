@@ -72,6 +72,7 @@ th { color: #999; font-size: 0.85rem; }
 .delta { font-weight: 600; font-size: 0.85em; margin-right: 0.4rem; }
 .delta.up { color: #4cd964; }
 .delta.down { color: #ff5c5c; }
+.delta.zero { color: #888; }
 a { color: #ffaa33; }
 .flash { margin-top: 1rem; padding: 0.6rem 0.9rem; border-radius: 6px; background: #2a2d31; border: 1px solid #444; }
 .control-row { display: flex; gap: 0.5rem; margin-top: 1rem; flex-wrap: wrap; }
@@ -164,7 +165,7 @@ a { color: #ffaa33; }
             <tr>
                 <td class="rank">#<?= (int)$s['rank'] ?></td>
                 <td><a href="https://scratch.mit.edu/users/<?= e($s['username']) ?>/" target="_blank" rel="noopener"><?= e($s['username']) ?></a></td>
-                <td class="count"><?php $d = (int)($s['delta'] ?? 0); if ($d !== 0): ?><span class="delta <?= $d > 0 ? 'up' : 'down' ?>"><?= $d > 0 ? '+' : '-' ?><?= number_format(abs($d)) ?></span> <?php endif; ?><?= number_format((int)$s['follower_count']) ?></td>
+                <td class="count"><?php $d = $s['delta'] ?? null; if ($d !== null): $d = (int)$d; ?><span class="delta <?= $d > 0 ? 'up' : ($d < 0 ? 'down' : 'zero') ?>"><?= $d < 0 ? '-' : '+' ?><?= number_format(abs($d)) ?></span> <?php endif; ?><?= number_format((int)$s['follower_count']) ?></td>
             </tr>
             <?php endforeach; ?>
         </tbody>
