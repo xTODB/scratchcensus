@@ -68,7 +68,7 @@ table { width: 100%; border-collapse: collapse; margin-top: 1.5rem; }
 th, td { text-align: left; padding: 0.5rem 0.7rem; border-bottom: 1px solid #333; }
 th { color: #999; font-size: 0.85rem; }
 .rank { color: #999; width: 3rem; }
-.count { text-align: right; }
+.count { text-align: right; white-space: nowrap; }
 .delta { font-weight: 600; font-size: 0.85em; margin-right: 0.4rem; }
 .delta.up { color: #4cd964; }
 .delta.down { color: #ff5c5c; }
