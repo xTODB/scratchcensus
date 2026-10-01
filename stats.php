@@ -10,6 +10,13 @@ if (!hash_equals(CRON_SECRET, $_GET['key'] ?? '')) {
     exit;
 }
 
+// Start the top-user refresh over from the beginning: every top user becomes due.
+if (isset($_GET['reindex'])) {
+    $n = reindexTopUsers();
+    header('Location: ?key=' . rawurlencode($_GET['key']) . '&reindexed=' . $n);
+    exit;
+}
+
 // Discovery settings form. Post/redirect/get so a refresh doesn't resubmit.
 if ($_SERVER['REQUEST_METHOD'] === 'POST') {
     $locked = loadAdminSettings();
@@ -82,13 +89,14 @@ button { margin-top: 1rem; padding: 0.5rem 1rem; border-radius: 6px; border: non
 <body>
     <h1>ScratchCensus Stats</h1>
     <p class="sub"><a href="/s/census/">&larr; Back to ScratchCensus</a></p>
+    <?php if (isset($_GET['reindexed'])): ?><p class="note">Reindex started: <?= number_format((int)$_GET['reindexed']) ?> users are now due for a refresh.</p><?php endif; ?>
     <table>
         <tr><th>Total rows</th><td class="num"><?= number_format($total) ?></td></tr>
         <tr><th>Fetched</th><td class="num"><?= number_format($counts['fetched']) ?></td></tr>
         <tr><th>Pending</th><td class="num"><?= number_format($counts['pending']) ?></td></tr>
         <tr><th>Error (account gone)</th><td class="num"><?= number_format($counts['error'] - $gaveUp) ?></td></tr>
         <tr><th>Error (gave up after retries)</th><td class="num"><?= number_format($gaveUp) ?></td></tr>
-        <tr><th>Refresh due (top <?= number_format(REFRESH_TOP_N) ?>)</th><td class="num"><?= number_format($refreshDue) ?></td></tr>
+        <tr><th>Refresh due (top <?= number_format(REFRESH_TOP_N) ?>)</th><td class="num"><?= number_format($refreshDue) ?><br><a href="?key=<?= e(rawurlencode($_GET['key'])) ?>&amp;reindex=1">reindex from 0</a></td></tr>
         <tr><th>Not yet mined</th><td class="num"><?= number_format($unmined) ?></td></tr>
         <tr><th>Discovery</th><td class="num"><?= !DISCOVERY_ENABLED ? 'OFF (DISCOVERY_ENABLED is false)' : ($discoveryOn ? 'on' : 'paused (queue over ' . number_format(DISCOVERY_PAUSE_PENDING) . ')') ?></td></tr>
         <tr><th>Last crawled</th><td class="num"><?= $lastCrawled ? e($lastCrawled) : 'never' ?></td></tr>
