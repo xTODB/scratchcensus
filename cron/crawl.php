@@ -51,7 +51,7 @@ try {
 
     echo "Processed {$processed} scratcher(s) in " . number_format($elapsed, 1) . "s"
         . ($rate > 0 ? " (" . number_format($rate, 2) . "/s)" : "") . ".\n";
-    echo "fetched={$s['fetched']} errors={$s['errors']} retried={$s['retried']} queued={$s['queued']} remined={$s['remined']}\n";
+    echo "fetched={$s['fetched']} errors={$s['errors']} retried={$s['retried']} queued={$s['queued']} remined={$s['remined']} refreshed={$s['refreshed']} requeued={$s['requeued']}\n";
     echo "pending in queue: {$pending}\n";
     $hv = httpVersionSeen();
     $hvName = $hv === 0 ? 'n/a' : (defined('CURL_HTTP_VERSION_2_0') && $hv === CURL_HTTP_VERSION_2_0 ? 'HTTP/2' : 'HTTP/1.x');
