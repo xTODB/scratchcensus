@@ -35,6 +35,8 @@ while ($row = $res->fetch_assoc()) {
 $total = array_sum($counts);
 
 $discoveryOn = discoveryAllowed($counts['pending']);
+$gaveUp = (int)$db->query("SELECT COUNT(*) AS c FROM scratchers WHERE status = 'error' AND retries >= " . (int)CRAWL_MAX_RETRIES)->fetch_assoc()['c'];
+$refreshDue = (int)$db->query("SELECT COUNT(*) AS c FROM scratchers WHERE status = 'fetched' AND follower_count >= " . max(1, refreshThreshold()) . " AND checked_at < DATE_SUB(NOW(), INTERVAL " . (int)REFRESH_INTERVAL_HOURS . " HOUR)")->fetch_assoc()['c'];
 $unmined = (int)$db->query("SELECT COUNT(*) AS c FROM scratchers WHERE status = 'fetched' AND discovered = 0 AND follower_count >= " . (int)DISCOVER_FOLLOWING_MIN)->fetch_assoc()['c'];
 $lastCrawled = $db->query("SELECT MAX(checked_at) AS t FROM scratchers")->fetch_assoc()['t'];
 $topRow = $db->query("SELECT username, follower_count FROM scratchers WHERE status = 'fetched' ORDER BY follower_count DESC, username ASC LIMIT 1")->fetch_assoc();
@@ -84,7 +86,9 @@ button { margin-top: 1rem; padding: 0.5rem 1rem; border-radius: 6px; border: non
         <tr><th>Total rows</th><td class="num"><?= number_format($total) ?></td></tr>
         <tr><th>Fetched</th><td class="num"><?= number_format($counts['fetched']) ?></td></tr>
         <tr><th>Pending</th><td class="num"><?= number_format($counts['pending']) ?></td></tr>
-        <tr><th>Error</th><td class="num"><?= number_format($counts['error']) ?></td></tr>
+        <tr><th>Error (account gone)</th><td class="num"><?= number_format($counts['error'] - $gaveUp) ?></td></tr>
+        <tr><th>Error (gave up after retries)</th><td class="num"><?= number_format($gaveUp) ?></td></tr>
+        <tr><th>Refresh due (top <?= number_format(REFRESH_TOP_N) ?>)</th><td class="num"><?= number_format($refreshDue) ?></td></tr>
         <tr><th>Not yet mined</th><td class="num"><?= number_format($unmined) ?></td></tr>
         <tr><th>Discovery</th><td class="num"><?= !DISCOVERY_ENABLED ? 'OFF (DISCOVERY_ENABLED is false)' : ($discoveryOn ? 'on' : 'paused (queue over ' . number_format(DISCOVERY_PAUSE_PENDING) . ')') ?></td></tr>
         <tr><th>Last crawled</th><td class="num"><?= $lastCrawled ? e($lastCrawled) : 'never' ?></td></tr>
