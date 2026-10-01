@@ -50,6 +50,7 @@ defined('DISCOVER_FOLLOWING_MIN')     || define('DISCOVER_FOLLOWING_MIN', 5);  /
 defined('DISCOVERY_ENABLED')          || define('DISCOVERY_ENABLED', true);    // master switch. false = never discover, count-only fetches always. Override in config.php: define('DISCOVERY_ENABLED', false);
 defined('DISCOVERY_PAUSE_PENDING')    || define('DISCOVERY_PAUSE_PENDING', 10000); // pause discovery whenever this many rows are pending (resumes by itself once the queue drops below it). 0 = NO CAP: discovery runs no matter how long the queue is. Only applies while DISCOVERY_ENABLED is true
 defined('DISCOVER_PAGE_SIZE')          || define('DISCOVER_PAGE_SIZE', 40);        // names per API request (Scratch's max; was 20, so every request now returns twice as many)
+defined('COUNT_EARLY_ABORT')          || define('COUNT_EARLY_ABORT', true);   // stop downloading a followers page once "Followers (N)" has arrived. false = download the whole page
 defined('REMINE_CHUNK_SIZE')          || define('REMINE_CHUNK_SIZE', 20);     // fetched users re-mined per round when the queue is empty (see remineChunk). Big accounts cost up to ~20 requests each, so keep a round short enough to stay inside the web server's timeout
 defined('DISCOVER_FOLLOWERS_MAX_PAGES')|| define('DISCOVER_FOLLOWERS_MAX_PAGES', 10); // up to 200 followers per user (was 40). Also capped by the user's real follower count, so small accounts never cost a wasted request
 defined('DISCOVER_FOLLOWING_MAX_PAGES')|| define('DISCOVER_FOLLOWING_MAX_PAGES', 10); // up to 200 followed accounts per user (was 40)
@@ -77,10 +78,13 @@ function newCurlHandle(string $url) {
 // starts spaced CRAWL_REQUEST_GAP apart). $urls is key => url.
 // Returns ['results' => key => ['code' => int, 'body' => ?string],
 //          'rate_limited' => bool].
+// $stopPattern (a regex): when COUNT_EARLY_ABORT is on, a transfer is cut off
+// as soon as the body so far matches it, and the partial body is returned as a
+// normal result. Only meant for the followers HTML page.
 // code 0 = network error/timeout. A 429 stops any not-yet-started requests:
 // their keys are simply missing from 'results' (caller treats that as "not
 // attempted", not as a failure).
-function httpMultiGet(array $urls): array {
+function httpMultiGet(array $urls, ?string $stopPattern = null): array {
     $results = [];
     $rateLimited = false;
     if (!$urls) return ['results' => $results, 'rate_limited' => false];
@@ -99,6 +103,9 @@ function httpMultiGet(array $urls): array {
     $total = count($keys);
     $next = 0;
     $handles = []; // spl_object_id => [handle, key]
+    $bufs = [];    // spl_object_id => body so far (only when $stopPattern is used)
+    $aborted = []; // spl_object_id => true once the pattern matched
+    $stop = $stopPattern !== null && COUNT_EARLY_ABORT;
     $lastStart = 0.0;
 
     while (true) {
@@ -108,8 +115,22 @@ function httpMultiGet(array $urls): array {
             $lastStart = microtime(true);
             $key = $keys[$next++];
             $ch = newCurlHandle($urls[$key]);
+            $hid = spl_object_id($ch);
+            if ($stop) {
+                $bufs[$hid] = '';
+                curl_setopt($ch, CURLOPT_WRITEFUNCTION, function ($c, $data) use (&$bufs, &$aborted, $hid, $stopPattern) {
+                    // test the new data plus a little of the old, in case the match straddles two chunks
+                    $tail = substr($bufs[$hid], -64);
+                    $bufs[$hid] .= $data;
+                    if (preg_match($stopPattern, $tail . $data)) {
+                        $aborted[$hid] = true;
+                        return 0; // makes curl abort with a write error
+                    }
+                    return strlen($data);
+                });
+            }
             curl_multi_add_handle($mh, $ch);
-            $handles[spl_object_id($ch)] = [$ch, $key];
+            $handles[$hid] = [$ch, $key];
         }
         if (!$handles) break;
 
@@ -122,20 +143,34 @@ function httpMultiGet(array $urls): array {
             $ch = $info['handle'];
             $id = spl_object_id($ch);
             $key = $handles[$id][1];
-            if ($info['result'] === CURLE_OK) {
+            if ($info['result'] === CURLE_OK || isset($aborted[$id])) {
                 $code = (int)curl_getinfo($ch, CURLINFO_HTTP_CODE);
-                $results[$key] = ['code' => $code, 'body' => curl_multi_getcontent($ch)];
+                httpVersionSeen((int)curl_getinfo($ch, CURLINFO_HTTP_VERSION));
+                $body = isset($bufs[$id]) ? $bufs[$id] : curl_multi_getcontent($ch);
+                $results[$key] = ['code' => $code, 'body' => $body];
                 if ($code === 429) $rateLimited = true;
             } else {
                 $results[$key] = ['code' => 0, 'body' => null];
             }
             curl_multi_remove_handle($mh, $ch);
             curl_close($ch);
-            unset($handles[$id]);
+            unset($handles[$id], $bufs[$id], $aborted[$id]);
         }
     }
     return ['results' => $results, 'rate_limited' => $rateLimited];
 }
+
+// Last HTTP version curl negotiated (CURL_HTTP_VERSION_* value), 0 if none yet.
+// cron/crawl.php prints it: early abort keeps the connection alive on HTTP/2
+// but costs a reconnect per request on HTTP/1.1.
+function httpVersionSeen(?int $set = null): int {
+    static $v = 0;
+    if ($set !== null && $set > 0) $v = $set;
+    return $v;
+}
+
+// The pattern parseFollowerCount() looks for; also used to cut the download short.
+const FOLLOWER_COUNT_PATTERN = '/Followers\s*\((\d+)\)/i';
 
 function followersPageUrl(string $username): string {
     return 'https://scratch.mit.edu/users/' . rawurlencode($username) . '/followers/';
@@ -145,7 +180,7 @@ function followersPageUrl(string $username): string {
 // includes "Followers (<N>)" in the tab heading - one request regardless of
 // how many followers the user has. Same trick scratchattach uses.
 function parseFollowerCount(?string $html): ?int {
-    if ($html !== null && preg_match('/Followers\s*\((\d+)\)/i', $html, $m)) {
+    if ($html !== null && preg_match(FOLLOWER_COUNT_PATTERN, $html, $m)) {
         return (int)$m[1];
     }
     return null;
@@ -444,7 +479,7 @@ function crawlChunk(array $claim, array &$stats, bool $discover = true): array {
     $rows = $claim['rows'];
     $urls = [];
     foreach ($rows as $row) $urls[$row['id']] = followersPageUrl($row['username']);
-    $r = httpMultiGet($urls);
+    $r = httpMultiGet($urls, FOLLOWER_COUNT_PATTERN);
     $rateLimited = $r['rate_limited'];
 
     $done = 0;
@@ -810,7 +845,7 @@ function crawlSingleUsername(string $username): array {
     queueUsername($username); // ensures a row exists if this is a brand new username
     $db = getDB();
 
-    $r = httpMultiGet(['c' => followersPageUrl($username)]);
+    $r = httpMultiGet(['c' => followersPageUrl($username)], FOLLOWER_COUNT_PATTERN);
     $res = $r['results']['c'] ?? ['code' => 0, 'body' => null];
     $count = $res['code'] === 200 ? parseFollowerCount($res['body']) : null;
 
