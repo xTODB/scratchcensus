@@ -10,6 +10,21 @@ if (!hash_equals(CRON_SECRET, $_GET['key'] ?? '')) {
     exit;
 }
 
+// Discovery settings form. Post/redirect/get so a refresh doesn't resubmit.
+if ($_SERVER['REQUEST_METHOD'] === 'POST') {
+    $locked = loadAdminSettings();
+    $save = getDB()->prepare("INSERT INTO census_settings (k, v) VALUES (?, ?) ON DUPLICATE KEY UPDATE v = VALUES(v)");
+    foreach (ADMIN_SETTINGS as $k => [$label, $lo, $hi]) {
+        if (isset($locked[$k]) || !isset($_POST[$k]) || !preg_match('/^\d{1,7}$/', (string)$_POST[$k])) continue;
+        $v = (string)max($lo, min($hi, (int)$_POST[$k]));
+        $save->bind_param('ss', $k, $v);
+        $save->execute();
+    }
+    $save->close();
+    header('Location: ?key=' . rawurlencode($_GET['key']) . '&saved=1');
+    exit;
+}
+
 $db = getDB();
 
 $counts = ['pending' => 0, 'fetched' => 0, 'error' => 0];
@@ -56,6 +71,10 @@ th { color: #999; font-weight: normal; }
 td.num { text-align: right; }
 a { color: #ffaa33; }
 h2 { margin: 2rem 0 0; font-size: 1.2rem; }
+input[type="number"] { width: 6rem; padding: 0.3rem; border-radius: 6px; border: 1px solid #444; background: #1e2023; color: #eee; text-align: right; }
+input:disabled { opacity: 0.5; }
+button { margin-top: 1rem; padding: 0.5rem 1rem; border-radius: 6px; border: none; background: #ffaa33; color: #17191c; font-weight: bold; font-size: 1rem; cursor: pointer; }
+.note { color: #888; font-size: 0.85rem; }
 </style>
 </head>
 <body>
@@ -67,12 +86,26 @@ h2 { margin: 2rem 0 0; font-size: 1.2rem; }
         <tr><th>Pending</th><td class="num"><?= number_format($counts['pending']) ?></td></tr>
         <tr><th>Error</th><td class="num"><?= number_format($counts['error']) ?></td></tr>
         <tr><th>Not yet mined</th><td class="num"><?= number_format($unmined) ?></td></tr>
-        <tr><th>Discovery</th><td class="num"><?= $discoveryOn ? 'on' : 'paused (queue over ' . number_format(DISCOVERY_PAUSE_PENDING) . ')' ?></td></tr>
+        <tr><th>Discovery</th><td class="num"><?= !DISCOVERY_ENABLED ? 'OFF (DISCOVERY_ENABLED is false)' : ($discoveryOn ? 'on' : 'paused (queue over ' . number_format(DISCOVERY_PAUSE_PENDING) . ')') ?></td></tr>
         <tr><th>Last crawled</th><td class="num"><?= $lastCrawled ? e($lastCrawled) : 'never' ?></td></tr>
         <?php if ($topRow): ?>
         <tr><th>Top user</th><td class="num"><?= e($topRow['username']) ?> (<?= number_format((int)$topRow['follower_count']) ?>)</td></tr>
         <?php endif; ?>
     </table>
+
+    <h2>Discovery settings</h2>
+    <form method="post" action="?key=<?= e(rawurlencode($_GET['key'])) ?>">
+        <table>
+            <?php $locked = loadAdminSettings(); foreach (ADMIN_SETTINGS as $k => [$label, $lo, $hi]): ?>
+            <tr>
+                <th><label for="<?= e($k) ?>"><?= e($label) ?></label></th>
+                <td class="num"><input type="number" id="<?= e($k) ?>" name="<?= e($k) ?>" value="<?= (int)constant($k) ?>" min="<?= $lo ?>" max="<?= $hi ?>"<?= isset($locked[$k]) ? ' disabled' : '' ?>><?= isset($locked[$k]) ? '<br><span class="note">set in config.php</span>' : '' ?></td>
+            </tr>
+            <?php endforeach; ?>
+        </table>
+        <button type="submit">Save</button> <?= isset($_GET['saved']) ? 'Saved.' : '' ?>
+        <p class="note">Applies from the next cron run. Users already mined are not re-mined with new values.</p>
+    </form>
 
     <h2>Studios</h2>
     <table>
