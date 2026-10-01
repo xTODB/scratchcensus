@@ -51,7 +51,7 @@ try {
 
     echo "Processed {$processed} scratcher(s) in " . number_format($elapsed, 1) . "s"
         . ($rate > 0 ? " (" . number_format($rate, 2) . "/s)" : "") . ".\n";
-    echo "fetched={$s['fetched']} errors={$s['errors']} retried={$s['retried']} queued={$s['queued']}\n";
+    echo "fetched={$s['fetched']} errors={$s['errors']} retried={$s['retried']} queued={$s['queued']} remined={$s['remined']}\n";
     echo "pending in queue: {$pending}\n";
     if (!DISCOVERY_ENABLED) {
         echo "discovery: OFF (DISCOVERY_ENABLED is false), count-only\n";
