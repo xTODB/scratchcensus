@@ -53,6 +53,9 @@ try {
         . ($rate > 0 ? " (" . number_format($rate, 2) . "/s)" : "") . ".\n";
     echo "fetched={$s['fetched']} errors={$s['errors']} retried={$s['retried']} queued={$s['queued']} remined={$s['remined']}\n";
     echo "pending in queue: {$pending}\n";
+    $hv = httpVersionSeen();
+    $hvName = $hv === 0 ? 'n/a' : (defined('CURL_HTTP_VERSION_2_0') && $hv === CURL_HTTP_VERSION_2_0 ? 'HTTP/2' : 'HTTP/1.x');
+    echo "count fetch: early abort " . (COUNT_EARLY_ABORT ? "on" : "off") . ", {$hvName}\n";
     if (!DISCOVERY_ENABLED) {
         echo "discovery: OFF (DISCOVERY_ENABLED is false), count-only\n";
     } else {
