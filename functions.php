@@ -50,6 +50,12 @@ defined('DISCOVER_FOLLOWING_MIN')     || define('DISCOVER_FOLLOWING_MIN', 5);  /
 defined('DISCOVERY_ENABLED')          || define('DISCOVERY_ENABLED', true);    // master switch. false = never discover, count-only fetches always. Override in config.php: define('DISCOVERY_ENABLED', false);
 defined('DISCOVERY_PAUSE_PENDING')    || define('DISCOVERY_PAUSE_PENDING', 10000); // pause discovery whenever this many rows are pending (resumes by itself once the queue drops below it). 0 = NO CAP: discovery runs no matter how long the queue is. Only applies while DISCOVERY_ENABLED is true
 defined('DISCOVER_PAGE_SIZE')          || define('DISCOVER_PAGE_SIZE', 40);        // names per API request (Scratch's max; was 20, so every request now returns twice as many)
+defined('REFRESH_ENABLED')            || define('REFRESH_ENABLED', true);     // re-crawl the top users so the leaderboard can show follower changes
+defined('REFRESH_TOP_N')              || define('REFRESH_TOP_N', 10000);      // how many of the biggest users get refreshed
+defined('REFRESH_INTERVAL_HOURS')     || define('REFRESH_INTERVAL_HOURS', 24); // a user is due again this long after their last check
+defined('REFRESH_PER_RUN')            || define('REFRESH_PER_RUN', 60);       // refreshes per cron run (10,000 a day needs only ~7 per minute)
+defined('REQUEUE_ERRORS_PER_RUN')     || define('REQUEUE_ERRORS_PER_RUN', 20); // gave-up rows put back in the queue per cron run
+defined('REQUEUE_ERRORS_AFTER_HOURS') || define('REQUEUE_ERRORS_AFTER_HOURS', 6); // ...once their last failure is this old
 defined('COUNT_EARLY_ABORT')          || define('COUNT_EARLY_ABORT', true);   // stop downloading a followers page once "Followers (N)" has arrived. false = download the whole page
 defined('REMINE_CHUNK_SIZE')          || define('REMINE_CHUNK_SIZE', 20);     // fetched users re-mined per round when the queue is empty (see remineChunk). Big accounts cost up to ~20 requests each, so keep a round short enough to stay inside the web server's timeout
 defined('DISCOVER_FOLLOWERS_MAX_PAGES')|| define('DISCOVER_FOLLOWERS_MAX_PAGES', 10); // up to 200 followers per user (was 40). Also capped by the user's real follower count, so small accounts never cost a wasted request
@@ -393,6 +399,113 @@ function releaseClaim(string $token): void {
     $stmt->close();
 }
 
+// ---- Top-user refresh. Users are normally crawled once; the biggest
+// REFRESH_TOP_N get re-crawled once REFRESH_INTERVAL_HOURS have passed since
+// their last check, and the change is stored in follower_delta (new - old, 0 if
+// unchanged) for the leaderboard's "+3" / "-6". A delta is only shown for 2 days
+// after the check that produced it (see the IF() in the SELECTs).
+
+// follower_count of the REFRESH_TOP_N-th biggest user (0 if there are fewer).
+function refreshThreshold(): int {
+    static $t = null;
+    if ($t !== null) return $t;
+    $off = max(0, REFRESH_TOP_N - 1);
+    $stmt = getDB()->prepare("SELECT follower_count FROM scratchers WHERE status = 'fetched' ORDER BY follower_count DESC LIMIT 1 OFFSET ?");
+    $stmt->bind_param('i', $off);
+    $stmt->execute();
+    $row = $stmt->get_result()->fetch_assoc();
+    $stmt->close();
+    return $t = $row ? (int)$row['follower_count'] : 0;
+}
+
+function claimRefreshRows(int $n): array {
+    $db = getDB();
+    $token = bin2hex(random_bytes(8));
+    $ttl = CRAWL_CLAIM_TTL_SEC;
+    $hours = REFRESH_INTERVAL_HOURS;
+    $min = max(1, refreshThreshold());
+    $stmt = $db->prepare("UPDATE scratchers SET claim_token = ?, claimed_at = NOW()
+        WHERE status = 'fetched' AND follower_count >= ?
+          AND checked_at < DATE_SUB(NOW(), INTERVAL ? HOUR)
+          AND (claim_token IS NULL OR claimed_at < DATE_SUB(NOW(), INTERVAL ? SECOND))
+        ORDER BY follower_count DESC, id ASC LIMIT ?");
+    $stmt->bind_param('siiii', $token, $min, $hours, $ttl, $n);
+    $stmt->execute();
+    $stmt->close();
+
+    $stmt = $db->prepare("SELECT id, username, follower_count FROM scratchers WHERE claim_token = ? AND status = 'fetched'");
+    $stmt->bind_param('s', $token);
+    $stmt->execute();
+    $rows = $stmt->get_result()->fetch_all(MYSQLI_ASSOC);
+    $stmt->close();
+    return ['token' => $token, 'rows' => $rows];
+}
+
+// One round of refreshing. Counts that come back are stored with their change;
+// a user whose page fails (404, odd page, timeout) just has checked_at moved so
+// it is tried again next interval and doesn't block the queue. A 429 leaves
+// everything alone. Returns ['claimed' => int, 'rate_limited' => bool].
+function refreshChunk(array &$stats): array {
+    $claim = claimRefreshRows(REFRESH_PER_RUN);
+    if (!$claim['rows']) return ['claimed' => 0, 'rate_limited' => false];
+
+    $urls = [];
+    foreach ($claim['rows'] as $row) $urls[$row['id']] = followersPageUrl($row['username']);
+    $r = httpMultiGet($urls, FOLLOWER_COUNT_PATTERN);
+
+    $db = getDB();
+    $ok = $db->prepare("UPDATE scratchers SET follower_delta = ?, follower_count = ?, checked_at = NOW(), claim_token = NULL, claimed_at = NULL WHERE id = ?");
+    $skip = $db->prepare("UPDATE scratchers SET checked_at = NOW(), claim_token = NULL, claimed_at = NULL WHERE id = ?");
+    foreach ($claim['rows'] as $row) {
+        $id = (int)$row['id'];
+        $res = $r['results'][$id] ?? null;
+        if ($res === null || $res['code'] === 429) continue; // not attempted / rate limited: released below
+        $count = $res['code'] === 200 ? parseFollowerCount($res['body']) : null;
+        if ($count !== null) {
+            $delta = $count - (int)$row['follower_count'];
+            $ok->bind_param('iii', $delta, $count, $id);
+            $ok->execute();
+            $stats['refreshed']++;
+        } else {
+            $skip->bind_param('i', $id);
+            $skip->execute();
+        }
+    }
+    $ok->close();
+    $skip->close();
+
+    // anything still carrying our token was never attempted: free it
+    $stmt = $db->prepare("UPDATE scratchers SET claim_token = NULL, claimed_at = NULL WHERE claim_token = ?");
+    $stmt->bind_param('s', $claim['token']);
+    $stmt->execute();
+    $stmt->close();
+    return ['claimed' => count($claim['rows']), 'rate_limited' => $r['rate_limited']];
+}
+
+// Rows that gave up after CRAWL_MAX_RETRIES transient failures (timeouts, 5xx,
+// odd pages) sit in 'error' with claim_token 'retry' and claimed_at = their last
+// failure. Put a few back in the queue now and then. One more failure sends a
+// row straight back to 'error' (retries is set one below the limit), so a
+// stubborn row costs one request per REQUEUE_ERRORS_AFTER_HOURS. 404 rows
+// (deleted accounts) have retries below the limit and are left alone.
+function requeueErrors(): int {
+    if (REQUEUE_ERRORS_PER_RUN <= 0) return 0;
+    $db = getDB();
+    $max = CRAWL_MAX_RETRIES;
+    $keep = max(0, $max - 1);
+    $hours = REQUEUE_ERRORS_AFTER_HOURS;
+    $n = REQUEUE_ERRORS_PER_RUN;
+    $stmt = $db->prepare("UPDATE scratchers SET status = 'pending', retries = ?, claim_token = NULL, claimed_at = NULL
+        WHERE status = 'error' AND retries >= ? AND claim_token = 'retry'
+          AND claimed_at < DATE_SUB(NOW(), INTERVAL ? HOUR)
+        ORDER BY claimed_at ASC LIMIT ?");
+    $stmt->bind_param('iiii', $keep, $max, $hours, $n);
+    $stmt->execute();
+    $count = $stmt->affected_rows;
+    $stmt->close();
+    return max(0, $count);
+}
+
 // discovered = 1 means this user's followers/following have been mined.
 function markDiscovered(array $ids): void {
     if (!$ids) return;
@@ -466,7 +579,7 @@ function remineChunk(array &$stats): array {
 
 // Last run's numbers, for cron/crawl.php's text output.
 function crawlStats(?array $set = null): array {
-    static $s = ['fetched' => 0, 'errors' => 0, 'retried' => 0, 'queued' => 0, 'remined' => 0, 'rate_limited' => false, 'discovery' => true, 'pending_at_start' => 0];
+    static $s = ['fetched' => 0, 'errors' => 0, 'retried' => 0, 'queued' => 0, 'remined' => 0, 'refreshed' => 0, 'requeued' => 0, 'rate_limited' => false, 'discovery' => true, 'pending_at_start' => 0];
     if ($set !== null) $s = $set;
     return $s;
 }
@@ -542,12 +655,20 @@ function crawlBatch(int $limit, int $budgetSec = CRAWL_TIME_BUDGET_SEC): int {
     // the queue drains mid-batch. 'discovery' in the stats means "at least one
     // round ran with it on".
     $pending = (int)getDB()->query("SELECT COUNT(*) AS c FROM scratchers WHERE status = 'pending'")->fetch_assoc()['c'];
-    $stats = ['fetched' => 0, 'errors' => 0, 'retried' => 0, 'queued' => 0, 'remined' => 0, 'rate_limited' => false,
+    $stats = ['fetched' => 0, 'errors' => 0, 'retried' => 0, 'queued' => 0, 'remined' => 0, 'refreshed' => 0, 'requeued' => 0, 'rate_limited' => false,
               'discovery' => false, 'pending_at_start' => $pending];
     $processed = 0;
     $first = true;
 
-    while ($processed < $limit && (microtime(true) - $start) < $budgetSec) {
+    // Housekeeping before the queue: put a few gave-up rows back, then refresh
+    // a slice of the biggest users (each at most once per REFRESH_INTERVAL_HOURS).
+    $stats['requeued'] = requeueErrors();
+    if (REFRESH_ENABLED) {
+        $f = refreshChunk($stats);
+        if ($f['rate_limited']) $stats['rate_limited'] = true;
+    }
+
+    while ($processed < $limit && !$stats['rate_limited'] && (microtime(true) - $start) < $budgetSec) {
         if (!$first && DISCOVERY_PAUSE_PENDING > 0) { // no cap = no need to recount every round
             $pending = (int)getDB()->query("SELECT COUNT(*) AS c FROM scratchers WHERE status = 'pending'")->fetch_assoc()['c'];
         }
@@ -588,7 +709,7 @@ function getScratcherCount(): int {
 function getScratchersPage(int $page, int $perPage = 100): array {
     $db = getDB();
     $offset = ($page - 1) * $perPage;
-    $stmt = $db->prepare("SELECT username, follower_count, checked_at FROM scratchers WHERE status = 'fetched' ORDER BY follower_count DESC, username ASC LIMIT ? OFFSET ?");
+    $stmt = $db->prepare("SELECT username, follower_count, checked_at, IF(checked_at >= DATE_SUB(NOW(), INTERVAL 2 DAY), follower_delta, 0) AS delta FROM scratchers WHERE status = 'fetched' ORDER BY follower_count DESC, username ASC LIMIT ? OFFSET ?");
     $stmt->bind_param('ii', $perPage, $offset);
     $stmt->execute();
     $rows = $stmt->get_result()->fetch_all(MYSQLI_ASSOC);
@@ -669,13 +790,16 @@ function attachCheckedAt(array &$rows): void {
     $names = array_column($rows, 'username');
     $db = getDB();
     $in = implode(',', array_fill(0, count($names), '?'));
-    $stmt = $db->prepare("SELECT username, checked_at FROM scratchers WHERE username IN ($in)");
+    $stmt = $db->prepare("SELECT username, checked_at, IF(checked_at >= DATE_SUB(NOW(), INTERVAL 2 DAY), follower_delta, 0) AS delta FROM scratchers WHERE username IN ($in)");
     $stmt->bind_param(str_repeat('s', count($names)), ...$names);
     $stmt->execute();
     $map = [];
-    foreach ($stmt->get_result()->fetch_all(MYSQLI_ASSOC) as $r) $map[$r['username']] = $r['checked_at'];
+    foreach ($stmt->get_result()->fetch_all(MYSQLI_ASSOC) as $r) $map[$r['username']] = $r;
     $stmt->close();
-    foreach ($rows as &$row) $row['checked_at'] = $map[$row['username']] ?? null;
+    foreach ($rows as &$row) {
+        $row['checked_at'] = $map[$row['username']]['checked_at'] ?? null;
+        $row['delta'] = (int)($map[$row['username']]['delta'] ?? 0);
+    }
     unset($row);
 }
 
@@ -782,7 +906,7 @@ function searchScratchersAdvanced(array $conds, string $text, int $page, int $pe
 // still pending, or errored) so the caller can offer to crawl it.
 function getExactScratcher(string $username): ?array {
     $db = getDB();
-    $stmt = $db->prepare("SELECT username, follower_count, checked_at
+    $stmt = $db->prepare("SELECT username, follower_count, checked_at, IF(checked_at >= DATE_SUB(NOW(), INTERVAL 2 DAY), follower_delta, 0) AS delta
         FROM scratchers WHERE status = 'fetched' AND username = ?");
     $stmt->bind_param('s', $username);
     $stmt->execute();
