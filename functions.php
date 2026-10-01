@@ -53,7 +53,7 @@ defined('DISCOVER_PAGE_SIZE')          || define('DISCOVER_PAGE_SIZE', 40);     
 defined('REFRESH_ENABLED')            || define('REFRESH_ENABLED', true);     // re-crawl the top users so the leaderboard can show follower changes
 defined('REFRESH_TOP_N')              || define('REFRESH_TOP_N', 10000);      // how many of the biggest users get refreshed
 defined('REFRESH_INTERVAL_HOURS')     || define('REFRESH_INTERVAL_HOURS', 24); // a user is due again this long after their last check
-defined('REFRESH_PER_RUN')            || define('REFRESH_PER_RUN', 60);       // refreshes per cron run (10,000 a day needs only ~7 per minute)
+defined('REFRESH_TIME_SHARE')         || define('REFRESH_TIME_SHARE', 0.6);   // up to this share of a cron run's time budget goes to refreshing due users first; the rest to the queue
 defined('REQUEUE_ERRORS_PER_RUN')     || define('REQUEUE_ERRORS_PER_RUN', 20); // gave-up rows put back in the queue per cron run
 defined('REQUEUE_ERRORS_AFTER_HOURS') || define('REQUEUE_ERRORS_AFTER_HOURS', 6); // ...once their last failure is this old
 defined('COUNT_EARLY_ABORT')          || define('COUNT_EARLY_ABORT', true);   // stop downloading a followers page once "Followers (N)" has arrived. false = download the whole page
@@ -445,34 +445,32 @@ function claimRefreshRows(int $n): array {
 // a user whose page fails (404, odd page, timeout) just has checked_at moved so
 // it is tried again next interval and doesn't block the queue. A 429 leaves
 // everything alone. Returns ['claimed' => int, 'rate_limited' => bool].
-function refreshChunk(array &$stats): array {
-    $claim = claimRefreshRows(REFRESH_PER_RUN);
+function refreshChunk(array &$stats, int $n = 60): array {
+    $claim = claimRefreshRows($n);
     if (!$claim['rows']) return ['claimed' => 0, 'rate_limited' => false];
 
     $urls = [];
     foreach ($claim['rows'] as $row) $urls[$row['id']] = followersPageUrl($row['username']);
     $r = httpMultiGet($urls, FOLLOWER_COUNT_PATTERN);
 
-    $db = getDB();
-    $ok = $db->prepare("UPDATE scratchers SET follower_delta = ?, follower_count = ?, checked_at = NOW(), claim_token = NULL, claimed_at = NULL WHERE id = ?");
-    $skip = $db->prepare("UPDATE scratchers SET checked_at = NOW(), claim_token = NULL, claimed_at = NULL WHERE id = ?");
+    // Two queries for the whole chunk (like markFetchedBulk), not one per row.
+    $done = []; // id => [count, delta]
+    $skip = []; // ids
     foreach ($claim['rows'] as $row) {
         $id = (int)$row['id'];
         $res = $r['results'][$id] ?? null;
         if ($res === null || $res['code'] === 429) continue; // not attempted / rate limited: released below
         $count = $res['code'] === 200 ? parseFollowerCount($res['body']) : null;
         if ($count !== null) {
-            $delta = $count - (int)$row['follower_count'];
-            $ok->bind_param('iii', $delta, $count, $id);
-            $ok->execute();
+            $done[$id] = [$count, $count - (int)$row['follower_count']];
             $stats['refreshed']++;
         } else {
-            $skip->bind_param('i', $id);
-            $skip->execute();
+            $skip[] = $id;
         }
     }
-    $ok->close();
-    $skip->close();
+    markRefreshedBulk($done);
+    markCheckedBulk($skip);
+    $db = getDB();
 
     // anything still carrying our token was never attempted: free it
     $stmt = $db->prepare("UPDATE scratchers SET claim_token = NULL, claimed_at = NULL WHERE claim_token = ?");
@@ -480,6 +478,69 @@ function refreshChunk(array &$stats): array {
     $stmt->execute();
     $stmt->close();
     return ['claimed' => count($claim['rows']), 'rate_limited' => $r['rate_limited']];
+}
+
+// $idToPair: id => [new count, change]. One UPDATE via CASE for any number of rows.
+function markRefreshedBulk(array $idToPair): void {
+    if (!$idToPair) return;
+    $caseCount = 'CASE id ';
+    $caseDelta = 'CASE id ';
+    $types = '';
+    $params = [];
+    foreach ($idToPair as $id => [$count, $delta]) {
+        $caseCount .= 'WHEN ? THEN ? ';
+        $types .= 'ii';
+        $params[] = $id;
+        $params[] = $count;
+    }
+    foreach ($idToPair as $id => [$count, $delta]) {
+        $caseDelta .= 'WHEN ? THEN ? ';
+        $types .= 'ii';
+        $params[] = $id;
+        $params[] = $delta;
+    }
+    $caseCount .= 'END';
+    $caseDelta .= 'END';
+    $ids = array_keys($idToPair);
+    $inClause = implode(',', array_fill(0, count($ids), '?'));
+    $types .= str_repeat('i', count($ids));
+    $params = array_merge($params, $ids);
+    $stmt = getDB()->prepare("UPDATE scratchers SET follower_count = $caseCount, follower_delta = $caseDelta,
+        checked_at = NOW(), claim_token = NULL, claimed_at = NULL WHERE id IN ($inClause)");
+    $stmt->bind_param($types, ...$params);
+    $stmt->execute();
+    $stmt->close();
+}
+
+// Pages that failed during a refresh: just move checked_at so they wait a full interval.
+function markCheckedBulk(array $ids): void {
+    if (!$ids) return;
+    $inClause = implode(',', array_fill(0, count($ids), '?'));
+    $stmt = getDB()->prepare("UPDATE scratchers SET checked_at = NOW(), claim_token = NULL, claimed_at = NULL WHERE id IN ($inClause)");
+    $stmt->bind_param(str_repeat('i', count($ids)), ...$ids);
+    $stmt->execute();
+    $stmt->close();
+}
+
+// "Start from 0": make every top user due for a refresh right now. checked_at
+// is pulled back to just past the refresh interval (LEAST, so pressing it twice
+// doesn't push it further back). Returns how many users are now due.
+function reindexTopUsers(): int {
+    $db = getDB();
+    $minutes = REFRESH_INTERVAL_HOURS * 60 + 1;
+    $min = max(1, refreshThreshold());
+    $stmt = $db->prepare("UPDATE scratchers SET checked_at = LEAST(checked_at, DATE_SUB(NOW(), INTERVAL ? MINUTE))
+        WHERE status = 'fetched' AND follower_count >= ?");
+    $stmt->bind_param('ii', $minutes, $min);
+    $stmt->execute();
+    $stmt->close();
+    $stmt = $db->prepare("SELECT COUNT(*) AS c FROM scratchers WHERE status = 'fetched' AND follower_count >= ? AND checked_at < DATE_SUB(NOW(), INTERVAL ? HOUR)");
+    $hours = REFRESH_INTERVAL_HOURS;
+    $stmt->bind_param('ii', $min, $hours);
+    $stmt->execute();
+    $n = (int)$stmt->get_result()->fetch_assoc()['c'];
+    $stmt->close();
+    return $n;
 }
 
 // Rows that gave up after CRAWL_MAX_RETRIES transient failures (timeouts, 5xx,
@@ -664,8 +725,14 @@ function crawlBatch(int $limit, int $budgetSec = CRAWL_TIME_BUDGET_SEC): int {
     // a slice of the biggest users (each at most once per REFRESH_INTERVAL_HOURS).
     $stats['requeued'] = requeueErrors();
     if (REFRESH_ENABLED) {
-        $f = refreshChunk($stats);
-        if ($f['rate_limited']) $stats['rate_limited'] = true;
+        // Same fetch path and chunk size as the queue, so a refresh runs as fast
+        // as a crawl. Stops when nobody is due, or the time share is used up.
+        $refreshUntil = $start + $budgetSec * REFRESH_TIME_SHARE;
+        while (microtime(true) < $refreshUntil) {
+            $f = refreshChunk($stats, CRAWL_CHUNK_SIZE);
+            if ($f['rate_limited']) { $stats['rate_limited'] = true; break; }
+            if ($f['claimed'] === 0) break;
+        }
     }
 
     while ($processed < $limit && !$stats['rate_limited'] && (microtime(true) - $start) < $budgetSec) {
@@ -700,20 +767,34 @@ function crawlBatch(int $limit, int $budgetSec = CRAWL_TIME_BUDGET_SEC): int {
     return $processed;
 }
 
+// COUNT(*) over half a million rows on every page load adds up when someone
+// pages through the list, so the number is cached for 60 seconds in a temp
+// file. No temp file (or any error) just means counting every time.
 function getScratcherCount(): int {
+    $file = sys_get_temp_dir() . '/scratchcensus_count_' . md5(__DIR__) . '.txt';
+    $raw = @file_get_contents($file);
+    if ($raw !== false && preg_match('/^(\d+) (\d+)$/', $raw, $m) && (time() - (int)$m[2]) < 60) {
+        return (int)$m[1];
+    }
     $db = getDB();
     $result = $db->query("SELECT COUNT(*) AS c FROM scratchers WHERE status = 'fetched'");
-    return (int)$result->fetch_assoc()['c'];
+    $count = (int)$result->fetch_assoc()['c'];
+    @file_put_contents($file, $count . ' ' . time(), LOCK_EX);
+    return $count;
 }
 
 function getScratchersPage(int $page, int $perPage = 100): array {
     $db = getDB();
     $offset = ($page - 1) * $perPage;
-    $stmt = $db->prepare("SELECT username, follower_count, checked_at, IF(checked_at >= DATE_SUB(NOW(), INTERVAL 2 DAY), follower_delta, 0) AS delta FROM scratchers WHERE status = 'fetched' ORDER BY follower_count DESC, username ASC LIMIT ? OFFSET ?");
+    // Index-only (status, follower_count, username): skipping rows for a deep
+    // OFFSET never touches the table. checked_at/delta are then looked up for
+    // just this page's rows, same as the search results do.
+    $stmt = $db->prepare("SELECT username, follower_count FROM scratchers WHERE status = 'fetched' ORDER BY follower_count DESC, username ASC LIMIT ? OFFSET ?");
     $stmt->bind_param('ii', $perPage, $offset);
     $stmt->execute();
     $rows = $stmt->get_result()->fetch_all(MYSQLI_ASSOC);
     $stmt->close();
+    attachCheckedAt($rows);
     return $rows;
 }
 
@@ -790,7 +871,7 @@ function attachCheckedAt(array &$rows): void {
     $names = array_column($rows, 'username');
     $db = getDB();
     $in = implode(',', array_fill(0, count($names), '?'));
-    $stmt = $db->prepare("SELECT username, checked_at, IF(checked_at >= DATE_SUB(NOW(), INTERVAL 2 DAY), follower_delta, 0) AS delta FROM scratchers WHERE username IN ($in)");
+    $stmt = $db->prepare("SELECT username, checked_at, IF(checked_at >= DATE_SUB(NOW(), INTERVAL 2 DAY), follower_delta, NULL) AS delta FROM scratchers WHERE username IN ($in)");
     $stmt->bind_param(str_repeat('s', count($names)), ...$names);
     $stmt->execute();
     $map = [];
@@ -798,7 +879,8 @@ function attachCheckedAt(array &$rows): void {
     $stmt->close();
     foreach ($rows as &$row) {
         $row['checked_at'] = $map[$row['username']]['checked_at'] ?? null;
-        $row['delta'] = (int)($map[$row['username']]['delta'] ?? 0);
+        $d = $map[$row['username']]['delta'] ?? null;
+        $row['delta'] = $d === null ? null : (int)$d; // null = no refresh to show a change for
     }
     unset($row);
 }
@@ -906,7 +988,7 @@ function searchScratchersAdvanced(array $conds, string $text, int $page, int $pe
 // still pending, or errored) so the caller can offer to crawl it.
 function getExactScratcher(string $username): ?array {
     $db = getDB();
-    $stmt = $db->prepare("SELECT username, follower_count, checked_at, IF(checked_at >= DATE_SUB(NOW(), INTERVAL 2 DAY), follower_delta, 0) AS delta
+    $stmt = $db->prepare("SELECT username, follower_count, checked_at, IF(checked_at >= DATE_SUB(NOW(), INTERVAL 2 DAY), follower_delta, NULL) AS delta
         FROM scratchers WHERE status = 'fetched' AND username = ?");
     $stmt->bind_param('s', $username);
     $stmt->execute();
