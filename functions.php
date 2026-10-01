@@ -15,8 +15,9 @@ defined('DISCOVER_FOLLOWING_MIN')     || define('DISCOVER_FOLLOWING_MIN', 5);  /
 defined('DISCOVERY_ENABLED')          || define('DISCOVERY_ENABLED', true);    // master switch. false = never discover, count-only fetches always. Override in config.php: define('DISCOVERY_ENABLED', false);
 defined('DISCOVERY_PAUSE_PENDING')    || define('DISCOVERY_PAUSE_PENDING', 10000); // pause discovery whenever this many rows are pending (resumes by itself once the queue drops below it). 0 = NO CAP: discovery runs no matter how long the queue is. Only applies while DISCOVERY_ENABLED is true
 defined('DISCOVER_PAGE_SIZE')          || define('DISCOVER_PAGE_SIZE', 40);        // names per API request (Scratch's max; was 20, so every request now returns twice as many)
-defined('DISCOVER_FOLLOWERS_MAX_PAGES')|| define('DISCOVER_FOLLOWERS_MAX_PAGES', 5); // up to 200 followers per user (was 40). Also capped by the user's real follower count, so small accounts never cost a wasted request
-defined('DISCOVER_FOLLOWING_MAX_PAGES')|| define('DISCOVER_FOLLOWING_MAX_PAGES', 5); // up to 200 followed accounts per user (was 40)
+defined('REMINE_CHUNK_SIZE')          || define('REMINE_CHUNK_SIZE', 40);     // fetched users re-mined per round when the queue is empty (see remineChunk)
+defined('DISCOVER_FOLLOWERS_MAX_PAGES')|| define('DISCOVER_FOLLOWERS_MAX_PAGES', 10); // up to 200 followers per user (was 40). Also capped by the user's real follower count, so small accounts never cost a wasted request
+defined('DISCOVER_FOLLOWING_MAX_PAGES')|| define('DISCOVER_FOLLOWING_MAX_PAGES', 10); // up to 200 followed accounts per user (was 40)
 
 function e(?string $s): string {
     return htmlspecialchars($s ?? '', ENT_QUOTES, 'UTF-8');
@@ -322,9 +323,80 @@ function releaseClaim(string $token): void {
     $stmt->close();
 }
 
+// discovered = 1 means this user's followers/following have been mined.
+function markDiscovered(array $ids): void {
+    if (!$ids) return;
+    $db = getDB();
+    $inClause = implode(',', array_fill(0, count($ids), '?'));
+    $stmt = $db->prepare("UPDATE scratchers SET discovered = 1 WHERE id IN ($inClause)");
+    $stmt->bind_param(str_repeat('i', count($ids)), ...$ids);
+    $stmt->execute();
+    $stmt->close();
+}
+
+// Same claim idea as claimPendingRows, but for rows that are already fetched
+// and were never mined (discovered = 0). Biggest accounts first, since their
+// follower/following lists hold the most unseen names. Users below the
+// smallest discovery threshold have nothing to mine and are never claimed.
+function claimRemineRows(int $n): array {
+    $db = getDB();
+    $token = bin2hex(random_bytes(8));
+    $ttl = CRAWL_CLAIM_TTL_SEC;
+    $min = DISCOVER_FOLLOWING_MIN;
+    $stmt = $db->prepare("UPDATE scratchers SET claim_token = ?, claimed_at = NOW()
+        WHERE status = 'fetched' AND discovered = 0 AND follower_count >= ?
+          AND (claim_token IS NULL OR claimed_at < DATE_SUB(NOW(), INTERVAL ? SECOND))
+        ORDER BY follower_count DESC, id ASC LIMIT ?");
+    $stmt->bind_param('siii', $token, $min, $ttl, $n);
+    $stmt->execute();
+    $stmt->close();
+
+    $stmt = $db->prepare("SELECT id, username, follower_count FROM scratchers WHERE claim_token = ? AND status = 'fetched'");
+    $stmt->bind_param('s', $token);
+    $stmt->execute();
+    $rows = $stmt->get_result()->fetch_all(MYSQLI_ASSOC);
+    $stmt->close();
+    return ['token' => $token, 'rows' => $rows];
+}
+
+// When the queue is empty, mine users that were fetched without being mined
+// (discovery was paused, or they predate the discovered column) instead of
+// sitting idle. $stats['remined'] counts users processed.
+function remineChunk(array &$stats): array {
+    $claim = claimRemineRows(REMINE_CHUNK_SIZE);
+    if (!$claim['rows']) return ['claimed' => 0, 'rate_limited' => false];
+
+    $jobs = [];
+    foreach ($claim['rows'] as $row) {
+        $job = discoveryJobFor((int)$row['follower_count']);
+        if ($job['followers'] || $job['following']) $jobs[$row['username']] = $job;
+    }
+    $rateLimited = false;
+    if ($jobs) {
+        $d = discoverBatch($jobs);
+        $rateLimited = $d['rate_limited'];
+        queueUsernamesBulk($d['items']);
+        $stats['queued'] += count($d['items']);
+    }
+
+    $db = getDB();
+    if ($rateLimited) {
+        // partial results: leave discovered = 0 so they are tried again
+        $stmt = $db->prepare("UPDATE scratchers SET claim_token = NULL, claimed_at = NULL WHERE claim_token = ? AND status = 'fetched'");
+    } else {
+        $stmt = $db->prepare("UPDATE scratchers SET discovered = 1, claim_token = NULL, claimed_at = NULL WHERE claim_token = ? AND status = 'fetched'");
+    }
+    $stmt->bind_param('s', $claim['token']);
+    $stmt->execute();
+    $stmt->close();
+
+    $stats['remined'] += count($claim['rows']);
+    return ['claimed' => count($claim['rows']), 'rate_limited' => $rateLimited];
+}
+
 // Last run's numbers, for cron/crawl.php's text output.
 function crawlStats(?array $set = null): array {
-    static $s = ['fetched' => 0, 'errors' => 0, 'retried' => 0, 'queued' => 0, 'rate_limited' => false, 'discovery' => true, 'pending_at_start' => 0];
+    static $s = ['fetched' => 0, 'errors' => 0, 'retried' => 0, 'queued' => 0, 'remined' => 0, 'rate_limited' => false, 'discovery' => true, 'pending_at_start' => 0];
     if ($set !== null) $s = $set;
     return $s;
 }
@@ -373,11 +445,16 @@ function crawlChunk(array $claim, array &$stats, bool $discover = true): array {
     markRetryBulk($toRetry);
 
     $jobs = array_filter($jobs, function ($j) { return $j['followers'] || $j['following']; });
-    if ($discover && $jobs && !$rateLimited) {
-        $d = discoverBatch($jobs);
-        if ($d['rate_limited']) $rateLimited = true;
-        queueUsernamesBulk($d['items']);
-        $stats['queued'] += count($d['items']);
+    if ($discover && !$rateLimited) {
+        if ($jobs) {
+            $d = discoverBatch($jobs);
+            if ($d['rate_limited']) $rateLimited = true;
+            queueUsernamesBulk($d['items']);
+            $stats['queued'] += count($d['items']);
+        }
+        // Mined (or nothing to mine). Rows fetched while discovery was paused
+        // keep discovered = 0 and get picked up later by remineChunk().
+        if (!$rateLimited) markDiscovered(array_keys($toFetch));
     }
 
     releaseClaim($claim['token']);
@@ -395,7 +472,7 @@ function crawlBatch(int $limit, int $budgetSec = CRAWL_TIME_BUDGET_SEC): int {
     // the queue drains mid-batch. 'discovery' in the stats means "at least one
     // round ran with it on".
     $pending = (int)getDB()->query("SELECT COUNT(*) AS c FROM scratchers WHERE status = 'pending'")->fetch_assoc()['c'];
-    $stats = ['fetched' => 0, 'errors' => 0, 'retried' => 0, 'queued' => 0, 'rate_limited' => false,
+    $stats = ['fetched' => 0, 'errors' => 0, 'retried' => 0, 'queued' => 0, 'remined' => 0, 'rate_limited' => false,
               'discovery' => false, 'pending_at_start' => $pending];
     $processed = 0;
     $first = true;
@@ -408,7 +485,19 @@ function crawlBatch(int $limit, int $budgetSec = CRAWL_TIME_BUDGET_SEC): int {
         $discover = discoveryAllowed($pending);
         if ($discover) $stats['discovery'] = true;
         $claim = claimPendingRows(min(CRAWL_CHUNK_SIZE, $limit - $processed));
-        if (!$claim['rows']) break;
+        if (!$claim['rows']) {
+            // Queue drained. Only the pending cap holds discovery back, so
+            // use the time to mine users that were never mined; the names
+            // that turns up are fetched by the next rounds.
+            if (!$discover) break;
+            $m = remineChunk($stats);
+            if ($m['rate_limited']) {
+                $stats['rate_limited'] = true;
+                break;
+            }
+            if ($m['claimed'] === 0) break;
+            continue;
+        }
         $res = crawlChunk($claim, $stats, $discover);
         $processed += $res['done'];
         if ($res['rate_limited']) {
@@ -711,9 +800,15 @@ function crawlSingleUsername(string $username): array {
     // public "Crawl User" click shouldn't add thousands more rows on top of it.
     $pending = (int)$db->query("SELECT COUNT(*) AS c FROM scratchers WHERE status = 'pending'")->fetch_assoc()['c'];
     $job = discoveryJobFor($count);
-    if (($job['followers'] || $job['following']) && discoveryAllowed($pending)) {
-        $d = discoverBatch([$username => $job]);
-        queueUsernamesBulk($d['items']);
+    if (discoveryAllowed($pending)) {
+        if ($job['followers'] || $job['following']) {
+            $d = discoverBatch([$username => $job]);
+            queueUsernamesBulk($d['items']);
+        }
+        $stmt = $db->prepare("UPDATE scratchers SET discovered = 1 WHERE username = ?");
+        $stmt->bind_param('s', $username);
+        $stmt->execute();
+        $stmt->close();
     }
 
     return ['ok' => true, 'count' => $count];
