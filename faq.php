@@ -30,6 +30,10 @@ a { color: #ffaa33; }
     <p>Yes! <a href="/s/census/studios">Studios</a> are ranked by followers, with their host and whether anyone can add projects (open to all). Search by title, or use <b>open</b>, <b>closed</b>, <b>id:56</b> and follower operators like <b>f&gt;=100</b>. Combine them, for example <b>open f&gt;=100 art</b>.</p>
     <h2>Why does a studio show 100+ projects?</h2>
     <p>Scratch only reports up to 100 projects per studio, so 100+ means 100 or more. The studio page on Scratch shows the real number.</p>
+    <h2>What do the green and red numbers next to follower counts mean?</h2>
+    <p>The top 10,000 Scratchers are checked again every day. The number beside a count is the change since their previous check: green for gained followers, red for lost, gray +0 for no change. It stays visible for two days after the check. Scratchers outside the top 10,000 are only checked once, so they show no change.</p>
+    <h2>Why are some deleted accounts still counted as errors?</h2>
+    <p>If Scratch says an account no longer exists, ScratchCensus leaves it alone instead of retrying forever. Accounts that only failed because of a temporary Scratch error are tried again automatically.</p>
     <h2>A Scratcher or studio is missing. Why?</h2>
     <p>ScratchCensus finds new users and studios by following the people and studios it already knows, so brand new or very quiet ones can take a while to appear.</p>
     <?php require __DIR__ . '/includes/footer.php'; ?>
