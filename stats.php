@@ -54,6 +54,7 @@ while ($row = $res->fetch_assoc()) {
     $sc[$row['status']] = (int)$row['c'];
 }
 $studioTotal = array_sum($sc);
+$studioRefreshDue = (int)$db->query("SELECT COUNT(*) AS c FROM studios WHERE status = 'fetched' AND follower_count >= " . max(1, studioRefreshThreshold()) . " AND checked_at < DATE_SUB(NOW(), INTERVAL " . (int)STUDIO_REFRESH_INTERVAL_HOURS . " HOUR)")->fetch_assoc()['c'];
 $pc = ['pending' => 0, 'mined' => 0, 'error' => 0];
 $res = $db->query("SELECT status, COUNT(*) AS c FROM studio_people GROUP BY status");
 while ($row = $res->fetch_assoc()) {
@@ -131,6 +132,7 @@ button { margin-top: 1rem; padding: 0.5rem 1rem; border-radius: 6px; border: non
         <tr><th>People pending</th><td class="num"><?= number_format($pc['pending']) ?></td></tr>
         <tr><th>People error</th><td class="num"><?= number_format($pc['error']) ?></td></tr>
         <tr><th>Discovery</th><td class="num"><?= !STUDIO_DISCOVERY_ENABLED ? 'off' : (studioDiscoveryAllowed($sc['pending']) ? 'on' : 'paused (queue over ' . number_format(STUDIO_DISCOVERY_PAUSE_PENDING) . ')') ?></td></tr>
+        <tr><th>Refresh due (top <?= number_format(STUDIO_REFRESH_TOP_N) ?>)</th><td class="num"><?= number_format($studioRefreshDue) ?></td></tr>
         <tr><th>Last crawled</th><td class="num"><?= $studioLast ? e($studioLast) : 'never' ?></td></tr>
         <?php if ($topStudio): ?>
         <tr><th>Top studio</th><td class="num"><?= e(shortTitle((string)$topStudio['title'], 40)) ?> (<?= number_format((int)$topStudio['follower_count']) ?>)</td></tr>
