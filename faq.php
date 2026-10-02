@@ -32,6 +32,8 @@ a { color: #ffaa33; }
     <p>Scratch only reports up to 100 projects per studio, so 100+ means 100 or more. The studio page on Scratch shows the real number.</p>
     <h2>What do the green and red numbers next to follower counts mean?</h2>
     <p>The top 10,000 Scratchers are checked again every day. The number beside a count is the change since their previous check: green for gained followers, red for lost, gray +0 for no change. It stays visible for two days after the check. Scratchers outside the top 10,000 are only checked once, so they show no change.</p>
+    <h2>What is the Growth page?</h2>
+    <p>It lists the 100 Scratchers or studios that gained (or lost) the most followers since their latest daily check, with the percentage change next to it. Only the top 10,000 Scratchers and top 10,000 studios are re-checked, so only they can appear there.</p>
     <h2>Why are some deleted accounts still counted as errors?</h2>
     <p>If Scratch says an account no longer exists, ScratchCensus leaves it alone instead of retrying forever. Accounts that only failed because of a temporary Scratch error are tried again automatically.</p>
     <h2>A Scratcher or studio is missing. Why?</h2>
