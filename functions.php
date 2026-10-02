@@ -784,18 +784,66 @@ function getScratcherCount(): int {
 }
 
 function getScratchersPage(int $page, int $perPage = 100): array {
-    $db = getDB();
-    $offset = ($page - 1) * $perPage;
-    // Index-only (status, follower_count, username): skipping rows for a deep
-    // OFFSET never touches the table. checked_at/delta are then looked up for
-    // just this page's rows, same as the search results do.
-    $stmt = $db->prepare("SELECT username, follower_count FROM scratchers WHERE status = 'fetched' ORDER BY follower_count DESC, username ASC LIMIT ? OFFSET ?");
-    $stmt->bind_param('ii', $perPage, $offset);
-    $stmt->execute();
-    $rows = $stmt->get_result()->fetch_all(MYSQLI_ASSOC);
-    $stmt->close();
+    $rows = leaderboardRows(($page - 1) * $perPage, $perPage);
+    // checked_at/delta are looked up for just this page's rows, same as search results.
     attachCheckedAt($rows);
     return $rows;
+}
+
+// $n rows of the leaderboard (follower_count DESC, username ASC) starting at
+// $offset. The obvious ORDER BY ... LIMIT ? OFFSET ? mixes directions, which the
+// (status, follower_count, username) index can't serve, so MySQL sorted every
+// fetched row on every page. This reads the same rows from the index in order:
+//   1. follower_count at that position (ties share it, so tie order doesn't matter)
+//   2. how many users are above it, to know where inside its tie group we start
+//   3. that group by username ASC, then lower groups by a backwards index scan
+//      (username comes out DESC inside a group, so groups are flipped), re-reading
+//      the last group in ASC order since the scan may have cut it short.
+// Same rows in the same order as the plain query, just without the sort.
+function leaderboardRows(int $offset, int $n): array {
+    $db = getDB();
+    $q = function (string $sql, string $types, array $params) use ($db): array {
+        $stmt = $db->prepare($sql);
+        $stmt->bind_param($types, ...$params);
+        $stmt->execute();
+        $r = $stmt->get_result()->fetch_all(MYSQLI_ASSOC);
+        $stmt->close();
+        return $r;
+    };
+    $group = "SELECT username, follower_count FROM scratchers WHERE status = 'fetched' AND follower_count = ? ORDER BY username ASC LIMIT ? OFFSET ?";
+
+    $r = $q("SELECT follower_count FROM scratchers WHERE status = 'fetched' ORDER BY follower_count DESC LIMIT 1 OFFSET ?", 'i', [$offset]);
+    if (!$r) return [];
+    $cur = (int)$r[0]['follower_count'];
+    $r = $q("SELECT COUNT(*) AS c FROM scratchers WHERE status = 'fetched' AND follower_count > ?", 'i', [$cur]);
+    $skip = max(0, $offset - (int)$r[0]['c']);
+
+    $out = $q($group, 'iii', [$cur, $n, $skip]);
+    $need = $n - count($out);
+    while ($need > 0) {
+        $batch = $q("SELECT username, follower_count FROM scratchers WHERE status = 'fetched' AND follower_count < ?
+            ORDER BY follower_count DESC, username DESC LIMIT ?", 'ii', [$cur, $need]);
+        if (!$batch) break;
+        $groups = [];
+        foreach ($batch as $row) $groups[(int)$row['follower_count']][] = $row;
+        $cut = null;
+        if (count($batch) === $need) { // the last group may be incomplete: redo it in ASC order
+            end($groups);
+            $cut = key($groups);
+            unset($groups[$cut]);
+        }
+        foreach ($groups as $fc => $rows) {
+            foreach (array_reverse($rows) as $row) $out[] = $row;
+            $cur = $fc;
+        }
+        if ($cut !== null) {
+            foreach ($q($group, 'iii', [$cut, $n - count($out), 0]) as $row) $out[] = $row;
+            $cur = $cut;
+        }
+        $need = $n - count($out);
+        if ($cut === null) break; // fewer rows than asked for: nothing is left below
+    }
+    return $out;
 }
 
 // Ranks mirror the leaderboard's own ordering (follower_count DESC, username
