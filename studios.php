@@ -40,7 +40,11 @@ table { width: 100%; border-collapse: collapse; margin-top: 1.5rem; }
 th, td { text-align: left; padding: 0.5rem 0.7rem; border-bottom: 1px solid #333; }
 th { color: #999; font-size: 0.85rem; }
 .rank { color: #999; width: 3rem; }
-.count { text-align: right; }
+.count { text-align: right; white-space: nowrap; }
+.delta { font-weight: 600; font-size: 0.85em; margin-right: 0.4rem; }
+.delta.up { color: #4cd964; }
+.delta.down { color: #ff5c5c; }
+.delta.zero { color: #888; }
 a { color: #ffaa33; }
 .tabs { display: flex; gap: 0.5rem; margin-top: 1rem; }
 .tabs a { padding: 0.4rem 1rem; border-radius: 20px; border: 1px solid #444; text-decoration: none; color: #eee; }
@@ -66,6 +70,7 @@ a { color: #ffaa33; }
     <div class="tabs">
         <a href="/s/census/">Users</a>
         <a class="on" href="/s/census/studios">Studios</a>
+        <a href="/s/census/growth">Growth</a>
     </div>
 
     <form class="control-row" method="get">
@@ -95,7 +100,7 @@ a { color: #ffaa33; }
                 <td><?php if (!empty($s['host_username'])): ?><a href="https://scratch.mit.edu/users/<?= e($s['host_username']) ?>/" target="_blank" rel="noopener"><?= e($s['host_username']) ?></a><?php else: ?><span class="muted">-</span><?php endif; ?></td>
                 <td><span class="tag <?= $s['open_to_all'] ? 'open' : 'closed' ?>"><?= $s['open_to_all'] ? 'Open' : 'Closed' ?></span></td>
                 <td class="count"><?= (int)$s['project_count'] >= 100 ? '100+' : number_format((int)$s['project_count']) ?></td>
-                <td class="count"><?= number_format((int)$s['follower_count']) ?></td>
+                <td class="count"><?php $d = $s['delta'] ?? null; if ($d !== null): $d = (int)$d; ?><span class="delta <?= $d > 0 ? 'up' : ($d < 0 ? 'down' : 'zero') ?>"><?= $d < 0 ? '-' : '+' ?><?= number_format(abs($d)) ?></span> <?php endif; ?><?= number_format((int)$s['follower_count']) ?></td>
             </tr>
             <?php endforeach; ?>
         </tbody>
