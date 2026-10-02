@@ -418,8 +418,10 @@ function getStudioCount(): int {
 }
 
 // follower_count => number of fetched studios with exactly that count, cached 60s.
-function studioFollowerHistogram(): array {
-    $file = sys_get_temp_dir() . '/scratchcensus_studiohist_' . md5(__DIR__) . '.json';
+// $open = 1 / 0 counts only open / closed studios (null = all). The open/closed
+// variants need INDEX (status, open_to_all, follower_count, id) to stay fast.
+function studioFollowerHistogram(?int $open = null): array {
+    $file = sys_get_temp_dir() . '/scratchcensus_studiohist_' . md5(__DIR__) . '_' . ($open === null ? 'all' : $open) . '.json';
     if (is_file($file) && (time() - (int)@filemtime($file)) < 60) {
         $cached = json_decode((string)@file_get_contents($file), true);
         if (is_array($cached) && $cached) {
@@ -428,21 +430,42 @@ function studioFollowerHistogram(): array {
             return $hist;
         }
     }
-    $res = getDB()->query("SELECT follower_count, COUNT(*) AS c FROM studios WHERE status = 'fetched' GROUP BY follower_count");
+    $sql = "SELECT follower_count, COUNT(*) AS c FROM studios WHERE status = 'fetched'"
+         . ($open === null ? '' : ' AND open_to_all = ' . (int)$open) . ' GROUP BY follower_count';
+    $res = getDB()->query($sql);
     $hist = [];
     while ($row = $res->fetch_assoc()) $hist[(int)$row['follower_count']] = (int)$row['c'];
     @file_put_contents($file, json_encode($hist), LOCK_EX);
     return $hist;
 }
 
-// $n studios of the full list (follower_count DESC, id ASC) from $offset, read in
-// index order with no sort. The mixed ORDER BY can't use an ascending index, so
-// MySQL sorted every fetched studio on every page. Same idea as leaderboardRows()
-// in functions.php: find the follower_count at the offset from the histogram, read
-// that tie group by id ASC, then lower groups by a backward scan (id DESC) with each
-// group flipped, re-reading the last group in ASC order in case it was cut short.
-// Needs INDEX (status, follower_count, id).
-function studioLeaderboardRows(int $offset, int $n): array {
+// The histogram narrowed to the follower comparisons of a search (f>=100 etc).
+function studioFilteredHistogram(?int $open, array $conds): array {
+    $hist = studioFollowerHistogram($open);
+    if (!$conds) return $hist;
+    foreach ($hist as $fc => $c) {
+        foreach ($conds as [$op, $v]) {
+            if ($op === '=') $ok = $fc == $v;
+            elseif ($op === '<') $ok = $fc < $v;
+            elseif ($op === '<=') $ok = $fc <= $v;
+            elseif ($op === '>') $ok = $fc > $v;
+            elseif ($op === '>=') $ok = $fc >= $v;
+            else $ok = true;
+            if (!$ok) { unset($hist[$fc]); break; }
+        }
+    }
+    return $hist;
+}
+
+// $n studios of the list (follower_count DESC, id ASC) from $offset, optionally only
+// open/closed ones and/or within follower comparisons, read in index order with no
+// sort. The mixed ORDER BY can't use an ascending index, so MySQL used to sort every
+// matching studio on every page. Same idea as leaderboardRows() in functions.php:
+// find the follower_count at the offset from the histogram, read that tie group by
+// id ASC, then lower groups by a backward scan (id DESC) with each group flipped,
+// re-reading the last group in ASC order in case it was cut short.
+// Needs INDEX (status, follower_count, id) and INDEX (status, open_to_all, follower_count, id).
+function studioLeaderboardRows(int $offset, int $n, ?int $open = null, array $conds = []): array {
     $db = getDB();
     $cols = 'id, title, host_username, follower_count, project_count, open_to_all, created_on';
     $q = function (string $sql, string $types, array $params) use ($db): array {
@@ -453,9 +476,19 @@ function studioLeaderboardRows(int $offset, int $n): array {
         $stmt->close();
         return $r;
     };
-    $group = "SELECT $cols FROM studios WHERE status = 'fetched' AND follower_count = ? ORDER BY id ASC LIMIT ? OFFSET ?";
+    $extra = '';
+    $xt = '';
+    $xp = [];
+    if ($open !== null) { $extra .= ' AND open_to_all = ?'; $xt .= 'i'; $xp[] = $open; }
+    foreach ($conds as [$op, $v]) {
+        if (!in_array($op, ['=', '<', '<=', '>', '>='], true)) continue;
+        $extra .= " AND follower_count $op ?";
+        $xt .= 'i';
+        $xp[] = $v;
+    }
+    $group = "SELECT $cols FROM studios WHERE status = 'fetched'$extra AND follower_count = ? ORDER BY id ASC LIMIT ? OFFSET ?";
 
-    $hist = studioFollowerHistogram();
+    $hist = studioFilteredHistogram($open, $conds);
     krsort($hist);
     $above = 0;
     $cur = null;
@@ -466,11 +499,11 @@ function studioLeaderboardRows(int $offset, int $n): array {
     }
     if ($cur === null) return [];
 
-    $out = $q($group, 'iii', [$cur, $n, $skip]);
+    $out = $q($group, $xt . 'iii', array_merge($xp, [$cur, $n, $skip]));
     $need = $n - count($out);
     while ($need > 0) {
-        $batch = $q("SELECT $cols FROM studios WHERE status = 'fetched' AND follower_count < ?
-            ORDER BY follower_count DESC, id DESC LIMIT ?", 'ii', [$cur, $need]);
+        $batch = $q("SELECT $cols FROM studios WHERE status = 'fetched'$extra AND follower_count < ?
+            ORDER BY follower_count DESC, id DESC LIMIT ?", $xt . 'ii', array_merge($xp, [$cur, $need]));
         if (!$batch) break;
         $groups = [];
         foreach ($batch as $row) $groups[(int)$row['follower_count']][] = $row;
@@ -485,7 +518,7 @@ function studioLeaderboardRows(int $offset, int $n): array {
             $cur = $fc;
         }
         if ($cut !== null) {
-            foreach ($q($group, 'iii', [$cut, $n - count($out), 0]) as $row) $out[] = $row;
+            foreach ($q($group, $xt . 'iii', array_merge($xp, [$cut, $n - count($out), 0])) as $row) $out[] = $row;
             $cur = $cut;
         }
         $need = $n - count($out);
@@ -507,46 +540,79 @@ function studioRankOf(int $followers, int $id): int {
     return $r;
 }
 
+// Adds 'rank' (position in the FULL list) to rows that are not a contiguous slice of
+// it. Studios above = running total from the cached histogram; position inside the
+// tie group = one covering-index read of that group's ids per distinct follower_count
+// on the page, instead of two COUNT(*) scans per row.
+function studioAttachRanks(array &$rows): void {
+    if (!$rows) return;
+    $hist = studioFollowerHistogram();
+    krsort($hist);
+    $maxId = [];
+    foreach ($rows as $r) {
+        $fc = (int)$r['follower_count'];
+        $maxId[$fc] = max($maxId[$fc] ?? 0, (int)$r['id']);
+    }
+    $above = [];
+    $run = 0;
+    foreach ($hist as $fc => $c) {
+        if (isset($maxId[$fc])) $above[$fc] = $run;
+        $run += $c;
+    }
+    $db = getDB();
+    $stmt = $db->prepare("SELECT id FROM studios WHERE status = 'fetched' AND follower_count = ? AND id <= ? ORDER BY id ASC");
+    $pos = [];
+    foreach ($maxId as $fc => $mid) {
+        $stmt->bind_param('ii', $fc, $mid);
+        $stmt->execute();
+        $i = 0;
+        foreach ($stmt->get_result()->fetch_all(MYSQLI_NUM) as [$id]) $pos[$fc][(int)$id] = $i++;
+    }
+    $stmt->close();
+    foreach ($rows as &$r) {
+        $fc = (int)$r['follower_count'];
+        $r['rank'] = isset($above[$fc], $pos[$fc][(int)$r['id']]) ? $above[$fc] + $pos[$fc][(int)$r['id']] + 1 : studioRankOf($fc, (int)$r['id']);
+    }
+    unset($r);
+}
+
 // $p = null for plain browsing. Returns ['rows' => [...with 'rank'...], 'total' => int].
 function getStudiosPage(?array $p, int $page, int $perPage = 100): array {
     $db = getDB();
-    [$where, $types, $params] = $p ? buildStudioWhere($p) : ["status = 'fetched'", '', []];
-
-    if (!$p) {
-        $total = getStudioCount();
-    } else {
-        $stmt = $db->prepare("SELECT COUNT(*) AS c FROM studios WHERE $where");
-        if ($params) $stmt->bind_param($types, ...$params);
-        $stmt->execute();
-        $total = (int)$stmt->get_result()->fetch_assoc()['c'];
-        $stmt->close();
-    }
-
     $offset = ($page - 1) * $perPage;
-    if (!$p) {
-        $rows = studioLeaderboardRows($offset, $perPage);
-    } else {
-        $stmt = $db->prepare("SELECT id, title, host_username, follower_count, project_count, open_to_all, created_on
-            FROM studios WHERE $where ORDER BY follower_count DESC, id ASC LIMIT ? OFFSET ?");
-        $stmt->bind_param($types . 'ii', ...array_merge($params, [$perPage, $offset]));
-        $stmt->execute();
-        $rows = $stmt->get_result()->fetch_all(MYSQLI_ASSOC);
-        $stmt->close();
+    // open/closed and follower comparisons only (no title text, no id): served from
+    // the indexes and histograms, no sort and no scan.
+    $fast = !$p || ($p['text'] === '' && $p['id'] === null);
+    if ($fast) {
+        $open = $p['open'] ?? null;
+        $conds = $p['conds'] ?? [];
+        $total = array_sum(studioFilteredHistogram($open, $conds));
+        $rows = studioLeaderboardRows($offset, $perPage, $open, $conds);
+        if ($rows && $open === null) {
+            // the whole list or one contiguous block of it
+            $first = !$p || !$conds ? $offset + 1 : studioRankOf((int)$rows[0]['follower_count'], (int)$rows[0]['id']);
+            foreach ($rows as $i => &$r) $r['rank'] = $first + $i;
+            unset($r);
+        } else {
+            studioAttachRanks($rows);
+        }
+        return ['rows' => $rows, 'total' => $total];
     }
 
-    $plain = !$p || ($p['text'] === '' && $p['id'] === null && $p['open'] === null);
-    if ($rows && !$p) {
-        foreach ($rows as $i => &$r) $r['rank'] = $offset + $i + 1;
-        unset($r);
-    } elseif ($rows && $plain) {
-        // only follower comparisons: one contiguous block of the leaderboard
-        $first = studioRankOf((int)$rows[0]['follower_count'], (int)$rows[0]['id']);
-        foreach ($rows as $i => &$r) $r['rank'] = $first + $i;
-        unset($r);
-    } else {
-        foreach ($rows as &$r) $r['rank'] = studioRankOf((int)$r['follower_count'], (int)$r['id']);
-        unset($r);
-    }
+    [$where, $types, $params] = buildStudioWhere($p);
+    $stmt = $db->prepare("SELECT COUNT(*) AS c FROM studios WHERE $where");
+    if ($params) $stmt->bind_param($types, ...$params);
+    $stmt->execute();
+    $total = (int)$stmt->get_result()->fetch_assoc()['c'];
+    $stmt->close();
+
+    $stmt = $db->prepare("SELECT id, title, host_username, follower_count, project_count, open_to_all, created_on
+        FROM studios WHERE $where ORDER BY follower_count DESC, id ASC LIMIT ? OFFSET ?");
+    $stmt->bind_param($types . 'ii', ...array_merge($params, [$perPage, $offset]));
+    $stmt->execute();
+    $rows = $stmt->get_result()->fetch_all(MYSQLI_ASSOC);
+    $stmt->close();
+    studioAttachRanks($rows);
     return ['rows' => $rows, 'total' => $total];
 }
 
