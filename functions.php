@@ -794,8 +794,8 @@ function getScratchersPage(int $page, int $perPage = 100): array {
 // $offset. The obvious ORDER BY ... LIMIT ? OFFSET ? mixes directions, which the
 // (status, follower_count, username) index can't serve, so MySQL sorted every
 // fetched row on every page. This reads the same rows from the index in order:
-//   1. follower_count at that position (ties share it, so tie order doesn't matter)
-//   2. how many users are above it, to know where inside its tie group we start
+//   1+2. the follower_count at that position and how many users are above it, from the
+//      follower_count histogram (cached 60s), so no deep OFFSET walk
 //   3. that group by username ASC, then lower groups by a backwards index scan
 //      (username comes out DESC inside a group, so groups are flipped), re-reading
 //      the last group in ASC order since the scan may have cut it short.
@@ -812,11 +812,18 @@ function leaderboardRows(int $offset, int $n): array {
     };
     $group = "SELECT username, follower_count FROM scratchers WHERE status = 'fetched' AND follower_count = ? ORDER BY username ASC LIMIT ? OFFSET ?";
 
-    $r = $q("SELECT follower_count FROM scratchers WHERE status = 'fetched' ORDER BY follower_count DESC LIMIT 1 OFFSET ?", 'i', [$offset]);
-    if (!$r) return [];
-    $cur = (int)$r[0]['follower_count'];
-    $r = $q("SELECT COUNT(*) AS c FROM scratchers WHERE status = 'fetched' AND follower_count > ?", 'i', [$cur]);
-    $skip = max(0, $offset - (int)$r[0]['c']);
+    // Where does this offset fall? The cached follower_count histogram answers it
+    // without walking `offset` index entries (that walk made deep pages take seconds).
+    $hist = getFollowerHistogram();
+    krsort($hist);
+    $above = 0;
+    $cur = null;
+    $skip = 0;
+    foreach ($hist as $fc => $c) {
+        if ($offset < $above + $c) { $cur = $fc; $skip = $offset - $above; break; }
+        $above += $c;
+    }
+    if ($cur === null) return [];
 
     $out = $q($group, 'iii', [$cur, $n, $skip]);
     $need = $n - count($out);
@@ -876,10 +883,20 @@ function rankOf(int $followers, string $username): int {
 // follower_count => how many fetched rows have exactly that count. One
 // covering-index scan; a few thousand distinct values, so the result is small.
 function getFollowerHistogram(): array {
+    $file = sys_get_temp_dir() . '/scratchcensus_hist_' . md5(__DIR__) . '.json';
+    if (is_file($file) && (time() - (int)@filemtime($file)) < 60) {
+        $cached = json_decode((string)@file_get_contents($file), true);
+        if (is_array($cached) && $cached) {
+            $hist = [];
+            foreach ($cached as $fc => $c) $hist[(int)$fc] = (int)$c;
+            return $hist;
+        }
+    }
     $db = getDB();
     $res = $db->query("SELECT follower_count, COUNT(*) AS c FROM scratchers WHERE status = 'fetched' GROUP BY follower_count");
     $hist = [];
     while ($row = $res->fetch_assoc()) $hist[(int)$row['follower_count']] = (int)$row['c'];
+    @file_put_contents($file, json_encode($hist), LOCK_EX);
     return $hist;
 }
 
