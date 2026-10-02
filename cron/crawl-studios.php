@@ -69,6 +69,7 @@ try {
 
     $rate = $elapsed > 0 ? $st['requests'] / $elapsed : 0;
     echo "Studio run: " . $st['requests'] . " request(s) in " . number_format($elapsed, 1) . "s (" . number_format($rate, 1) . "/s)\n";
+    echo "studios refreshed={$st['studios_refreshed']}\n";
     echo "studios fetched={$st['studios_fetched']} errors={$st['studios_errors']} retried={$st['studios_retried']} new_studios_queued={$st['studios_queued']}\n";
     echo "people mined={$st['people_mined']} errors={$st['people_errors']} new_people_queued={$st['people_queued']}\n";
     echo "studios in DB: fetched={$sc['fetched']} pending={$sc['pending']} error={$sc['error']}\n";
