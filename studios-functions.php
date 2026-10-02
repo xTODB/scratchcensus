@@ -407,7 +407,91 @@ function buildStudioWhere(array $p): array {
 }
 
 function getStudioCount(): int {
-    return (int)getDB()->query("SELECT COUNT(*) AS c FROM studios WHERE status = 'fetched'")->fetch_assoc()['c'];
+    $file = sys_get_temp_dir() . '/scratchcensus_studiocount_' . md5(__DIR__) . '.txt';
+    $raw = @file_get_contents($file);
+    if ($raw !== false && preg_match('/^(\d+) (\d+)$/', $raw, $m) && (time() - (int)$m[2]) < 60) {
+        return (int)$m[1];
+    }
+    $count = (int)getDB()->query("SELECT COUNT(*) AS c FROM studios WHERE status = 'fetched'")->fetch_assoc()['c'];
+    @file_put_contents($file, $count . ' ' . time(), LOCK_EX);
+    return $count;
+}
+
+// follower_count => number of fetched studios with exactly that count, cached 60s.
+function studioFollowerHistogram(): array {
+    $file = sys_get_temp_dir() . '/scratchcensus_studiohist_' . md5(__DIR__) . '.json';
+    if (is_file($file) && (time() - (int)@filemtime($file)) < 60) {
+        $cached = json_decode((string)@file_get_contents($file), true);
+        if (is_array($cached) && $cached) {
+            $hist = [];
+            foreach ($cached as $fc => $c) $hist[(int)$fc] = (int)$c;
+            return $hist;
+        }
+    }
+    $res = getDB()->query("SELECT follower_count, COUNT(*) AS c FROM studios WHERE status = 'fetched' GROUP BY follower_count");
+    $hist = [];
+    while ($row = $res->fetch_assoc()) $hist[(int)$row['follower_count']] = (int)$row['c'];
+    @file_put_contents($file, json_encode($hist), LOCK_EX);
+    return $hist;
+}
+
+// $n studios of the full list (follower_count DESC, id ASC) from $offset, read in
+// index order with no sort. The mixed ORDER BY can't use an ascending index, so
+// MySQL sorted every fetched studio on every page. Same idea as leaderboardRows()
+// in functions.php: find the follower_count at the offset from the histogram, read
+// that tie group by id ASC, then lower groups by a backward scan (id DESC) with each
+// group flipped, re-reading the last group in ASC order in case it was cut short.
+// Needs INDEX (status, follower_count, id).
+function studioLeaderboardRows(int $offset, int $n): array {
+    $db = getDB();
+    $cols = 'id, title, host_username, follower_count, project_count, open_to_all, created_on';
+    $q = function (string $sql, string $types, array $params) use ($db): array {
+        $stmt = $db->prepare($sql);
+        $stmt->bind_param($types, ...$params);
+        $stmt->execute();
+        $r = $stmt->get_result()->fetch_all(MYSQLI_ASSOC);
+        $stmt->close();
+        return $r;
+    };
+    $group = "SELECT $cols FROM studios WHERE status = 'fetched' AND follower_count = ? ORDER BY id ASC LIMIT ? OFFSET ?";
+
+    $hist = studioFollowerHistogram();
+    krsort($hist);
+    $above = 0;
+    $cur = null;
+    $skip = 0;
+    foreach ($hist as $fc => $c) {
+        if ($offset < $above + $c) { $cur = $fc; $skip = $offset - $above; break; }
+        $above += $c;
+    }
+    if ($cur === null) return [];
+
+    $out = $q($group, 'iii', [$cur, $n, $skip]);
+    $need = $n - count($out);
+    while ($need > 0) {
+        $batch = $q("SELECT $cols FROM studios WHERE status = 'fetched' AND follower_count < ?
+            ORDER BY follower_count DESC, id DESC LIMIT ?", 'ii', [$cur, $need]);
+        if (!$batch) break;
+        $groups = [];
+        foreach ($batch as $row) $groups[(int)$row['follower_count']][] = $row;
+        $cut = null;
+        if (count($batch) === $need) {
+            end($groups);
+            $cut = key($groups);
+            unset($groups[$cut]);
+        }
+        foreach ($groups as $fc => $rows) {
+            foreach (array_reverse($rows) as $row) $out[] = $row;
+            $cur = $fc;
+        }
+        if ($cut !== null) {
+            foreach ($q($group, 'iii', [$cut, $n - count($out), 0]) as $row) $out[] = $row;
+            $cur = $cut;
+        }
+        $need = $n - count($out);
+        if ($cut === null) break;
+    }
+    return $out;
 }
 
 // Rank in the full list: follower_count DESC, id ASC.
@@ -428,19 +512,27 @@ function getStudiosPage(?array $p, int $page, int $perPage = 100): array {
     $db = getDB();
     [$where, $types, $params] = $p ? buildStudioWhere($p) : ["status = 'fetched'", '', []];
 
-    $stmt = $db->prepare("SELECT COUNT(*) AS c FROM studios WHERE $where");
-    if ($params) $stmt->bind_param($types, ...$params);
-    $stmt->execute();
-    $total = (int)$stmt->get_result()->fetch_assoc()['c'];
-    $stmt->close();
+    if (!$p) {
+        $total = getStudioCount();
+    } else {
+        $stmt = $db->prepare("SELECT COUNT(*) AS c FROM studios WHERE $where");
+        if ($params) $stmt->bind_param($types, ...$params);
+        $stmt->execute();
+        $total = (int)$stmt->get_result()->fetch_assoc()['c'];
+        $stmt->close();
+    }
 
     $offset = ($page - 1) * $perPage;
-    $stmt = $db->prepare("SELECT id, title, host_username, follower_count, project_count, open_to_all, created_on
-        FROM studios WHERE $where ORDER BY follower_count DESC, id ASC LIMIT ? OFFSET ?");
-    $stmt->bind_param($types . 'ii', ...array_merge($params, [$perPage, $offset]));
-    $stmt->execute();
-    $rows = $stmt->get_result()->fetch_all(MYSQLI_ASSOC);
-    $stmt->close();
+    if (!$p) {
+        $rows = studioLeaderboardRows($offset, $perPage);
+    } else {
+        $stmt = $db->prepare("SELECT id, title, host_username, follower_count, project_count, open_to_all, created_on
+            FROM studios WHERE $where ORDER BY follower_count DESC, id ASC LIMIT ? OFFSET ?");
+        $stmt->bind_param($types . 'ii', ...array_merge($params, [$perPage, $offset]));
+        $stmt->execute();
+        $rows = $stmt->get_result()->fetch_all(MYSQLI_ASSOC);
+        $stmt->close();
+    }
 
     $plain = !$p || ($p['text'] === '' && $p['id'] === null && $p['open'] === null);
     if ($rows && !$p) {
