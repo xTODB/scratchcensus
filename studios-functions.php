@@ -21,6 +21,10 @@ defined('STUDIO_CURATOR_PAGES')          || define('STUDIO_CURATOR_PAGES', 1);  
 defined('STUDIO_CURATE_MAX_PAGES')       || define('STUDIO_CURATE_MAX_PAGES', 3);  // pages of 40 curated studios per person
 defined('STUDIO_PAGE_SIZE')              || define('STUDIO_PAGE_SIZE', 40);
 defined('STUDIO_SEED_ID')                || define('STUDIO_SEED_ID', 56);          // Mick's Gallery, the root
+defined('STUDIO_REFRESH_ENABLED')        || define('STUDIO_REFRESH_ENABLED', true);   // re-fetch the top studios so the list can show follower changes
+defined('STUDIO_REFRESH_TOP_N')          || define('STUDIO_REFRESH_TOP_N', 10000);    // how many of the biggest studios get refreshed
+defined('STUDIO_REFRESH_INTERVAL_HOURS') || define('STUDIO_REFRESH_INTERVAL_HOURS', 24); // a studio is due again this long after its last check
+defined('STUDIO_REFRESH_TIME_SHARE')     || define('STUDIO_REFRESH_TIME_SHARE', 0.5); // up to this share of a studio cron run goes to refreshing due studios first
 
 const STUDIO_API = 'https://api.scratch.mit.edu';
 
@@ -338,14 +342,116 @@ function studioPeopleRound(array $claim, array &$st): void {
     $st['studios_queued'] += queueStudios($items);
 }
 
+// ---- Top-studio refresh. Same idea as the users' refresh in functions.php: the
+// biggest STUDIO_REFRESH_TOP_N studios are fetched again once
+// STUDIO_REFRESH_INTERVAL_HOURS have passed since their last check, and the change
+// (new - old) is stored in follower_delta. The list shows it for 2 days.
+
+// follower_count of the STUDIO_REFRESH_TOP_N-th biggest studio (0 if there are fewer).
+function studioRefreshThreshold(): int {
+    static $t = null;
+    if ($t !== null) return $t;
+    $off = max(0, STUDIO_REFRESH_TOP_N - 1);
+    $stmt = getDB()->prepare("SELECT follower_count FROM studios WHERE status = 'fetched' ORDER BY follower_count DESC LIMIT 1 OFFSET ?");
+    $stmt->bind_param('i', $off);
+    $stmt->execute();
+    $row = $stmt->get_result()->fetch_assoc();
+    $stmt->close();
+    return $t = $row ? (int)$row['follower_count'] : 0;
+}
+
+function studioClaimRefresh(int $n): array {
+    $db = getDB();
+    $token = bin2hex(random_bytes(8));
+    $ttl = CRAWL_CLAIM_TTL_SEC;
+    $hours = STUDIO_REFRESH_INTERVAL_HOURS;
+    $min = max(1, studioRefreshThreshold());
+    $stmt = $db->prepare("UPDATE studios SET claim_token = ?, claimed_at = NOW()
+        WHERE status = 'fetched' AND follower_count >= ?
+          AND checked_at < DATE_SUB(NOW(), INTERVAL ? HOUR)
+          AND (claim_token IS NULL OR claimed_at < DATE_SUB(NOW(), INTERVAL ? SECOND))
+        ORDER BY follower_count DESC, id ASC LIMIT ?");
+    $stmt->bind_param('siiii', $token, $min, $hours, $ttl, $n);
+    $stmt->execute();
+    $stmt->close();
+    $stmt = $db->prepare("SELECT id, follower_count FROM studios WHERE claim_token = ? AND status = 'fetched'");
+    $stmt->bind_param('s', $token);
+    $stmt->execute();
+    $rows = $stmt->get_result()->fetch_all(MYSQLI_ASSOC);
+    $stmt->close();
+    return ['token' => $token, 'rows' => $rows];
+}
+
+// Stores a fresh fetch of an already-fetched studio, with its follower change.
+function studioMarkRefreshed(int $id, array $s, int $delta): void {
+    $stmt = getDB()->prepare("UPDATE studios SET title = ?, host_id = ?, follower_count = ?, follower_delta = ?, project_count = ?,
+        manager_count = ?, comment_count = ?, open_to_all = ?, is_public = ?, comments_allowed = ?, created_on = ?,
+        checked_at = NOW(), claim_token = NULL, claimed_at = NULL WHERE id = ?");
+    $stmt->bind_param('siiiiiiiiisi', $s['title'], $s['host_id'], $s['followers'], $delta, $s['projects'], $s['managers'],
+        $s['comments'], $s['open_to_all'], $s['is_public'], $s['comments_allowed'], $s['created'], $id);
+    $stmt->execute();
+    $stmt->close();
+}
+
+// One round: returns how many studios were claimed (0 = nothing is due).
+// A page that fails (timeout, odd answer) only has checked_at moved, so it waits a
+// full interval; a 404 means the studio is gone and it leaves the list.
+function studioRefreshRound(array &$st, int $n): int {
+    $claim = studioClaimRefresh($n);
+    if (!$claim['rows']) return 0;
+    $urls = [];
+    foreach ($claim['rows'] as $r) $urls[$r['id']] = studioUrl((int)$r['id']);
+    $res = httpMultiGet($urls);
+    $st['requests'] += count($res['results']);
+    if ($res['rate_limited']) $st['rate_limited'] = true;
+
+    $gone = []; $skip = [];
+    foreach ($claim['rows'] as $r) {
+        $id = (int)$r['id'];
+        $x = $res['results'][$id] ?? null;
+        if (!$x || $x['code'] === 429) continue; // not attempted: released below
+        $s = $x['code'] === 200 ? parseStudio($x['body']) : null;
+        if ($s) {
+            studioMarkRefreshed($id, $s, (int)$s['followers'] - (int)$r['follower_count']);
+            $st['studios_refreshed']++;
+        } elseif ($x['code'] === 404) {
+            $gone[] = $id;
+        } else {
+            $skip[] = $id;
+        }
+    }
+    studioMarkError('studios', $gone);
+    if ($skip) {
+        $in = implode(',', array_fill(0, count($skip), '?'));
+        $stmt = getDB()->prepare("UPDATE studios SET checked_at = NOW(), claim_token = NULL, claimed_at = NULL WHERE id IN ($in)");
+        $stmt->bind_param(str_repeat('i', count($skip)), ...$skip);
+        $stmt->execute();
+        $stmt->close();
+    }
+    // anything still carrying our token was never attempted: free it
+    $stmt = getDB()->prepare("UPDATE studios SET claim_token = NULL, claimed_at = NULL WHERE claim_token = ? AND status = 'fetched'");
+    $stmt->bind_param('s', $claim['token']);
+    $stmt->execute();
+    $stmt->close();
+    return count($claim['rows']);
+}
+
 // One cron run. Returns this run's counters.
 function crawlStudiosBatch(int $budgetSec = STUDIO_TIME_BUDGET_SEC): array {
     $start = microtime(true);
-    $st = ['studios_fetched' => 0, 'studios_errors' => 0, 'studios_retried' => 0, 'studios_queued' => 0,
+    $st = ['studios_fetched' => 0, 'studios_refreshed' => 0, 'studios_errors' => 0, 'studios_retried' => 0, 'studios_queued' => 0,
            'people_mined' => 0, 'people_queued' => 0, 'people_errors' => 0, 'requests' => 0, 'rate_limited' => false];
     studioSeedIfEmpty();
 
-    while ((microtime(true) - $start) < $budgetSec) {
+    // Due top studios first, but only up to their share of the time budget.
+    if (STUDIO_REFRESH_ENABLED) {
+        $until = $start + $budgetSec * STUDIO_REFRESH_TIME_SHARE;
+        while (microtime(true) < $until && !$st['rate_limited']) {
+            if (studioRefreshRound($st, STUDIO_CHUNK_SIZE) === 0) break;
+        }
+    }
+
+    while ((microtime(true) - $start) < $budgetSec && !$st['rate_limited']) {
         // Only recount pending each round when a cap is set.
         $discover = studioDiscoveryAllowed(STUDIO_DISCOVERY_PAUSE_PENDING > 0 ? studioPendingCount() : 0);
         $sc = studioClaim('studios', 'id', STUDIO_CHUNK_SIZE);
@@ -467,7 +573,8 @@ function studioFilteredHistogram(?int $open, array $conds): array {
 // Needs INDEX (status, follower_count, id) and INDEX (status, open_to_all, follower_count, id).
 function studioLeaderboardRows(int $offset, int $n, ?int $open = null, array $conds = []): array {
     $db = getDB();
-    $cols = 'id, title, host_username, follower_count, project_count, open_to_all, created_on';
+    $cols = "id, title, host_username, follower_count, project_count, open_to_all, created_on,
+        IF(checked_at >= DATE_SUB(NOW(), INTERVAL 2 DAY), follower_delta, NULL) AS delta";
     $q = function (string $sql, string $types, array $params) use ($db): array {
         $stmt = $db->prepare($sql);
         $stmt->bind_param($types, ...$params);
@@ -606,7 +713,8 @@ function getStudiosPage(?array $p, int $page, int $perPage = 100): array {
     $total = (int)$stmt->get_result()->fetch_assoc()['c'];
     $stmt->close();
 
-    $stmt = $db->prepare("SELECT id, title, host_username, follower_count, project_count, open_to_all, created_on
+    $stmt = $db->prepare("SELECT id, title, host_username, follower_count, project_count, open_to_all, created_on,
+        IF(checked_at >= DATE_SUB(NOW(), INTERVAL 2 DAY), follower_delta, NULL) AS delta
         FROM studios WHERE $where ORDER BY follower_count DESC, id ASC LIMIT ? OFFSET ?");
     $stmt->bind_param($types . 'ii', ...array_merge($params, [$perPage, $offset]));
     $stmt->execute();
