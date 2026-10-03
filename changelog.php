@@ -1,26 +1,13 @@
 <?php
 require_once __DIR__ . '/functions.php';
+$pageTitle = 'Changelog - ScratchCensus';
+$pageDesc = "What's changed in ScratchCensus over time.";
+$navActive = 'changelog';
+require __DIR__ . '/includes/layout-top.php';
 ?>
-<!DOCTYPE html>
-<html lang="en">
-<head>
-<meta charset="UTF-8">
-<meta name="viewport" content="width=device-width, initial-scale=1.0">
-<title>Changelog - ScratchCensus</title>
-<?php require __DIR__ . '/includes/favicon.php'; ?>
-<meta name="description" content="What's changed in ScratchCensus over time.">
-<style>
-body { font-family: -apple-system, Helvetica, Arial, sans-serif; max-width: 700px; margin: 2rem auto; padding: 0 1rem; background: #17191c; color: #eee; }
-h1 { margin-bottom: 0.2rem; }
-p.sub { color: #999; margin-top: 0; }
-a { color: #ffaa33; }
-ul { margin: 0.3rem 0 1rem; padding-left: 1.3rem; }
-li { margin: 0.15rem 0; }
-</style>
-</head>
-<body>
-    <h1>Changelog</h1>
-    <p class="sub"><a href="/s/census/">&larr; Back to ScratchCensus</a></p>
+<div class="prose">
+<h1>Changelog</h1>
+    <p>[Oct3] v5.2 - New look! ScratchCensus now has a sidebar and one simple page: pick Users, Studios or Forums, switch between Static and Dynamic (Dynamic is the old Growth page), and use the Filter button for category-specific filters. Crawling has its own page. Old Studios, Forums and Growth links still work.</p>
     <p>[Oct3] v5.1 - Faster forums! The Topics tab loads quicker, even filtered to one forum, and the crawler does less counting between rounds.</p>
     <p>[Oct3] v5.0 - Forums! ScratchCensus now crawls the Scratch forums. The Topics tab ranks every topic by views or replies, and can be filtered to one forum. The Posts tab searches the text of posts in bigger topics, like Ctrl+F, and links each result to the post on Scratch.</p>
     <p>[Oct2] v4.2 - Growth! A new Growth page shows which Scratchers and studios gained or lost the most followers since their last daily check. Studios now get the same daily re-check and green/red follower changes as users.</p>
@@ -30,6 +17,5 @@ li { margin: 0.15rem 0; }
     <p>[Sep29] v2.1 - Way faster crawler! Parallel fetching, smarter queuing, and already bigger than ScratchViews's list.</p>
     <p>[Sep28] v2.0 - Search, a better way to crawl users, FAQ and a new UI!</p>
     <p>[Sep27] v1.0 - ScratchCensus launches! A comprehensive, community-crawled list of every Scratcher, by followers.</p>
-    <?php require __DIR__ . '/includes/footer.php'; ?>
-</body>
-</html>
+</div>
+<?php require __DIR__ . '/includes/layout-bottom.php'; ?>
