@@ -347,6 +347,93 @@ function getForumStats(): array {
     return ['topics' => (int)$t['c'], 'big_topics' => (int)$t['big'], 'big_done' => (int)$t['done'], 'posts' => (int)$p['c'], 'forums' => (int)$f['c']];
 }
 
+// Same numbers as getForumStats(), kept in a small temp file for FORUM_STATS_CACHE_SEC.
+// The cron prints these every minute; counting 100k+ topic rows that often is wasted work.
+defined('FORUM_STATS_CACHE_SEC') || define('FORUM_STATS_CACHE_SEC', 300);
+function getForumStatsCached(): array {
+    $f = sys_get_temp_dir() . '/scratchcensus_fstats_' . md5(__DIR__);
+    if (is_file($f) && time() - (int)@filemtime($f) < (int)FORUM_STATS_CACHE_SEC) {
+        $d = json_decode((string)@file_get_contents($f), true);
+        if (is_array($d) && isset($d['topics'])) return $d;
+    }
+    $s = getForumStats();
+    $tmp = $f . '.' . bin2hex(random_bytes(4)) . '.tmp';
+    if (@file_put_contents($tmp, json_encode($s)) !== false) @rename($tmp, $f); else @unlink($tmp);
+    return $s;
+}
+
+// Everything the key-gated stats page shows about forums (fresh counts, a few scans: fine there).
+function getForumAdminStats(): array {
+    $s = getForumStats();
+    $f = forumRows("SELECT COUNT(*) AS c, COALESCE(SUM(topic_count), 0) AS t, COALESCE(SUM(post_count), 0) AS p, MAX(last_list_at) AS last_list, MAX(index_at) AS index_at,
+                    SUM(last_list_at IS NOT NULL) AS touched, SUM(enabled = 0) AS skipped FROM forums")[0];
+    $top = forumRows("SELECT t.id, t.title, t.views, f.name AS forum_name FROM forum_topics t LEFT JOIN forums f ON f.id = t.forum_id ORDER BY t.views DESC LIMIT 1");
+    $s['scratch_topics'] = (int)$f['t'];
+    $s['scratch_posts'] = (int)$f['p'];
+    $s['last_list'] = $f['last_list'];
+    $s['index_at'] = $f['index_at'];
+    $s['touched'] = (int)$f['touched'];
+    $s['skipped'] = (int)$f['skipped'];
+    $s['forums_all'] = (int)$f['c'];
+    $s['top_topic'] = $top[0] ?? null;
+    $s['rows_sticky'] = (int)forumRows("SELECT COUNT(*) AS c FROM forum_topics WHERE sticky = 1")[0]['c'];
+    $s['claimed'] = (int)forumRows("SELECT COUNT(*) AS c FROM forum_topics WHERE claimed_until >= NOW()")[0]['c'];
+    return $s;
+}
+
+// Adds any missing speed index. Safe to run again: an index counts as present when some
+// existing index already starts with the same columns, whatever it is named.
+// Run it from stats.php?key=...&indexes=1 (ALTER TABLE on big tables can take a minute).
+function ensureSpeedIndexes(): array {
+    $wanted = [
+        'forum_topics' => [
+            'idx_views_id'          => ['views', 'id'],
+            'idx_replies_id'        => ['replies', 'id'],
+            'idx_forum_views_id'    => ['forum_id', 'views', 'id'],
+            'idx_forum_replies_id'  => ['forum_id', 'replies', 'id'],
+            'idx_post_queue'        => ['posts_done', 'views'],
+        ],
+        'forum_posts' => [
+            'idx_topic_id'          => ['topic_id'],
+        ],
+        'studios' => [
+            'idx_status_followers_id'      => ['status', 'follower_count', 'id'],
+            'idx_status_open_followers_id' => ['status', 'open_to_all', 'follower_count', 'id'],
+        ],
+        'scratchers' => [
+            'idx_status_followers_username' => ['status', 'follower_count', 'username'],
+        ],
+    ];
+    $db = getDB();
+    $out = [];
+    foreach ($wanted as $table => $indexes) {
+        $have = [];
+        $stmt = $db->prepare("SELECT index_name AS iname, column_name AS cname FROM information_schema.statistics WHERE table_schema = DATABASE() AND table_name = ? ORDER BY index_name, seq_in_index");
+        $stmt->bind_param('s', $table);
+        $stmt->execute();
+        $res = $stmt->get_result();
+        while ($r = $res->fetch_assoc()) $have[$r['iname']][] = strtolower($r['cname']);
+        $stmt->close();
+        if (!$have) { $out[] = "$table: table not found, skipped"; continue; }
+        foreach ($indexes as $name => $cols) {
+            $sig = implode(',', $cols);
+            $found = null;
+            foreach ($have as $hn => $hc) {
+                if (strpos(implode(',', $hc) . ',', $sig . ',') === 0) { $found = $hn; break; }
+            }
+            if ($found !== null) { $out[] = "$table: $name already covered by $found"; continue; }
+            $t0 = microtime(true);
+            try {
+                $ok = $db->query("ALTER TABLE `$table` ADD INDEX `$name` (`" . implode('`, `', $cols) . "`)");
+                $out[] = $ok ? "$table: added $name (" . $sig . ") in " . number_format(microtime(true) - $t0, 1) . "s" : "$table: FAILED $name: " . $db->error;
+            } catch (\Throwable $e) {
+                $out[] = "$table: FAILED $name: " . $e->getMessage();
+            }
+        }
+    }
+    return $out;
+}
+
 // $sort: 'views' or 'replies' (whitelisted, never user text in the SQL).
 function getForumTopicsPage(string $sort, int $forumId, int $page, int $perPage): array {
     $col = $sort === 'replies' ? 'replies' : 'views';
