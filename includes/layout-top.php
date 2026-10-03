@@ -36,6 +36,7 @@ $renderNav = function (array $items) use ($navActive) {
         <div class="brand"><?php require __DIR__ . '/logo.php'; ?></div>
         <p class="tagline">Track everything Scratch.</p>
     </header>
+    <div class="scrim" onclick="document.body.classList.remove('nav-open')"></div>
     <nav class="side" aria-label="Main">
         <?php $renderNav($navItems); ?>
         <hr>
