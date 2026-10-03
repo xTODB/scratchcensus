@@ -8,6 +8,9 @@ $q = trim($_GET['q'] ?? '');
 $page = max(1, (int)($_GET['page'] ?? 1));
 $perPage = $view === 'posts' ? 20 : 100;
 
+require_once __DIR__ . '/page-cache.php';
+if (($view === 'topics' || $q === '') && $page <= 100) pageCacheStart('forums-' . $view . '-' . $sort . '-' . $forumId . '-' . $page);
+
 $stats = getForumStats();
 $forums = getForumChoices();
 $rows = [];
