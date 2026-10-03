@@ -28,6 +28,8 @@ a { color: #ffaa33; }
     <p>You can also search by follower count: f=100 for exactly 100 followers, f&lt;100 for less than 100, f&lt;=100 for 100 or fewer, f&gt;100 for more than 100, and f&gt;=100 for 100 or more. Operators can be combined in one search, for example <b>f&gt;=12 f&lt;=15</b> (12 to 15 followers), or <b>f&lt;=300 a</b> (300 or fewer followers and "a" in the username).</p>
     <h2>Does ScratchCensus have studios?</h2>
     <p>Yes! <a href="/s/census/studios">Studios</a> are ranked by followers, with their host and whether anyone can add projects (open to all). Search by title, or use <b>open</b>, <b>closed</b>, <b>id:56</b> and follower operators like <b>f&gt;=100</b>. Combine them, for example <b>open f&gt;=100 art</b>.</p>
+    <h2>Does ScratchCensus have forums?</h2>
+    <p>Yes! <a href="/s/census/forums">Forums</a> has two tabs. Topics ranks every crawled forum topic by views or replies. Posts is a search over post text, like Ctrl+F, with a preview that links to the post on Scratch. Only topics with 50 or more replies are searchable, and only their first 500 posts.</p>
     <h2>Why does a studio show 100+ projects?</h2>
     <p>Scratch only reports up to 100 projects per studio, so 100+ means 100 or more. The studio page on Scratch shows the real number.</p>
     <h2>What do the green and red numbers next to follower counts mean?</h2>
