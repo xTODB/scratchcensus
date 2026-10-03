@@ -27,6 +27,16 @@ if ($what === 'studio') {
     crawlBack(['msg' => 'studio', 'result' => $r['reason'], 'id' => $id]);
 }
 
+if ($what === 'topic') {
+    $id = parseForumTopicInput((string)($_POST['topic'] ?? ''));
+    if ($id === null || $id <= 0) crawlBack(['msg' => 'topic', 'result' => 'invalid']);
+    if (!FORUM_ENABLED) crawlBack(['msg' => 'ran', 'what' => 'topics', 'off' => 1]);
+    recordCrawlTrigger($ip);
+    $r = crawlSingleForumTopic($id);
+    if ($r['ok']) crawlBack(['msg' => 'topic', 'result' => $r['new'] ? 'added' : 'updated', 'id' => $id, 'c' => $r['replies'], 't' => mb_substr($r['title'], 0, 60), 'f' => mb_substr($r['forum'], 0, 60)]);
+    crawlBack(['msg' => 'topic', 'result' => $r['reason'], 'id' => $id]);
+}
+
 if ($what === 'studios') {
     recordCrawlTrigger($ip);
     $st = crawlStudiosBatch(PUBLIC_STUDIO_CRAWL_SEC);
