@@ -4,6 +4,9 @@ require_once __DIR__ . '/studios-functions.php';
 $perPage = 100;
 $page = max(1, (int)($_GET['page'] ?? 1));
 $q = trim($_GET['q'] ?? '');
+
+require_once __DIR__ . '/page-cache.php';
+if ($q === '' && $page <= 100) pageCacheStart('studios-' . $page);
 $parsed = $q !== '' ? parseStudioSearch($q) : null;
 
 $t0 = microtime(true);
