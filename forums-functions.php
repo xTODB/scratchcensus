@@ -538,3 +538,76 @@ function crawlForumsPublic(string $what, int $budgetSec = PUBLIC_FORUM_CRAWL_SEC
     }
     return $st;
 }
+
+// ---- One forum topic by id or link (crawl.php -> crawl-run.php, what=topic) ------------
+
+// "906446", "#906446" or a topic link -> id (null when it is neither).
+function parseForumTopicInput(string $s): ?int {
+    $s = trim($s);
+    if (preg_match('~discuss/topic/(\d{1,10})~i', $s, $m)) return (int)$m[1];
+    if (preg_match('/^#?(\d{1,10})$/', $s, $m)) return (int)$m[1];
+    return null;
+}
+
+// Reads what a topic page itself shows: forum id, title, first poster, page count.
+// Views are NOT on a topic page, so they are not read here.
+function parseForumTopicPage(?string $html): ?array {
+    $xp = forumXPath($html);
+    if (!$xp) return null;
+    $title = '';
+    $t = fxFirst($xp, '//title');
+    if ($t) $title = trim(preg_replace('/\s*-\s*Discuss Scratch\s*$/u', '', fxText($t)));
+    $forumId = 0;
+    foreach ($xp->query('//div[' . fxc('linkst') . ']//li/a/@href') as $h) {
+        if (preg_match('#^/discuss/(\d+)/?$#', (string)$h->nodeValue, $m)) $forumId = (int)$m[1]; // the last one is the forum
+    }
+    $posts = parseTopicPosts($html);
+    if ($title === '' || $forumId <= 0 || !$posts) return null;
+    return ['title' => mb_substr($title, 0, 255), 'forum_id' => $forumId, 'pages' => parseForumPagination($xp), 'posts' => $posts];
+}
+
+// Fetches one topic right now and adds it (or refreshes it). A new topic starts with 0 views:
+// topic pages do not show views, the normal topic-list crawl fills them in later.
+// Returns ['ok' => true, 'title', 'forum', 'replies', 'new'] or ['ok' => false, 'reason' => 'notfound'|'busy'].
+function crawlSingleForumTopic(int $id): array {
+    $r = httpMultiGet(['t' => FORUM_BASE . "/topic/$id/"]);
+    $x = $r['results']['t'] ?? null;
+    if (!$x) return ['ok' => false, 'reason' => 'busy'];
+    if (in_array($x['code'], [403, 404, 410], true)) return ['ok' => false, 'reason' => 'notfound'];
+    if ($x['code'] !== 200) return ['ok' => false, 'reason' => 'busy'];
+    $first = parseForumTopicPage($x['body']);
+    if (!$first) return ['ok' => false, 'reason' => 'notfound'];
+
+    $pages = max(1, (int)$first['pages']);
+    $last = $first['posts'];
+    if ($pages > 1) { // replies need the post count of the last page
+        $x2 = httpMultiGet(['t' => FORUM_BASE . "/topic/$id/?page=$pages"])['results']['t'] ?? null;
+        if (!$x2 || $x2['code'] !== 200) return ['ok' => false, 'reason' => 'busy'];
+        $last = parseTopicPosts($x2['body']);
+        if (!$last) return ['ok' => false, 'reason' => 'busy'];
+    }
+    $replies = max(0, ($pages - 1) * FORUM_POSTS_PER_PAGE + count($last) - 1);
+    $lastPost = $last[count($last) - 1];
+    $author = $first['posts'][0]['author'];
+    $forumId = (int)$first['forum_id'];
+    $bigTopic = $replies >= (int)FORUM_POST_MIN_REPLIES;
+
+    $existed = forumRows("SELECT id FROM forum_topics WHERE id = ?", 'i', [$id]) ? true : false;
+    forumExec("INSERT INTO forum_topics (id, forum_id, title, author, replies, views, sticky, closed, last_post_id, last_post_by, seen_at, posts_next_page)
+        VALUES (?, ?, ?, ?, ?, 0, 0, 0, ?, ?, NOW(), ?)
+        ON DUPLICATE KEY UPDATE forum_id = VALUES(forum_id), title = VALUES(title), author = VALUES(author), replies = VALUES(replies),
+        last_post_id = VALUES(last_post_id), last_post_by = VALUES(last_post_by), seen_at = NOW()",
+        'iissiisi', [$id, $forumId, $first['title'], $author, $replies, $lastPost['id'], $lastPost['author'], $bigTopic ? 2 : 1]);
+
+    if ($bigTopic) { // page 1 is already in hand; the posts cron carries on from page 2 (INSERT IGNORE skips repeats)
+        foreach (array_chunk($first['posts'], 20) as $chunk) {
+            $ph = implode(',', array_fill(0, count($chunk), '(?, ?, ?, ?, ?, ?, NOW())'));
+            $params = [];
+            foreach ($chunk as $p) array_push($params, $p['id'], $id, $forumId, $p['author'], $p['pos'], $p['text']);
+            forumExec("INSERT IGNORE INTO forum_posts (id, topic_id, forum_id, author, pos, body_text, fetched_at) VALUES $ph",
+                str_repeat('iiisis', count($chunk)), $params);
+        }
+    }
+    $f = forumRows("SELECT name FROM forums WHERE id = ?", 'i', [$forumId]);
+    return ['ok' => true, 'title' => $first['title'], 'forum' => $f ? (string)$f[0]['name'] : '', 'replies' => $replies, 'new' => !$existed];
+}
