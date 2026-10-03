@@ -1,5 +1,6 @@
 <?php
 require_once __DIR__ . '/studios-functions.php';
+require_once __DIR__ . '/forums-functions.php';
 
 // No accounts on ScratchCensus, so this is gated the same way seed.php and
 // cron/crawl.php already are: ?key=YOUR_CRON_SECRET from config.php. Bookmark
@@ -14,6 +15,16 @@ if (!hash_equals(CRON_SECRET, $_GET['key'] ?? '')) {
 if (isset($_GET['reindex'])) {
     $n = reindexTopUsers();
     header('Location: ?key=' . rawurlencode($_GET['key']) . '&reindexed=' . $n);
+    exit;
+}
+
+// Adds any missing database index (users, studios, forums). Safe to run again.
+if (isset($_GET['indexes'])) {
+    @set_time_limit(0);
+    ignore_user_abort(true);
+    header('Content-Type: text/plain; charset=utf-8');
+    foreach (ensureSpeedIndexes() as $line) { echo $line, "\n"; flush(); }
+    echo "done\n";
     exit;
 }
 
@@ -63,6 +74,10 @@ while ($row = $res->fetch_assoc()) {
 $openRow = $db->query("SELECT SUM(open_to_all = 1) AS o, SUM(open_to_all = 0) AS c FROM studios WHERE status = 'fetched'")->fetch_assoc();
 $studioLast = $db->query("SELECT MAX(checked_at) AS t FROM studios")->fetch_assoc()['t'];
 $topStudio = $db->query("SELECT id, title, follower_count FROM studios WHERE status = 'fetched' ORDER BY follower_count DESC, id ASC LIMIT 1")->fetch_assoc();
+
+$fs = getForumAdminStats();
+$topicPct = $fs['scratch_topics'] > 0 ? min(100, 100 * $fs['topics'] / $fs['scratch_topics']) : 0;
+$postPct = $fs['big_topics'] > 0 ? 100 * $fs['big_done'] / $fs['big_topics'] : 0;
 ?>
 <!DOCTYPE html>
 <html lang="en">
@@ -138,6 +153,26 @@ button { margin-top: 1rem; padding: 0.5rem 1rem; border-radius: 6px; border: non
         <tr><th>Top studio</th><td class="num"><?= e(shortTitle((string)$topStudio['title'], 40)) ?> (<?= number_format((int)$topStudio['follower_count']) ?>)</td></tr>
         <?php endif; ?>
     </table>
+
+    <h2>Forums</h2>
+    <table>
+        <tr><th>Forums tracked</th><td class="num"><?= number_format($fs['forums']) ?><?= $fs['skipped'] ? '<br><span class="note">' . number_format($fs['skipped']) . ' skipped</span>' : '' ?></td></tr>
+        <tr><th>Topics stored</th><td class="num"><?= number_format($fs['topics']) ?><br><span class="note"><?= number_format($topicPct, 1) ?>% of Scratch's <?= number_format($fs['scratch_topics']) ?></span></td></tr>
+        <tr><th>Posts stored (search)</th><td class="num"><?= number_format($fs['posts']) ?><br><span class="note">Scratch has <?= number_format($fs['scratch_posts']) ?> in total</span></td></tr>
+        <tr><th>Big topics (<?= number_format(FORUM_POST_MIN_REPLIES) ?>+ replies)</th><td class="num"><?= number_format($fs['big_topics']) ?></td></tr>
+        <tr><th>Big topics done</th><td class="num"><?= number_format($fs['big_done']) ?><br><span class="note"><?= number_format($postPct, 1) ?>%, <?= number_format($fs['big_topics'] - $fs['big_done']) ?> to go</span></td></tr>
+        <tr><th>Sticky topics</th><td class="num"><?= number_format($fs['rows_sticky']) ?></td></tr>
+        <tr><th>Claimed right now</th><td class="num"><?= number_format($fs['claimed']) ?></td></tr>
+        <tr><th>Crawl</th><td class="num"><?= !FORUM_ENABLED ? 'OFF (FORUM_ENABLED is false)' : 'on' ?><?= FORUM_ENABLED && !FORUM_POSTS_ENABLED ? ', posts off' : '' ?></td></tr>
+        <tr><th>Forum list read</th><td class="num"><?= $fs['index_at'] ? e($fs['index_at']) : 'never' ?></td></tr>
+        <tr><th>Last topic list crawled</th><td class="num"><?= $fs['last_list'] ? e($fs['last_list']) : 'never' ?></td></tr>
+        <?php if ($fs['top_topic']): ?>
+        <tr><th>Most viewed topic</th><td class="num"><?= e(shortTitle((string)$fs['top_topic']['title'], 40)) ?> (<?= number_format((int)$fs['top_topic']['views']) ?>)</td></tr>
+        <?php endif; ?>
+    </table>
+
+    <h2>Speed</h2>
+    <p class="note"><a href="?key=<?= e(rawurlencode($_GET['key'])) ?>&amp;indexes=1">Add missing database indexes</a> (users, studios, forums). Safe to run again; it skips any index that already exists.</p>
     <?php require __DIR__ . '/includes/footer.php'; ?>
 </body>
 </html>
