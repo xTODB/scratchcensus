@@ -1,0 +1,433 @@
+<?php
+// Forum crawler + queries. Lives in its own file so functions.php (users) and
+// studios-functions.php stay untouched. Reuses httpMultiGet() and getDB().
+//
+// Scratch's forums have no API, so this reads the HTML of scratch.mit.edu/discuss.
+//   1. forum index (/discuss/)          -> the forums table
+//   2. topic lists (/discuss/<id>/?page=N) -> forum_topics (replies, views)
+//   3. topic pages (/discuss/topic/<id>/?page=N) -> forum_posts (search text),
+//      only for topics with FORUM_POST_MIN_REPLIES or more replies
+// Tables: see forums-schema.sql.
+require_once __DIR__ . '/functions.php';
+
+// ---- Tuning. Override any of these in config.php (config.php loads first).
+defined('FORUM_ENABLED')              || define('FORUM_ENABLED', true);   // false = the forum cron does nothing
+defined('FORUM_POSTS_ENABLED')        || define('FORUM_POSTS_ENABLED', true); // false = only crawl topic lists, never topic pages
+defined('FORUM_TIME_BUDGET_SEC')      || define('FORUM_TIME_BUDGET_SEC', 20); // per cron run. Small on purpose: the other crons share this IP's rate limit
+defined('FORUM_LIST_TIME_SHARE')      || define('FORUM_LIST_TIME_SHARE', 0.6); // share of a run spent on topic lists, the rest on topic pages
+defined('FORUM_PAGES_PER_ROUND')      || define('FORUM_PAGES_PER_ROUND', 4);   // pages fetched at once per round
+defined('FORUM_ROUND_PAUSE_MS')       || define('FORUM_ROUND_PAUSE_MS', 400);  // pause between rounds. 4 pages / ~0.5s = roughly 6-8 requests/s
+defined('FORUM_POST_MIN_REPLIES')     || define('FORUM_POST_MIN_REPLIES', 50); // only topics with at least this many replies get their posts stored for search
+defined('FORUM_POST_MAX_PAGES')       || define('FORUM_POST_MAX_PAGES', 25);   // pages of 20 posts stored per topic (25 = the first 500 posts)
+defined('FORUM_POST_MAX_CHARS')       || define('FORUM_POST_MAX_CHARS', 3000); // stored characters per post
+defined('FORUM_INDEX_REFRESH_HOURS')  || define('FORUM_INDEX_REFRESH_HOURS', 24); // how often the forum list itself is re-read
+defined('FORUM_SKIP_IDS')             || define('FORUM_SKIP_IDS', '');          // comma list of forum ids never crawled, e.g. '16,17'
+defined('FORUM_CLAIM_TTL_SEC')        || define('FORUM_CLAIM_TTL_SEC', 120);
+
+const FORUM_BASE = 'https://scratch.mit.edu/discuss';
+const FORUM_POSTS_PER_PAGE = 20;
+
+// ---------------------------------------------------------------- parsing
+
+function forumXPath(?string $html): ?DOMXPath {
+    if ($html === null || trim($html) === '') return null;
+    $prev = libxml_use_internal_errors(true);
+    $dom = new DOMDocument();
+    $ok = $dom->loadHTML('<?xml encoding="utf-8" ?>' . $html, LIBXML_NOERROR | LIBXML_NOWARNING | LIBXML_COMPACT);
+    libxml_clear_errors();
+    libxml_use_internal_errors($prev);
+    return $ok ? new DOMXPath($dom) : null;
+}
+
+function fxc(string $class): string {
+    return "contains(concat(' ', normalize-space(@class), ' '), ' $class ')";
+}
+
+function fxText(?DOMNode $n): string {
+    return $n ? trim(preg_replace('/\s+/u', ' ', $n->textContent)) : '';
+}
+
+function fxFirst(DOMXPath $xp, string $q, ?DOMNode $ctx = null): ?DOMNode {
+    $r = $ctx ? $xp->query($q, $ctx) : $xp->query($q);
+    return ($r && $r->length) ? $r->item(0) : null;
+}
+
+// /discuss/ -> list of ['id','name','category','topics','posts']
+function parseForumIndex(?string $html): array {
+    $xp = forumXPath($html);
+    if (!$xp) return [];
+    $out = [];
+    foreach ($xp->query('//div[starts-with(@id, "category_body_")]') as $cat) {
+        $h4 = fxFirst($xp, './/h4', $cat);
+        $catName = trim(preg_replace('/^\s*Toggle shoutbox\s*/u', '', fxText($h4)));
+        foreach ($xp->query('.//tbody/tr', $cat) as $tr) {
+            $a = fxFirst($xp, './/h3/a', $tr);
+            if (!$a || !preg_match('#/discuss/(\d+)/?$#', (string)$a->getAttribute('href'), $m)) continue;
+            $out[] = [
+                'id' => (int)$m[1],
+                'name' => fxText($a),
+                'category' => $catName,
+                'topics' => (int)preg_replace('/\D/', '', fxText(fxFirst($xp, './/td[' . fxc('tc2') . ']', $tr))),
+                'posts' => (int)preg_replace('/\D/', '', fxText(fxFirst($xp, './/td[' . fxc('tc3') . ']', $tr))),
+            ];
+        }
+    }
+    return $out;
+}
+
+function parseForumPagination(DOMXPath $xp): int {
+    $max = 1;
+    foreach ($xp->query('//div[' . fxc('pagination') . ']//a/@href') as $h) {
+        if (preg_match('/[?&]page=(\d+)/', (string)$h->nodeValue, $m)) $max = max($max, (int)$m[1]);
+    }
+    foreach ($xp->query('//div[' . fxc('pagination') . ']//span[' . fxc('current') . ']') as $c) {
+        $max = max($max, (int)fxText($c));
+    }
+    return $max;
+}
+
+// /discuss/<forum>/?page=N -> ['topics' => [...], 'total_pages' => int]
+function parseForumTopicList(?string $html): array {
+    $xp = forumXPath($html);
+    if (!$xp) return ['topics' => [], 'total_pages' => 1];
+    $topics = [];
+    foreach ($xp->query('//table//tbody/tr') as $tr) {
+        $a = fxFirst($xp, './/td[' . fxc('tcl') . ']//h3/a', $tr);
+        if (!$a || !preg_match('#/discuss/topic/(\d+)/#', (string)$a->getAttribute('href'), $m)) continue;
+        $repliesTxt = fxText(fxFirst($xp, './/td[' . fxc('tc2') . ']', $tr));
+        $viewsTxt = fxText(fxFirst($xp, './/td[' . fxc('tc3') . ']', $tr));
+        if (!preg_match('/^\d+$/', $repliesTxt) || !preg_match('/^\d+$/', $viewsTxt)) continue; // moved-topic stubs have no counts
+        $con = fxFirst($xp, './/div[' . fxc('tclcon') . ']', $tr);
+        $conText = fxText($con);
+        $by = fxText(fxFirst($xp, './/span[' . fxc('byuser') . ']', $con));
+        $lastA = fxFirst($xp, './/td[' . fxc('tcr') . ']//a', $tr);
+        $lastId = 0;
+        if ($lastA && preg_match('#/discuss/post/(\d+)/#', (string)$lastA->getAttribute('href'), $lm)) $lastId = (int)$lm[1];
+        $topics[] = [
+            'id' => (int)$m[1],
+            'title' => mb_substr(fxText($a), 0, 255),
+            'author' => mb_substr(preg_replace('/^by\s+/u', '', $by), 0, 60),
+            'replies' => (int)$repliesTxt,
+            'views' => (int)$viewsTxt,
+            'sticky' => (stripos($conText, 'Sticky') === 0 || fxFirst($xp, './/div[' . fxc('isticky') . ']', $tr)) ? 1 : 0,
+            'closed' => stripos($conText, 'Closed') === 0 ? 1 : 0,
+            'last_post_id' => $lastId,
+            'last_post_by' => mb_substr(preg_replace('/^by\s+/u', '', fxText(fxFirst($xp, './/td[' . fxc('tcr') . ']//span[' . fxc('byuser') . ']', $tr))), 0, 60),
+        ];
+    }
+    return ['topics' => $topics, 'total_pages' => parseForumPagination($xp)];
+}
+
+// /discuss/topic/<id>/?page=N -> list of ['id','author','pos','text']
+// Quoted text is dropped so a post only matches searches for what it says itself.
+function parseTopicPosts(?string $html): array {
+    $xp = forumXPath($html);
+    if (!$xp) return [];
+    $out = [];
+    foreach ($xp->query('//div[' . fxc('blockpost') . '][starts-with(@id, "p")]') as $post) {
+        if (!preg_match('/^p(\d+)$/', (string)$post->getAttribute('id'), $m)) continue;
+        $body = fxFirst($xp, './/div[' . fxc('post_body_html') . ']', $post);
+        if (!$body) continue;
+        foreach (iterator_to_array($xp->query('.//blockquote', $body)) as $bq) {
+            if ($bq->parentNode) $bq->parentNode->removeChild($bq);
+        }
+        foreach (iterator_to_array($xp->query('.//br', $body)) as $br) {
+            $br->parentNode->replaceChild($body->ownerDocument->createTextNode(' '), $br);
+        }
+        $text = fxText($body);
+        if (mb_strlen($text) > FORUM_POST_MAX_CHARS) $text = mb_substr($text, 0, FORUM_POST_MAX_CHARS);
+        $pos = (int)preg_replace('/\D/', '', fxText(fxFirst($xp, './/span[' . fxc('conr') . ']', $post)));
+        $out[] = [
+            'id' => (int)$m[1],
+            'author' => mb_substr(fxText(fxFirst($xp, './/dt/a[' . fxc('username') . ']', $post)), 0, 60),
+            'pos' => $pos,
+            'text' => $text,
+        ];
+    }
+    return $out;
+}
+
+// ---------------------------------------------------------------- db helpers
+
+function forumExec(string $sql, string $types = '', array $params = []): int {
+    $stmt = getDB()->prepare($sql);
+    if ($types !== '') $stmt->bind_param($types, ...$params);
+    $stmt->execute();
+    $n = $stmt->affected_rows;
+    $stmt->close();
+    return (int)$n;
+}
+
+function forumRows(string $sql, string $types = '', array $params = []): array {
+    $stmt = getDB()->prepare($sql);
+    if ($types !== '') $stmt->bind_param($types, ...$params);
+    $stmt->execute();
+    $res = $stmt->get_result();
+    $rows = $res ? $res->fetch_all(MYSQLI_ASSOC) : [];
+    $stmt->close();
+    return $rows;
+}
+
+// Claims up to $n rows of $table (forums or forum_topics) so overlapping cron
+// runs don't work on the same row. $order is a trusted fixed string.
+function forumClaim(string $table, string $key, string $where, string $order, int $n): array {
+    $tok = bin2hex(random_bytes(6));
+    $ttl = (int)FORUM_CLAIM_TTL_SEC;
+    forumExec("UPDATE $table SET claim_token = ?, claimed_until = DATE_ADD(NOW(), INTERVAL $ttl SECOND)
+               WHERE ($where) AND (claimed_until IS NULL OR claimed_until < NOW()) ORDER BY $order LIMIT $n", 's', [$tok]);
+    return forumRows("SELECT * FROM $table WHERE claim_token = ? AND claimed_until >= NOW()", 's', [$tok]);
+}
+
+function forumSkipIds(): array {
+    $ids = [];
+    foreach (explode(',', (string)FORUM_SKIP_IDS) as $s) if ((int)$s > 0) $ids[] = (int)$s;
+    return $ids;
+}
+
+// ---------------------------------------------------------------- crawling
+
+// Re-reads /discuss/ when the forums table is empty or older than FORUM_INDEX_REFRESH_HOURS.
+function ensureForumIndex(array &$st, bool $force = false): void {
+    $r = forumRows("SELECT COUNT(*) AS c FROM forums");
+    $count = (int)$r[0]['c'];
+    // Compared in SQL so the server's time zone never gets mixed with PHP's.
+    if ($count > 0 && !$force) {
+        $q = forumRows("SELECT (MAX(index_at) >= DATE_SUB(NOW(), INTERVAL " . (int)FORUM_INDEX_REFRESH_HOURS . " HOUR)) AS f FROM forums");
+        if ((bool)$q[0]['f']) return;
+    }
+    $x = httpMultiGet(['idx' => FORUM_BASE . '/'])['results']['idx'] ?? null;
+    $st['requests']++;
+    if (!$x || $x['code'] !== 200) { $st['index_error'] = $x ? $x['code'] : 'not attempted'; return; }
+    $forums = parseForumIndex($x['body']);
+    foreach ($forums as $f) {
+        forumExec("INSERT INTO forums (id, name, category, topic_count, post_count, index_at) VALUES (?, ?, ?, ?, ?, NOW())
+                   ON DUPLICATE KEY UPDATE name = VALUES(name), category = VALUES(category), topic_count = VALUES(topic_count), post_count = VALUES(post_count), index_at = NOW()",
+            'issii', [$f['id'], mb_substr($f['name'], 0, 120), mb_substr($f['category'], 0, 120), $f['topics'], $f['posts']]);
+    }
+    foreach (forumSkipIds() as $id) forumExec("UPDATE forums SET enabled = 0 WHERE id = ?", 'i', [$id]);
+    $st['forums_indexed'] = count($forums);
+}
+
+function upsertForumTopics(int $forumId, array $topics): int {
+    $n = 0;
+    foreach (array_chunk($topics, 100) as $chunk) {
+        $ph = implode(',', array_fill(0, count($chunk), '(?, ?, ?, ?, ?, ?, ?, ?, ?, ?, NOW())'));
+        $params = [];
+        foreach ($chunk as $t) {
+            array_push($params, $t['id'], $forumId, $t['title'], $t['author'], $t['replies'], $t['views'], $t['sticky'], $t['closed'], $t['last_post_id'], $t['last_post_by']);
+        }
+        $n += forumExec("INSERT INTO forum_topics (id, forum_id, title, author, replies, views, sticky, closed, last_post_id, last_post_by, seen_at) VALUES $ph
+            ON DUPLICATE KEY UPDATE forum_id = VALUES(forum_id), title = VALUES(title), replies = VALUES(replies), views = VALUES(views),
+            sticky = VALUES(sticky), closed = VALUES(closed), last_post_id = VALUES(last_post_id), last_post_by = VALUES(last_post_by), seen_at = NOW()",
+            str_repeat('iissiiiiis', count($chunk)), $params);
+    }
+    return $n;
+}
+
+// One round of topic-list crawling: claim a forum, fetch its next few pages.
+// Returns false when there was nothing to do.
+function crawlForumListRound(array &$st): bool {
+    $claimed = forumClaim('forums', 'id', 'enabled = 1', 'last_list_at IS NOT NULL, last_list_at ASC', 1);
+    if (!$claimed) return false;
+    $f = $claimed[0];
+    $fid = (int)$f['id'];
+    $next = max(1, (int)$f['next_page']);
+    $total = (int)$f['total_pages'];
+    $urls = [];
+    for ($p = $next; $p < $next + FORUM_PAGES_PER_ROUND; $p++) {
+        if ($total > 0 && $p > $total) break;
+        $urls[$p] = FORUM_BASE . "/$fid/?page=$p";
+    }
+    if (!$urls) { $urls[1] = FORUM_BASE . "/$fid/?page=1"; $next = 1; }
+    $r = httpMultiGet($urls);
+    $st['requests'] += count($r['results']);
+    if ($r['rate_limited']) $st['rate_limited'] = true;
+
+    $newNext = $next;
+    $wrapped = false;
+    foreach ($urls as $p => $_) {
+        $x = $r['results'][$p] ?? null;
+        if (!$x) break;                       // not attempted (429)
+        if ($x['code'] === 404) { $wrapped = true; break; } // past the last page
+        if ($x['code'] !== 200) { $st['list_errors']++; break; }
+        $parsed = parseForumTopicList($x['body']);
+        if ($parsed['total_pages'] > 0) $total = max($parsed['total_pages'], $p);
+        if (!$parsed['topics']) {              // an empty page means we ran off the end
+            if ($p > 1) { $wrapped = true; break; }
+            $newNext = $p + 1; continue;
+        }
+        upsertForumTopics($fid, $parsed['topics']);
+        $st['topics_seen'] += count($parsed['topics']);
+        $st['list_pages']++;
+        $newNext = $p + 1;
+        if ($total > 0 && $p >= $total) { $wrapped = true; break; }
+    }
+    if ($wrapped) { $newNext = 1; $st['forums_wrapped']++; }
+    forumExec("UPDATE forums SET next_page = ?, total_pages = ?, last_list_at = NOW(), claim_token = NULL, claimed_until = NULL WHERE id = ?",
+        'iii', [$newNext, $total, $fid]);
+    return true;
+}
+
+// One round of topic-page crawling: claim the biggest unfinished topics, fetch one page of each.
+function crawlForumPostRound(array &$st): bool {
+    $min = (int)FORUM_POST_MIN_REPLIES;
+    $claimed = forumClaim('forum_topics', 'id', "replies >= $min AND posts_done = 0", 'views DESC', FORUM_PAGES_PER_ROUND);
+    if (!$claimed) return false;
+    $urls = [];
+    $byKey = [];
+    foreach ($claimed as $t) {
+        $k = (int)$t['id'];
+        $byKey[$k] = $t;
+        $urls[$k] = FORUM_BASE . "/topic/$k/?page=" . max(1, (int)$t['posts_next_page']);
+    }
+    $r = httpMultiGet($urls);
+    $st['requests'] += count($r['results']);
+    if ($r['rate_limited']) $st['rate_limited'] = true;
+
+    foreach ($byKey as $tid => $t) {
+        $page = max(1, (int)$t['posts_next_page']);
+        $x = $r['results'][$tid] ?? null;
+        if (!$x) { forumExec("UPDATE forum_topics SET claim_token = NULL, claimed_until = NULL WHERE id = ?", 'i', [$tid]); continue; }
+        if ($x['code'] === 404 || $x['code'] === 403 || $x['code'] === 410) {
+            forumExec("UPDATE forum_topics SET posts_done = 1, claim_token = NULL, claimed_until = NULL WHERE id = ?", 'i', [$tid]);
+            continue;
+        }
+        if ($x['code'] !== 200) {
+            $st['post_errors']++;
+            forumExec("UPDATE forum_topics SET posts_errors = posts_errors + 1, posts_done = (posts_errors >= 3), claim_token = NULL, claimed_until = NULL WHERE id = ?", 'i', [$tid]);
+            continue;
+        }
+        $posts = parseTopicPosts($x['body']);
+        foreach (array_chunk($posts, 20) as $chunk) {
+            $ph = implode(',', array_fill(0, count($chunk), '(?, ?, ?, ?, ?, ?, NOW())'));
+            $params = [];
+            foreach ($chunk as $p) array_push($params, $p['id'], $tid, (int)$t['forum_id'], $p['author'], $p['pos'], $p['text']);
+            $st['posts_stored'] += forumExec("INSERT IGNORE INTO forum_posts (id, topic_id, forum_id, author, pos, body_text, fetched_at) VALUES $ph",
+                str_repeat('iiisis', count($chunk)), $params);
+        }
+        $st['post_pages']++;
+        $lastPage = min((int)FORUM_POST_MAX_PAGES, (int)ceil(((int)$t['replies'] + 1) / FORUM_POSTS_PER_PAGE));
+        $done = (!$posts || $page >= $lastPage) ? 1 : 0;
+        forumExec("UPDATE forum_topics SET posts_next_page = ?, posts_done = ?, claim_token = NULL, claimed_until = NULL WHERE id = ?",
+            'iii', [$page + 1, $done, $tid]);
+    }
+    return true;
+}
+
+function crawlForumsBatch(bool $forceIndex = false): array {
+    $st = ['requests' => 0, 'rate_limited' => false, 'forums_indexed' => 0, 'list_pages' => 0, 'topics_seen' => 0,
+           'list_errors' => 0, 'forums_wrapped' => 0, 'post_pages' => 0, 'posts_stored' => 0, 'post_errors' => 0];
+    if (!FORUM_ENABLED) return $st;
+    $start = microtime(true);
+    ensureForumIndex($st, $forceIndex);
+    $listBudget = FORUM_POSTS_ENABLED ? FORUM_TIME_BUDGET_SEC * FORUM_LIST_TIME_SHARE : FORUM_TIME_BUDGET_SEC;
+    while (!$st['rate_limited'] && microtime(true) - $start < $listBudget) {
+        if (!crawlForumListRound($st)) break;
+        usleep((int)FORUM_ROUND_PAUSE_MS * 1000);
+    }
+    if (FORUM_POSTS_ENABLED) {
+        while (!$st['rate_limited'] && microtime(true) - $start < FORUM_TIME_BUDGET_SEC) {
+            if (!crawlForumPostRound($st)) break;
+            usleep((int)FORUM_ROUND_PAUSE_MS * 1000);
+        }
+    }
+    return $st;
+}
+
+// ---------------------------------------------------------------- queries
+
+function getForumChoices(): array {
+    return forumRows("SELECT id, name FROM forums ORDER BY category, name");
+}
+
+function getForumStats(): array {
+    $t = forumRows("SELECT COUNT(*) AS c, SUM(replies >= " . (int)FORUM_POST_MIN_REPLIES . ") AS big, SUM(posts_done = 1 AND replies >= " . (int)FORUM_POST_MIN_REPLIES . ") AS done FROM forum_topics")[0];
+    $p = forumRows("SELECT COUNT(*) AS c FROM forum_posts")[0];
+    $f = forumRows("SELECT COUNT(*) AS c FROM forums WHERE enabled = 1")[0];
+    return ['topics' => (int)$t['c'], 'big_topics' => (int)$t['big'], 'big_done' => (int)$t['done'], 'posts' => (int)$p['c'], 'forums' => (int)$f['c']];
+}
+
+// $sort: 'views' or 'replies' (whitelisted, never user text in the SQL).
+function getForumTopicsPage(string $sort, int $forumId, int $page, int $perPage): array {
+    $col = $sort === 'replies' ? 'replies' : 'views';
+    $where = $forumId > 0 ? 'WHERE t.forum_id = ?' : '';
+    $types = $forumId > 0 ? 'i' : '';
+    $params = $forumId > 0 ? [$forumId] : [];
+    $total = (int)forumRows("SELECT COUNT(*) AS c FROM forum_topics t $where", $types, $params)[0]['c'];
+    $offset = max(0, ($page - 1) * $perPage);
+    $rows = forumRows("SELECT t.id, t.title, t.author, t.replies, t.views, t.sticky, t.closed, t.forum_id, f.name AS forum_name
+        FROM forum_topics t LEFT JOIN forums f ON f.id = t.forum_id $where
+        ORDER BY t.$col DESC, t.id DESC LIMIT $perPage OFFSET $offset", $types, $params);
+    foreach ($rows as $i => &$r) $r['rank'] = $offset + $i + 1;
+    return ['rows' => $rows, 'total' => $total];
+}
+
+// Splits a search box string into plain words and "quoted phrases".
+function parseForumSearch(string $q): array {
+    $words = [];
+    $phrases = [];
+    if (preg_match_all('/"([^"]+)"|(\S+)/u', $q, $m, PREG_SET_ORDER)) {
+        foreach ($m as $x) {
+            if (isset($x[2]) && $x[2] !== '') {
+                $w = trim(preg_replace('/[+\-<>()~*"@]+/u', ' ', $x[2]));
+                foreach (preg_split('/\s+/u', $w, -1, PREG_SPLIT_NO_EMPTY) as $part) $words[] = mb_substr($part, 0, 40);
+            } elseif (trim($x[1]) !== '') {
+                $phrases[] = mb_substr(trim($x[1]), 0, 80);
+            }
+        }
+    }
+    return ['words' => array_slice($words, 0, 6), 'phrases' => array_slice($phrases, 0, 3)];
+}
+
+// Ctrl+F over stored posts, newest first. FULLTEXT when every word is 3+
+// characters (its minimum), otherwise a plain LIKE scan.
+function searchForumPosts(string $q, int $forumId, int $page, int $perPage): array {
+    $p = parseForumSearch($q);
+    $terms = array_merge($p['words'], $p['phrases']);
+    if (!$terms) return ['rows' => [], 'total' => 0, 'terms' => []];
+    $short = false;
+    foreach ($p['words'] as $w) if (mb_strlen($w) < 3) $short = true;
+
+    $where = [];
+    $types = '';
+    $params = [];
+    if ($short) {
+        foreach ($terms as $t) {
+            $where[] = 'p.body_text LIKE ?';
+            $types .= 's';
+            $params[] = '%' . addcslashes($t, '%_\\') . '%';
+        }
+    } else {
+        $bool = [];
+        foreach ($p['words'] as $w) $bool[] = '+' . $w . '*';
+        foreach ($p['phrases'] as $ph) $bool[] = '+"' . $ph . '"';
+        $where[] = 'MATCH(p.body_text) AGAINST (? IN BOOLEAN MODE)';
+        $types .= 's';
+        $params[] = implode(' ', $bool);
+    }
+    if ($forumId > 0) { $where[] = 'p.forum_id = ?'; $types .= 'i'; $params[] = $forumId; }
+    $w = implode(' AND ', $where);
+
+    $total = (int)forumRows("SELECT COUNT(*) AS c FROM forum_posts p WHERE $w", $types, $params)[0]['c'];
+    $offset = max(0, ($page - 1) * $perPage);
+    $rows = forumRows("SELECT p.id, p.topic_id, p.author, p.pos, p.body_text, t.title AS topic_title, f.name AS forum_name
+        FROM forum_posts p LEFT JOIN forum_topics t ON t.id = p.topic_id LEFT JOIN forums f ON f.id = p.forum_id
+        WHERE $w ORDER BY p.id DESC LIMIT $perPage OFFSET $offset", $types, $params);
+    return ['rows' => $rows, 'total' => $total, 'terms' => $terms];
+}
+
+// A short excerpt around the first match, HTML-escaped, matches in <mark>.
+function forumPreview(string $text, array $terms, int $len = 260): string {
+    $pos = null;
+    foreach ($terms as $t) {
+        $i = mb_stripos($text, $t);
+        if ($i !== false && ($pos === null || $i < $pos)) $pos = $i;
+    }
+    $start = $pos === null ? 0 : max(0, $pos - 90);
+    $snip = mb_substr($text, $start, $len);
+    $out = ($start > 0 ? '...' : '') . e($snip) . ($start + $len < mb_strlen($text) ? '...' : '');
+    foreach ($terms as $t) {
+        $out = preg_replace('/' . preg_quote(htmlspecialchars($t, ENT_QUOTES), '/') . '/iu', '<mark>$0</mark>', $out) ?? $out;
+    }
+    return $out;
+}
