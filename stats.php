@@ -88,7 +88,7 @@ button { margin-top: 1rem; padding: 0.5rem 1rem; border-radius: 6px; border: non
 </style>
 </head>
 <body>
-    <h1>ScratchCensus Stats</h1>
+    <h1><?php require __DIR__ . '/includes/logo.php'; ?> <span style="font-size: 1.2rem; color: #999; vertical-align: middle;">Stats</span></h1>
     <p class="sub"><a href="/s/census/">&larr; Back to ScratchCensus</a></p>
     <?php if (isset($_GET['reindexed'])): ?><p class="note">Reindex started: <?= number_format((int)$_GET['reindexed']) ?> users are now due for a refresh.</p><?php endif; ?>
     <table>
