@@ -201,7 +201,7 @@ function queueUsername(string $username, ?string $discoveredFrom = null, int $pr
 }
 
 // One INSERT IGNORE per 200 usernames instead of one per username.
-// $items: list of [username, discovered_from, priority].
+// $items: list of [username, discovered_from, priority, picture id (optional)].
 function queueUsernamesBulk(array $items): void {
     if (!$items) return;
     $db = getDB();
@@ -214,18 +214,29 @@ function queueUsernamesBulk(array $items): void {
         $unique[] = $it;
     }
     foreach (array_chunk($unique, 200) as $chunk) {
-        $placeholders = implode(',', array_fill(0, count($chunk), '(?, ?, ?)'));
+        $placeholders = implode(',', array_fill(0, count($chunk), '(?, ?, ?, ?)'));
         $params = [];
         foreach ($chunk as $it) {
             $params[] = $it[0];
             $params[] = $it[1];
             $params[] = (int)$it[2];
+            $params[] = isset($it[3]) && $it[3] ? (int)$it[3] : null; // picture id, when the API gave one
         }
-        $stmt = $db->prepare("INSERT IGNORE INTO scratchers (username, discovered_from, priority) VALUES $placeholders");
-        $stmt->bind_param(str_repeat('ssi', count($chunk)), ...$params);
+        // New names are queued as before. Names already known only get their picture id filled in if it was missing.
+        $stmt = $db->prepare("INSERT IGNORE INTO scratchers (username, discovered_from, priority, scratch_id) VALUES $placeholders
+            ON DUPLICATE KEY UPDATE scratch_id = IF(scratch_id IS NULL, VALUES(scratch_id), scratch_id)");
+        $stmt->bind_param(str_repeat('ssii', count($chunk)), ...$params);
         $stmt->execute();
         $stmt->close();
     }
+}
+
+// The number in a user's picture link (.../get_image/user/<N>_90x90.png). Read straight from the
+// API's image link so it is right whatever the other ids are; falls back to the user's id.
+function scratchPictureId(array $u): ?int {
+    $img = $u['profile']['images']['90x90'] ?? ($u['profile']['images']['60x60'] ?? '');
+    if (is_string($img) && preg_match('~/get_image/user/(\d+)_~', $img, $m)) return (int)$m[1];
+    return !empty($u['id']) ? (int)$u['id'] : null;
 }
 
 // Discovery only, not a full crawl: up to DISCOVER_*_MAX_PAGES pages of
@@ -271,7 +282,7 @@ function discoverBatch(array $jobs): array {
             if (!is_array($data) || count($data) === 0) continue;
             $priority = $rq['kind'] === 'following' ? (int)$jobs[$rq['user']]['count'] : 0;
             foreach ($data as $u) {
-                if (!empty($u['username'])) $items[] = [$u['username'], $rq['user'], $priority];
+                if (!empty($u['username'])) $items[] = [$u['username'], $rq['user'], $priority, scratchPictureId($u)];
             }
             // A short page means that was the last one; otherwise keep going up to the cap.
             if (count($data) >= DISCOVER_PAGE_SIZE && $rq['page'] < $rq['max']) {
@@ -936,7 +947,7 @@ function attachCheckedAt(array &$rows): void {
     $names = array_column($rows, 'username');
     $db = getDB();
     $in = implode(',', array_fill(0, count($names), '?'));
-    $stmt = $db->prepare("SELECT username, checked_at, IF(checked_at >= DATE_SUB(NOW(), INTERVAL 2 DAY), follower_delta, NULL) AS delta FROM scratchers WHERE username IN ($in)");
+    $stmt = $db->prepare("SELECT username, checked_at, scratch_id, IF(checked_at >= DATE_SUB(NOW(), INTERVAL 2 DAY), follower_delta, NULL) AS delta FROM scratchers WHERE username IN ($in)");
     $stmt->bind_param(str_repeat('s', count($names)), ...$names);
     $stmt->execute();
     $map = [];
@@ -944,6 +955,7 @@ function attachCheckedAt(array &$rows): void {
     $stmt->close();
     foreach ($rows as &$row) {
         $row['checked_at'] = $map[$row['username']]['checked_at'] ?? null;
+        $row['scratch_id'] = isset($map[$row['username']]['scratch_id']) ? (int)$map[$row['username']]['scratch_id'] : null;
         $d = $map[$row['username']]['delta'] ?? null;
         $row['delta'] = $d === null ? null : (int)$d; // null = no refresh to show a change for
     }
@@ -1053,7 +1065,7 @@ function searchScratchersAdvanced(array $conds, string $text, int $page, int $pe
 // still pending, or errored) so the caller can offer to crawl it.
 function getExactScratcher(string $username): ?array {
     $db = getDB();
-    $stmt = $db->prepare("SELECT username, follower_count, checked_at, IF(checked_at >= DATE_SUB(NOW(), INTERVAL 2 DAY), follower_delta, NULL) AS delta
+    $stmt = $db->prepare("SELECT username, follower_count, checked_at, scratch_id, IF(checked_at >= DATE_SUB(NOW(), INTERVAL 2 DAY), follower_delta, NULL) AS delta
         FROM scratchers WHERE status = 'fetched' AND username = ?");
     $stmt->bind_param('s', $username);
     $stmt->execute();
@@ -1153,4 +1165,62 @@ function crawlSingleUsername(string $username): array {
     }
 
     return ['ok' => true, 'count' => $count];
+}
+
+
+// ---- Picture ids ------------------------------------------------------------
+// Profile pictures need the number in the picture link. Discovery fills it for the people it sees;
+// this reads it for the biggest users that still have none, one API request each, biggest first.
+// scratch_id 0 = "looked, no picture id" (a real 404), so nobody is asked twice.
+defined('ID_BACKFILL_PER_RUN') || define('ID_BACKFILL_PER_RUN', 60); // users per cron run, 0 = off
+function backfillScratchIds(int $limit = ID_BACKFILL_PER_RUN): array {
+    $out = ['filled' => 0, 'missing' => 0, 'rate_limited' => false];
+    if ($limit <= 0) return $out;
+    $db = getDB();
+    $res = $db->query("SELECT username FROM scratchers WHERE status = 'fetched' AND scratch_id IS NULL ORDER BY follower_count DESC LIMIT " . (int)$limit);
+    $names = $res ? array_column($res->fetch_all(MYSQLI_ASSOC), 'username') : [];
+    if (!$names) return $out;
+    $urls = [];
+    foreach ($names as $i => $n) $urls[$i] = 'https://api.scratch.mit.edu/users/' . rawurlencode($n);
+    $r = httpMultiGet($urls);
+    if ($r['rate_limited']) $out['rate_limited'] = true;
+    $upd = $db->prepare("UPDATE scratchers SET scratch_id = ? WHERE username = ? AND scratch_id IS NULL");
+    foreach ($names as $i => $n) {
+        $x = $r['results'][$i] ?? null;
+        if (!$x) continue; // not attempted (429): leave it for the next run
+        if ($x['code'] === 200) {
+            $u = json_decode((string)$x['body'], true);
+            $id = is_array($u) ? scratchPictureId($u) : null;
+            if (!$id) continue;
+        } elseif ($x['code'] === 404) {
+            $id = 0;
+            $out['missing']++;
+        } else {
+            continue;
+        }
+        $upd->bind_param('is', $id, $n);
+        $upd->execute();
+        if ($id) $out['filled']++;
+    }
+    $upd->close();
+    return $out;
+}
+
+// Picture link helpers shared by the pages. Users: id from scratch_id (0 or null = no picture yet).
+function userPicUrl(?int $id, string $size = '90x90'): ?string {
+    return $id ? "https://uploads.scratch.mit.edu/get_image/user/{$id}_{$size}.png" : null;
+}
+function studioPicUrl(int $id): string {
+    return "https://uploads.scratch.mit.edu/get_image/gallery/{$id}_170x100.png";
+}
+
+// Markup for the optional pictures. The page cache is shared by everyone, so the HTML is the same for
+// all visitors: images carry data-src, and a small script (layout-bottom.php) loads them only when the
+// visitor's Settings have pictures on. Users without a known picture id get a plain grey circle.
+function userPicHtml(?int $id): string {
+    $u = userPicUrl($id);
+    return $u ? '<img class="pic user" data-src="' . $u . '" alt="" width="48" height="48">' : '<span class="pic user ph"></span>';
+}
+function studioPicHtml(int $id): string {
+    return '<img class="pic studio" data-src="' . studioPicUrl($id) . '" alt="" width="85" height="50">';
 }
