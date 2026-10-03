@@ -32,6 +32,7 @@
         <div>
             <p><a href="/s/census/">ScratchCensus</a></p>
             <p><a href="/s/census/studios">Studios</a></p>
+            <p><a href="/s/census/forums">Forums</a></p>
             <p><a href="/s/census/growth">Growth</a></p>
             <p><a href="/s/census/changelog">Changelog</a></p>
             <p><a href="/s/census/faq">FAQ</a></p>
