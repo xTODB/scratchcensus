@@ -7,6 +7,7 @@ require __DIR__ . '/includes/layout-top.php';
 ?>
 <div class="prose">
 <h1>Changelog</h1>
+    <p>[Oct3] v5.4 - Add a forum topic! The Crawl page now has a box where you can paste a forum topic id or link, and ScratchCensus adds it right away with its forum, title and replies.</p>
     <p>[Oct3] v5.3 - Crawl everything! The Crawl page now has buttons for Scratchers, studios, forum topics and forum posts, plus a way to add one studio by id or link. There is also a Home button in the sidebar.</p>
     <p>[Oct3] v5.2 - New look! ScratchCensus now has a sidebar and one simple page: pick Users, Studios or Forums, switch between Static and Dynamic (Dynamic is the old Growth page), and use the Filter button for category-specific filters. Crawling has its own page. Old Studios, Forums and Growth links still work.</p>
     <p>[Oct3] v5.1 - Faster forums! The Topics tab loads quicker, even filtered to one forum, and the crawler does less counting between rounds.</p>
