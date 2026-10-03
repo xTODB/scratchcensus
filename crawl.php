@@ -39,6 +39,18 @@ require __DIR__ . '/includes/layout-top.php';
     <?php else: ?>
         <div class="flash">That doesn't look like a studio id or link.</div>
     <?php endif; ?>
+<?php elseif ($msg === 'topic'):
+    $result = $_GET['result'] ?? '';
+    $tid = (int)($_GET['id'] ?? 0); ?>
+    <?php if ($result === 'added' || $result === 'updated'): ?>
+        <div class="flash"><?= $result === 'added' ? 'Added' : 'Updated' ?> topic #<?= $tid ?><?= ($_GET['t'] ?? '') !== '' ? ' (' . e($_GET['t']) . ')' : '' ?><?= ($_GET['f'] ?? '') !== '' ? ' in ' . e($_GET['f']) : '' ?> - <?= number_format((int)($_GET['c'] ?? 0)) ?> replies! Its views fill in when the topic lists reach it.</div>
+    <?php elseif ($result === 'notfound'): ?>
+        <div class="flash">Couldn't find topic #<?= $tid ?> (deleted, private, or a wrong id?).</div>
+    <?php elseif ($result === 'busy'): ?>
+        <div class="flash">Scratch didn't answer for topic #<?= $tid ?>. Try again in a moment.</div>
+    <?php else: ?>
+        <div class="flash">That doesn't look like a topic id or link.</div>
+    <?php endif; ?>
 <?php elseif ($msg === 'ran'):
     $what = $_GET['what'] ?? '';
     $n = (int)($_GET['n'] ?? 0);
@@ -64,7 +76,7 @@ require __DIR__ . '/includes/layout-top.php';
     (function() {
         if (window.history && window.history.replaceState) {
             var url = new URL(window.location.href);
-            ['msg', 'n', 'wait', 'result', 'u', 'c', 'id', 't', 'what', 'r', 'p', 'rl', 'off'].forEach(function(k) { url.searchParams.delete(k); });
+            ['msg', 'n', 'wait', 'result', 'u', 'c', 'id', 't', 'what', 'r', 'p', 'rl', 'off', 'f'].forEach(function(k) { url.searchParams.delete(k); });
             window.history.replaceState({}, '', url.toString());
         }
     })();
@@ -99,7 +111,7 @@ require __DIR__ . '/includes/layout-top.php';
 
 <div class="card">
     <h2>Forums</h2>
-    <p>Topics reads the next pages of forum topic lists, which keeps views and replies fresh. Posts stores the text of the next big topics (50 or more replies) so the Posts search can find them.</p>
+    <p>Topics reads the next pages of forum topic lists, which keeps views and replies fresh. Posts stores the text of the next big topics (50 or more replies) so the Posts search can find them. You can also add one topic by id or link.</p>
     <form method="post" action="/s/census/crawl-run.php">
         <input type="hidden" name="what" value="topics">
         <button type="submit" class="primary">Crawl Forum Topics</button>
@@ -107,6 +119,11 @@ require __DIR__ . '/includes/layout-top.php';
     <form method="post" action="/s/census/crawl-run.php" style="margin-top: 0.6rem;">
         <input type="hidden" name="what" value="posts">
         <button type="submit" class="primary">Crawl Forum Posts</button>
+    </form>
+    <form method="post" action="/s/census/crawl-run.php" style="margin-top: 0.6rem;">
+        <input type="hidden" name="what" value="topic">
+        <input type="text" name="topic" placeholder="topic id or link..." maxlength="160" required>
+        <button type="submit" class="primary">Crawl Forum Topic</button>
     </form>
 </div>
 <?php require __DIR__ . '/includes/layout-bottom.php'; ?>
