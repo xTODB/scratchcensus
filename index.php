@@ -190,7 +190,7 @@ $pageDesc = [
     'studios' => 'Scratch studios ranked by followers, with whether they are open to all.',
     'forums' => 'Scratch forum topics ranked by views and replies, plus a search over forum posts.',
 ][$cat];
-$navActive = '';
+$navActive = 'home';
 $searchPlaceholder = $cat === 'forums' ? 'Search posts... (words, or "an exact phrase")'
     : ($cat === 'studios' ? 'Search studio title... (open, closed, id:56, f>=100)' : 'Search username... (exact:name, f>=100)');
 if ($mode === 'dynamic') $searchPlaceholder = $cat === 'studios' ? 'Search studio title...' : 'Search username...';

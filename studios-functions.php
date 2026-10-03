@@ -733,3 +733,31 @@ function shortTitle(string $t, int $max = 60): string {
     $cut = function_exists('mb_substr') ? mb_substr($t, 0, $max) : substr($t, 0, $max);
     return rtrim($cut) . '...';
 }
+
+// ---- Public crawl buttons (crawl.php -> crawl-run.php) ---------------------
+defined('PUBLIC_STUDIO_CRAWL_SEC') || define('PUBLIC_STUDIO_CRAWL_SEC', 15); // one click on "Crawl Studios" works for about this long
+
+// Accepts a studio id ("56") or a studio link ("https://scratch.mit.edu/studios/56/"). Null if it is neither.
+function parseStudioIdInput(string $s): ?int {
+    $s = trim($s);
+    if (preg_match('~studios/(\d{1,10})~i', $s, $m)) return (int)$m[1];
+    if (preg_match('/^#?(\d{1,10})$/', $s, $m)) return (int)$m[1];
+    return null;
+}
+
+// Fetches one studio right now (adding it to the list if it is new, refreshing it if it is not).
+// Returns ['ok' => true, 'title' => ..., 'count' => followers] or ['ok' => false, 'reason' => 'notfound'|'busy'].
+function crawlSingleStudio(int $id): array {
+    queueStudios([[$id, 'manual', 2000000000]]); // INSERT IGNORE: makes sure a row exists
+    $x = httpMultiGet(['s' => studioUrl($id)])['results']['s'] ?? null;
+    if (!$x) return ['ok' => false, 'reason' => 'busy'];
+    if ($x['code'] === 200 && ($s = parseStudio($x['body']))) {
+        studioMarkFetched($id, $s);
+        return ['ok' => true, 'title' => $s['title'], 'count' => $s['followers']];
+    }
+    if ($x['code'] === 404) {
+        studioMarkError('studios', [$id]);
+        return ['ok' => false, 'reason' => 'notfound'];
+    }
+    return ['ok' => false, 'reason' => 'busy'];
+}

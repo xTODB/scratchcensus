@@ -519,3 +519,22 @@ function forumPreview(string $text, array $terms, int $len = 260): string {
     }
     return $out;
 }
+
+// ---- Public crawl buttons (crawl.php -> crawl-run.php) ---------------------
+defined('PUBLIC_FORUM_CRAWL_SEC') || define('PUBLIC_FORUM_CRAWL_SEC', 15); // one click works for about this long
+
+// $what: 'topics' (read the next pages of topic lists) or 'posts' (store the next big topics' posts).
+// Same rounds the forum cron runs, so claims keep a click and the cron from working on the same rows.
+function crawlForumsPublic(string $what, int $budgetSec = PUBLIC_FORUM_CRAWL_SEC): array {
+    $st = ['requests' => 0, 'rate_limited' => false, 'forums_indexed' => 0, 'list_pages' => 0, 'topics_seen' => 0,
+           'list_errors' => 0, 'forums_wrapped' => 0, 'post_pages' => 0, 'posts_stored' => 0, 'post_errors' => 0, 'disabled' => false];
+    if (!FORUM_ENABLED || ($what === 'posts' && !FORUM_POSTS_ENABLED)) { $st['disabled'] = true; return $st; }
+    $start = microtime(true);
+    if ($what === 'topics') ensureForumIndex($st);
+    while (!$st['rate_limited'] && microtime(true) - $start < $budgetSec) {
+        $more = $what === 'posts' ? crawlForumPostRound($st) : crawlForumListRound($st);
+        if (!$more) break;
+        usleep((int)FORUM_ROUND_PAUSE_MS * 1000);
+    }
+    return $st;
+}
