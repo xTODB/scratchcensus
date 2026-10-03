@@ -1,6 +1,5 @@
 <?php
-require_once __DIR__ . '/studios-functions.php';
-require_once __DIR__ . '/forums-functions.php';
+require_once __DIR__ . '/stats-data.php';
 
 // No accounts on ScratchCensus, so this is gated the same way seed.php and
 // cron/crawl.php already are: ?key=YOUR_CRON_SECRET from config.php. Bookmark
@@ -43,41 +42,27 @@ if ($_SERVER['REQUEST_METHOD'] === 'POST') {
     exit;
 }
 
-$db = getDB();
-
-$counts = ['pending' => 0, 'fetched' => 0, 'error' => 0];
-$res = $db->query("SELECT status, COUNT(*) AS c FROM scratchers GROUP BY status");
-while ($row = $res->fetch_assoc()) {
-    $counts[$row['status']] = (int)$row['c'];
-}
+// The heavy numbers come from a short-lived cache (see stats-data.php); ?fresh=1 rebuilds them now.
+$d = getStatsData(isset($_GET['fresh']));
+$counts = $d['counts'];
 $total = array_sum($counts);
-
 $discoveryOn = discoveryAllowed($counts['pending']);
-$gaveUp = (int)$db->query("SELECT COUNT(*) AS c FROM scratchers WHERE status = 'error' AND retries >= " . (int)CRAWL_MAX_RETRIES)->fetch_assoc()['c'];
-$refreshDue = (int)$db->query("SELECT COUNT(*) AS c FROM scratchers WHERE status = 'fetched' AND follower_count >= " . max(1, refreshThreshold()) . " AND checked_at < DATE_SUB(NOW(), INTERVAL " . (int)REFRESH_INTERVAL_HOURS . " HOUR)")->fetch_assoc()['c'];
-$unmined = (int)$db->query("SELECT COUNT(*) AS c FROM scratchers WHERE status = 'fetched' AND discovered = 0 AND follower_count >= " . (int)DISCOVER_FOLLOWING_MIN)->fetch_assoc()['c'];
-$lastCrawled = $db->query("SELECT MAX(checked_at) AS t FROM scratchers")->fetch_assoc()['t'];
-$topRow = $db->query("SELECT username, follower_count FROM scratchers WHERE status = 'fetched' ORDER BY follower_count DESC, username ASC LIMIT 1")->fetch_assoc();
-
-$sc = ['pending' => 0, 'fetched' => 0, 'error' => 0];
-$res = $db->query("SELECT status, COUNT(*) AS c FROM studios GROUP BY status");
-while ($row = $res->fetch_assoc()) {
-    $sc[$row['status']] = (int)$row['c'];
-}
+$gaveUp = $d['gave_up'];
+$refreshDue = $d['refresh_due'];
+$unmined = $d['unmined'];
+$lastCrawled = $d['last_crawled'];
+$topRow = $d['top_user'];
+$sc = $d['studio_counts'];
 $studioTotal = array_sum($sc);
-$studioRefreshDue = (int)$db->query("SELECT COUNT(*) AS c FROM studios WHERE status = 'fetched' AND follower_count >= " . max(1, studioRefreshThreshold()) . " AND checked_at < DATE_SUB(NOW(), INTERVAL " . (int)STUDIO_REFRESH_INTERVAL_HOURS . " HOUR)")->fetch_assoc()['c'];
-$pc = ['pending' => 0, 'mined' => 0, 'error' => 0];
-$res = $db->query("SELECT status, COUNT(*) AS c FROM studio_people GROUP BY status");
-while ($row = $res->fetch_assoc()) {
-    $pc[$row['status']] = (int)$row['c'];
-}
-$openRow = $db->query("SELECT SUM(open_to_all = 1) AS o, SUM(open_to_all = 0) AS c FROM studios WHERE status = 'fetched'")->fetch_assoc();
-$studioLast = $db->query("SELECT MAX(checked_at) AS t FROM studios")->fetch_assoc()['t'];
-$topStudio = $db->query("SELECT id, title, follower_count FROM studios WHERE status = 'fetched' ORDER BY follower_count DESC, id ASC LIMIT 1")->fetch_assoc();
-
-$fs = getForumAdminStats();
+$studioRefreshDue = $d['studio_refresh_due'];
+$pc = $d['people'];
+$openRow = ['o' => $d['studio_open']['o'], 'c' => $d['studio_open']['c']];
+$studioLast = $d['studio_last'];
+$topStudio = $d['top_studio'];
+$fs = $d['forums'];
 $topicPct = $fs['scratch_topics'] > 0 ? min(100, 100 * $fs['topics'] / $fs['scratch_topics']) : 0;
 $postPct = $fs['big_topics'] > 0 ? 100 * $fs['big_done'] / $fs['big_topics'] : 0;
+$cacheAge = max(0, time() - (int)$d['built_at']);
 ?>
 <!DOCTYPE html>
 <html lang="en">
@@ -106,6 +91,7 @@ button { margin-top: 1rem; padding: 0.5rem 1rem; border-radius: 6px; border: non
     <h1><?php require __DIR__ . '/includes/logo.php'; ?> <span style="font-size: 1.2rem; color: #999; vertical-align: middle;">Stats</span></h1>
     <p class="sub"><a href="/s/census/">&larr; Back to ScratchCensus</a></p>
     <?php if (isset($_GET['reindexed'])): ?><p class="note">Reindex started: <?= number_format((int)$_GET['reindexed']) ?> users are now due for a refresh.</p><?php endif; ?>
+    <p class="note">Numbers are <?= $cacheAge < 5 ? 'fresh' : number_format($cacheAge) . 's old' ?> (counted in <?= e((string)$d['build_sec']) ?>s, kept for <?= (int)STATS_CACHE_SEC ?>s). <a href="?key=<?= e(rawurlencode($_GET['key'])) ?>&amp;fresh=1">Refresh now</a></p>
     <table>
         <tr><th>Total rows</th><td class="num"><?= number_format($total) ?></td></tr>
         <tr><th>Fetched</th><td class="num"><?= number_format($counts['fetched']) ?></td></tr>
