@@ -3,6 +3,11 @@ require_once __DIR__ . '/functions.php';
 
 $perPage = 100;
 $page = max(1, (int)($_GET['page'] ?? 1));
+
+// Plain browsing looks the same for everyone, so it is served from the page cache.
+require_once __DIR__ . '/page-cache.php';
+if (($_GET['q'] ?? '') === '' && !isset($_GET['msg']) && $page <= 100) pageCacheStart('users-' . $page);
+
 $total = getScratcherCount();
 
 $q = trim($_GET['q'] ?? '');
