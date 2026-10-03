@@ -116,3 +116,21 @@ mark { background: var(--accent); color: #17191c; border-radius: 2px; padding: 0
     body.nav-open .scrim { display: block; position: fixed; inset: 0; z-index: 40; background: rgba(0, 0, 0, 0.45); }
     .main { border-top-left-radius: 0; padding: 1.1rem 0.9rem 2rem; }
 }
+
+/* ---- optional pictures (Settings) ---- */
+.who { display: inline-flex; align-items: center; gap: 0.6rem; }
+.pic { display: none; flex: none; background: #2a2c31; object-fit: cover; }
+.pic.user { border-radius: 50%; }
+.pic.studio { border-radius: 4px; }
+html[data-img="on"] .pic { display: inline-block; }
+html[data-img="on"][data-imgsize="s"] .pic.user { width: 30px; height: 30px; }
+html[data-img="on"][data-imgsize="m"] .pic.user { width: 44px; height: 44px; }
+html[data-img="on"][data-imgsize="l"] .pic.user { width: 64px; height: 64px; }
+html[data-img="on"][data-imgsize="s"] .pic.studio { width: 51px; height: 30px; }
+html[data-img="on"][data-imgsize="m"] .pic.studio { width: 77px; height: 45px; }
+html[data-img="on"][data-imgsize="l"] .pic.studio { width: 119px; height: 70px; }
+.setrow { display: flex; align-items: center; gap: 0.8rem; flex-wrap: wrap; margin: 0.9rem 0; }
+.setrow label { font-weight: 600; min-width: 9rem; }
+.setrow select { background: #2a2c31; color: #fff; border: 1px solid #4a4d55; border-radius: 8px; padding: 0.45rem 0.6rem; font: inherit; }
+.setrow input[type="checkbox"] { width: 1.2rem; height: 1.2rem; accent-color: #ffaa33; }
+.setnote { color: var(--muted); margin: 0.2rem 0 1rem; }
