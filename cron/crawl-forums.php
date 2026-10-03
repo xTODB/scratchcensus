@@ -1,5 +1,6 @@
 <?php
 require_once __DIR__ . '/../forums-functions.php';
+require_once __DIR__ . '/../stats-data.php';
 
 // Forum crawler cron. Same two ways to run it as cron/crawl-studios.php:
 //   URL cron: https://scratchnews.net/s/census/cron/crawl-forums.php?key=YOUR_CRON_SECRET
@@ -66,6 +67,8 @@ try {
     if (!FORUM_ENABLED) echo "forums: OFF (FORUM_ENABLED is false)\n";
     if (!FORUM_POSTS_ENABLED) echo "posts: OFF (FORUM_POSTS_ENABLED is false)\n";
     if ($st['rate_limited']) echo "Scratch returned 429 - stopped early.\n";
+    // Keep the stats page's numbers warm (rebuilds at most every ~4 minutes, runs after the crawl work).
+    if (statsCacheWarm()) echo "stats cache rebuilt\n";
 } catch (\Throwable $e) {
     http_response_code(500);
     echo "ERROR: " . $e->getMessage() . " in " . $e->getFile() . ":" . $e->getLine() . "\n";
