@@ -362,23 +362,24 @@ function getForumStatsCached(): array {
     return $s;
 }
 
-// Everything the key-gated stats page shows about forums (fresh counts, a few scans: fine there).
+// Everything the key-gated stats page shows about forums. One pass over forum_topics
+// instead of one scan per number, plus two tiny queries.
 function getForumAdminStats(): array {
-    $s = getForumStats();
-    $f = forumRows("SELECT COUNT(*) AS c, COALESCE(SUM(topic_count), 0) AS t, COALESCE(SUM(post_count), 0) AS p, MAX(last_list_at) AS last_list, MAX(index_at) AS index_at,
-                    SUM(last_list_at IS NOT NULL) AS touched, SUM(enabled = 0) AS skipped FROM forums")[0];
-    $top = forumRows("SELECT t.id, t.title, t.views, f.name AS forum_name FROM forum_topics t LEFT JOIN forums f ON f.id = t.forum_id ORDER BY t.views DESC LIMIT 1");
-    $s['scratch_topics'] = (int)$f['t'];
-    $s['scratch_posts'] = (int)$f['p'];
-    $s['last_list'] = $f['last_list'];
-    $s['index_at'] = $f['index_at'];
-    $s['touched'] = (int)$f['touched'];
-    $s['skipped'] = (int)$f['skipped'];
-    $s['forums_all'] = (int)$f['c'];
-    $s['top_topic'] = $top[0] ?? null;
-    $s['rows_sticky'] = (int)forumRows("SELECT COUNT(*) AS c FROM forum_topics WHERE sticky = 1")[0]['c'];
-    $s['claimed'] = (int)forumRows("SELECT COUNT(*) AS c FROM forum_topics WHERE claimed_until >= NOW()")[0]['c'];
-    return $s;
+    $min = (int)FORUM_POST_MIN_REPLIES;
+    $t = forumRows("SELECT COUNT(*) AS c, COALESCE(SUM(replies >= $min), 0) AS big, COALESCE(SUM(posts_done = 1 AND replies >= $min), 0) AS done,
+                    COALESCE(SUM(sticky = 1), 0) AS stk, COALESCE(SUM(claimed_until >= NOW()), 0) AS clm FROM forum_topics")[0];
+    $f = forumRows("SELECT COUNT(*) AS c, COALESCE(SUM(enabled = 1), 0) AS en, COALESCE(SUM(topic_count), 0) AS t, COALESCE(SUM(post_count), 0) AS p,
+                    MAX(last_list_at) AS last_list, MAX(index_at) AS index_at FROM forums")[0];
+    $p = forumRows("SELECT COUNT(*) AS c FROM forum_posts")[0];
+    $top = forumRows("SELECT t.id, t.title, t.views FROM forum_topics t ORDER BY t.views DESC LIMIT 1");
+    return [
+        'topics' => (int)$t['c'], 'big_topics' => (int)$t['big'], 'big_done' => (int)$t['done'],
+        'rows_sticky' => (int)$t['stk'], 'claimed' => (int)$t['clm'],
+        'posts' => (int)$p['c'], 'forums' => (int)$f['en'], 'forums_all' => (int)$f['c'], 'skipped' => (int)$f['c'] - (int)$f['en'],
+        'scratch_topics' => (int)$f['t'], 'scratch_posts' => (int)$f['p'],
+        'last_list' => $f['last_list'], 'index_at' => $f['index_at'],
+        'top_topic' => $top[0] ?? null,
+    ];
 }
 
 // Adds any missing speed index. Safe to run again: an index counts as present when some
