@@ -1,129 +1,77 @@
 <?php
-require_once __DIR__ . '/functions.php';
+require_once __DIR__ . '/../functions.php';
 
-$pageTitle = 'Crawl - ScratchCensus';
-$pageDesc = 'Help ScratchCensus find more Scratchers, studios and forum posts.';
-$navActive = 'crawl';
+// Two ways to run this:
+//  - Web/URL cron (iFastNet's default "wget"/"curl the URL" cron type):
+//      https://scratchnews.net/s/census/cron/crawl.php?key=YOUR_CRON_SECRET
+//    This goes through the web server, so it's capped by ITS request
+//    timeout (commonly 30-90s on shared hosting), NOT just CRAWL_TIME_BUDGET_SEC.
+//    That's almost certainly what a 500 at CRAWL_TIME_BUDGET_SEC=120 means:
+//    the web server killed the request before PHP finished. Raise the
+//    budget gradually (e.g. try 60, then 75...) and watch for the same 500.
+//  - CLI cron (if iFastNet's cron UI offers "PHP" or lets you enter a
+//    command instead of a URL): use a command like
+//      /usr/bin/php /home/YOURUSER/public_html/s/census/cron/crawl.php
+//    CLI has no such request timeout, so this is the real fix if it's
+//    available - it removes the ceiling entirely instead of guessing where
+//    it is. No ?key= needed in CLI mode; it's trusted since it isn't reachable
+//    over the web this way. Check cPanel's Cron Jobs page for what iFastNet
+//    supports before assuming it's URL-only.
+$isCli = PHP_SAPI === 'cli';
 
-$msg = $_GET['msg'] ?? '';
-$showFlash = in_array($msg, ['crawled', 'cooldown', 'user', 'studio', 'ran'], true);
-$rateNote = !empty($_GET['rl']) ? ' Scratch asked us to slow down, so it stopped early.' : '';
-require __DIR__ . '/includes/layout-top.php';
-?>
-<h1>Crawl</h1>
-<p class="sub">Help ScratchCensus find more of Scratch. Each button works for about 15 seconds, and you can click again after a short wait.</p>
+if (!$isCli) {
+    if (!hash_equals(CRON_SECRET, $_GET['key'] ?? '')) {
+        http_response_code(404);
+        exit;
+    }
+    header('Content-Type: text/plain');
+}
 
-<?php if ($msg === 'crawled'): ?>
-    <div class="flash">Crawled <?= (int)($_GET['n'] ?? 0) ?> more Scratcher(s) - refresh the leaderboard in a moment to see them.</div>
-<?php elseif ($msg === 'cooldown'): ?>
-    <div class="flash">Thanks for helping - please wait <?= (int)($_GET['wait'] ?? CRAWL_TRIGGER_COOLDOWN_SEC) ?>s before crawling again.</div>
-<?php elseif ($msg === 'user'):
-    $result = $_GET['result'] ?? '';
-    $u = e($_GET['u'] ?? ''); ?>
-    <?php if ($result === 'added'): ?>
-        <div class="flash">Added <?= $u ?> - <?= number_format((int)($_GET['c'] ?? 0)) ?> followers!</div>
-    <?php elseif ($result === 'notfound'): ?>
-        <div class="flash">Couldn't find <?= $u ?> (deleted, banned, or a typo?).</div>
-    <?php else: ?>
-        <div class="flash">That doesn't look like a valid Scratch username.</div>
-    <?php endif; ?>
-<?php elseif ($msg === 'studio'):
-    $result = $_GET['result'] ?? '';
-    $sid = (int)($_GET['id'] ?? 0); ?>
-    <?php if ($result === 'added'): ?>
-        <div class="flash">Added studio #<?= $sid ?><?= ($_GET['t'] ?? '') !== '' ? ' (' . e($_GET['t']) . ')' : '' ?> - <?= number_format((int)($_GET['c'] ?? 0)) ?> followers!</div>
-    <?php elseif ($result === 'notfound'): ?>
-        <div class="flash">Couldn't find studio #<?= $sid ?> (deleted, or a wrong id?).</div>
-    <?php elseif ($result === 'busy'): ?>
-        <div class="flash">Scratch didn't answer for studio #<?= $sid ?>. Try again in a moment.</div>
-    <?php else: ?>
-        <div class="flash">That doesn't look like a studio id or link.</div>
-    <?php endif; ?>
-<?php elseif ($msg === 'topic'):
-    $result = $_GET['result'] ?? '';
-    $tid = (int)($_GET['id'] ?? 0); ?>
-    <?php if ($result === 'added' || $result === 'updated'): ?>
-        <div class="flash"><?= $result === 'added' ? 'Added' : 'Updated' ?> topic #<?= $tid ?><?= ($_GET['t'] ?? '') !== '' ? ' (' . e($_GET['t']) . ')' : '' ?><?= ($_GET['f'] ?? '') !== '' ? ' in ' . e($_GET['f']) : '' ?> - <?= number_format((int)($_GET['c'] ?? 0)) ?> replies! Its views fill in when the topic lists reach it.</div>
-    <?php elseif ($result === 'notfound'): ?>
-        <div class="flash">Couldn't find topic #<?= $tid ?> (deleted, private, or a wrong id?).</div>
-    <?php elseif ($result === 'busy'): ?>
-        <div class="flash">Scratch didn't answer for topic #<?= $tid ?>. Try again in a moment.</div>
-    <?php else: ?>
-        <div class="flash">That doesn't look like a topic id or link.</div>
-    <?php endif; ?>
-<?php elseif ($msg === 'ran'):
-    $what = $_GET['what'] ?? '';
-    $n = (int)($_GET['n'] ?? 0);
-    $p = (int)($_GET['p'] ?? 0); ?>
-    <?php if (!empty($_GET['off'])): ?>
-        <div class="flash">That crawler is switched off right now.</div>
-    <?php elseif ($what === 'studios'): ?>
-        <div class="flash"><?= $n > 0 || (int)($_GET['r'] ?? 0) > 0
-            ? 'Fetched ' . number_format($n) . ' new studio(s)' . ((int)($_GET['r'] ?? 0) > 0 ? ' and re-checked ' . number_format((int)$_GET['r']) . ' big one(s)' : '') . '.'
-            : 'No studios were waiting right now.' ?><?= e($rateNote) ?></div>
-    <?php elseif ($what === 'topics'): ?>
-        <div class="flash"><?= $n > 0
-            ? 'Read ' . number_format($p) . ' topic list page(s) and saw ' . number_format($n) . ' topic(s).'
-            : 'No topic lists were due right now.' ?><?= e($rateNote) ?></div>
-    <?php elseif ($what === 'posts'): ?>
-        <div class="flash"><?= $n > 0
-            ? 'Stored ' . number_format($n) . ' new post(s) from ' . number_format($p) . ' topic page(s).'
-            : 'No big topics were waiting for their posts right now.' ?><?= e($rateNote) ?></div>
-    <?php endif; ?>
-<?php endif; ?>
-<?php if ($showFlash): ?>
-    <script>
-    (function() {
-        if (window.history && window.history.replaceState) {
-            var url = new URL(window.location.href);
-            ['msg', 'n', 'wait', 'result', 'u', 'c', 'id', 't', 'what', 'r', 'p', 'rl', 'off', 'f'].forEach(function(k) { url.searchParams.delete(k); });
-            window.history.replaceState({}, '', url.toString());
-        }
-    })();
-    </script>
-<?php endif; ?>
+// A bare 500 with no message (like the one that prompted this comment) is
+// undiagnosable. Surface the real error instead, whatever it turns out to be
+// (execution time limit, memory limit, a DB error) - both to the browser
+// and, since cron output is normally sent by iFastNet, to that "cron output"
+// email so it's visible even for the every-5-minutes runs nobody watches live.
+register_shutdown_function(function () {
+    $err = error_get_last();
+    if ($err && in_array($err['type'], [E_ERROR, E_PARSE, E_CORE_ERROR, E_COMPILE_ERROR], true)) {
+        if (!headers_sent()) http_response_code(500);
+        echo "FATAL: {$err['message']} in {$err['file']}:{$err['line']}\n";
+    }
+});
 
-<div class="card">
-    <h2>Scratchers</h2>
-    <p>Fetch the next batch of Scratchers from the queue, or add one by username.</p>
-    <form method="get" action="/s/census/crawl-now.php">
-        <button type="submit" class="primary">Crawl Users</button>
-    </form>
-    <form method="post" action="/s/census/crawl-user.php" style="margin-top: 0.6rem;">
-        <input type="text" name="username" placeholder="username..." maxlength="50" required>
-        <button type="submit" class="primary">Crawl User</button>
-    </form>
-</div>
+try {
+    $start = microtime(true);
+    $ids = backfillScratchIds(); // picture ids, biggest users first (about 2-3s, one parallel round)
+    $start = microtime(true);
+    $processed = crawlBatch(CRAWL_BATCH_SIZE);
+    $elapsed = microtime(true) - $start;
+    $s = crawlStats();
 
-<div class="card">
-    <h2>Studios</h2>
-    <p>Fetch the next studios in the queue and re-check the biggest ones that are due, or add one by id or link.</p>
-    <form method="post" action="/s/census/crawl-run.php">
-        <input type="hidden" name="what" value="studios">
-        <button type="submit" class="primary">Crawl Studios</button>
-    </form>
-    <form method="post" action="/s/census/crawl-run.php" style="margin-top: 0.6rem;">
-        <input type="hidden" name="what" value="studio">
-        <input type="text" name="studio" placeholder="studio id or link..." maxlength="120" required>
-        <button type="submit" class="primary">Crawl Studio</button>
-    </form>
-</div>
+    $pending = (int)getDB()->query("SELECT COUNT(*) AS c FROM scratchers WHERE status = 'pending'")->fetch_assoc()['c'];
+    $rate = $elapsed > 0 ? $processed / $elapsed : 0;
 
-<div class="card">
-    <h2>Forums</h2>
-    <p>Topics reads the next pages of forum topic lists, which keeps views and replies fresh. Posts stores the text of the next big topics (50 or more replies) so the Posts search can find them. You can also add one topic by id or link.</p>
-    <form method="post" action="/s/census/crawl-run.php">
-        <input type="hidden" name="what" value="topics">
-        <button type="submit" class="primary">Crawl Forum Topics</button>
-    </form>
-    <form method="post" action="/s/census/crawl-run.php" style="margin-top: 0.6rem;">
-        <input type="hidden" name="what" value="posts">
-        <button type="submit" class="primary">Crawl Forum Posts</button>
-    </form>
-    <form method="post" action="/s/census/crawl-run.php" style="margin-top: 0.6rem;">
-        <input type="hidden" name="what" value="topic">
-        <input type="text" name="topic" placeholder="topic id or link..." maxlength="160" required>
-        <button type="submit" class="primary">Crawl Forum Topic</button>
-    </form>
-</div>
-<?php require __DIR__ . '/includes/layout-bottom.php'; ?>
+    echo "Processed {$processed} scratcher(s) in " . number_format($elapsed, 1) . "s"
+        . ($rate > 0 ? " (" . number_format($rate, 2) . "/s)" : "") . ".\n";
+    echo "fetched={$s['fetched']} errors={$s['errors']} retried={$s['retried']} queued={$s['queued']} remined={$s['remined']} refreshed={$s['refreshed']} requeued={$s['requeued']}\n";
+    echo "pending in queue: {$pending}\n";
+    echo "picture ids: filled={$ids['filled']} missing={$ids['missing']}" . ($ids['rate_limited'] ? " (429)" : "") . "\n";
+    $hv = httpVersionSeen();
+    $hvName = $hv === 0 ? 'n/a' : (defined('CURL_HTTP_VERSION_2_0') && $hv === CURL_HTTP_VERSION_2_0 ? 'HTTP/2' : 'HTTP/1.x');
+    echo "count fetch: early abort " . (COUNT_EARLY_ABORT ? "on" : "off") . ", {$hvName}\n";
+    if (!DISCOVERY_ENABLED) {
+        echo "discovery: OFF (DISCOVERY_ENABLED is false), count-only\n";
+    } else {
+        echo "discovery: " . ($s['discovery'] ? "on" : "paused, count-only (queue was " . number_format($s['pending_at_start']) . ", at or over " . number_format(DISCOVERY_PAUSE_PENDING) . ")") . "\n";
+    }
+    if ($rate > 0 && $pending > 0) {
+        // Rough only: assumes this run's rate holds and cron fires back-to-back,
+        // which it won't (5 min apart) - just a ballpark for "is this working".
+        $etaRuns = $pending / $processed;
+        echo "at this rate: ~" . number_format($etaRuns) . " more runs to clear current queue\n";
+    }
+    if ($s['rate_limited']) echo "Scratch returned 429 - stopped early.\n";
+} catch (\Throwable $e) {
+    if (!headers_sent()) http_response_code(500);
+    echo "FATAL: " . $e->getMessage() . " in " . $e->getFile() . ":" . $e->getLine() . "\n";
+}
