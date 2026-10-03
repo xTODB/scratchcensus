@@ -67,7 +67,7 @@ a { color: #ffaa33; }
 </style>
 </head>
 <body>
-    <h1>ScratchCensus</h1>
+    <h1><?php require __DIR__ . '/includes/logo.php'; ?></h1>
     <p class="sub">Scratch studios, by followers. <?= number_format($total) ?> tracked so far.</p>
 
     <div class="tabs">
