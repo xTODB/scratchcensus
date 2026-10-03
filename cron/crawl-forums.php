@@ -54,7 +54,7 @@ try {
     $start = microtime(true);
     $st = crawlForumsBatch(!$isCli && !empty($_GET['reindex']));
     $elapsed = microtime(true) - $start;
-    $s = getForumStats();
+    $s = getForumStatsCached();
 
     $rate = $elapsed > 0 ? $st['requests'] / $elapsed : 0;
     echo "Forum run: " . $st['requests'] . " request(s) in " . number_format($elapsed, 1) . "s (" . number_format($rate, 1) . "/s)\n";
