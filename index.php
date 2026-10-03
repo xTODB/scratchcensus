@@ -67,11 +67,11 @@ function censusUrl(array $over = []): string {
 // Plain browsing looks the same for everyone, so it is served from the page cache.
 $cacheKey = null;
 if ($cat === 'forums') {
-    if (($view === 'topics' || $q === '') && $page <= 100) $cacheKey = 'v2-forums-' . $view . '-' . $sort . '-' . $forumId . '-' . $page;
+    if (($view === 'topics' || $q === '') && $page <= 100) $cacheKey = 'v3-forums-' . $view . '-' . $sort . '-' . $forumId . '-' . $page;
 } elseif ($mode === 'dynamic') {
-    if ($q === '') $cacheKey = 'v2-dyn-' . $cat . '-' . $dir;
+    if ($q === '') $cacheKey = 'v3-dyn-' . $cat . '-' . $dir;
 } elseif ($qEff === '' && $page <= 100) {
-    $cacheKey = 'v2-' . $cat . '-' . $page;
+    $cacheKey = 'v3-' . $cat . '-' . $page;
 }
 if ($cacheKey !== null) pageCacheStart($cacheKey);
 
@@ -144,7 +144,7 @@ if ($cat === 'users' && $mode === 'static') {
     $order = $dir === 'up' ? 'DESC' : 'ASC';
     $like = $q !== '' ? '%' . likeEscape($q) . '%' : null;
     if ($cat === 'users') {
-        $sql = "SELECT username, follower_count, follower_delta AS delta FROM scratchers
+        $sql = "SELECT username, scratch_id, follower_count, follower_delta AS delta FROM scratchers
                 WHERE status = 'fetched' AND follower_delta $cmp AND checked_at >= DATE_SUB(NOW(), INTERVAL 2 DAY)"
              . ($like !== null ? " AND username LIKE ?" : "")
              . " ORDER BY follower_delta $order, username ASC LIMIT 100";
@@ -350,9 +350,9 @@ require __DIR__ . '/includes/layout-top.php';
         <tr>
             <td class="rank">#<?= $i + 1 ?></td>
             <td><?php if ($cat === 'users'): ?>
-                <a href="https://scratch.mit.edu/users/<?= e($r['username']) ?>/" target="_blank" rel="noopener"><?= e($r['username']) ?></a>
+                <span class="who"><?= userPicHtml(isset($r['scratch_id']) ? (int)$r['scratch_id'] : null) ?><a href="https://scratch.mit.edu/users/<?= e($r['username']) ?>/" target="_blank" rel="noopener"><?= e($r['username']) ?></a></span>
             <?php else: $full = $r['title'] !== null && $r['title'] !== '' ? $r['title'] : 'Studio ' . $r['id']; ?>
-                <a href="https://scratch.mit.edu/studios/<?= (int)$r['id'] ?>/" target="_blank" rel="noopener" title="<?= e($full) ?>"><?= e(shortTitle($full)) ?></a> <span class="muted">#<?= (int)$r['id'] ?></span>
+                <span class="who"><?= studioPicHtml((int)$r['id']) ?><span><a href="https://scratch.mit.edu/studios/<?= (int)$r['id'] ?>/" target="_blank" rel="noopener" title="<?= e($full) ?>"><?= e(shortTitle($full)) ?></a> <span class="muted">#<?= (int)$r['id'] ?></span></span></span>
             <?php endif; ?></td>
             <td class="count"><span class="delta <?= $d > 0 ? 'up' : 'down' ?>"><?= $d < 0 ? '-' : '+' ?><?= number_format(abs($d)) ?></span></td>
             <td class="count muted"><?= $pct === null ? '-' : ($d < 0 ? '-' : '+') . number_format(abs($pct), abs($pct) < 10 ? 1 : 0) . '%' ?></td>
@@ -368,7 +368,7 @@ require __DIR__ . '/includes/layout-top.php';
         <?php foreach ($rows as $s): ?>
         <tr>
             <td class="rank">#<?= (int)$s['rank'] ?></td>
-            <td><a href="https://scratch.mit.edu/users/<?= e($s['username']) ?>/" target="_blank" rel="noopener"><?= e($s['username']) ?></a></td>
+            <td><span class="who"><?= userPicHtml(isset($s['scratch_id']) ? (int)$s['scratch_id'] : null) ?><a href="https://scratch.mit.edu/users/<?= e($s['username']) ?>/" target="_blank" rel="noopener"><?= e($s['username']) ?></a></span></td>
             <td class="count"><?php $d = $s['delta'] ?? null; if ($d !== null): $d = (int)$d; ?><span class="delta <?= $d > 0 ? 'up' : ($d < 0 ? 'down' : 'zero') ?>"><?= $d < 0 ? '-' : '+' ?><?= number_format(abs($d)) ?></span> <?php endif; ?><?= number_format((int)$s['follower_count']) ?></td>
         </tr>
         <?php endforeach; ?>
@@ -381,7 +381,7 @@ require __DIR__ . '/includes/layout-top.php';
         <?php foreach ($rows as $s): ?>
         <tr>
             <td class="rank">#<?= (int)$s['rank'] ?></td>
-            <td><?php $full = $s['title'] !== null && $s['title'] !== '' ? $s['title'] : 'Studio ' . $s['id']; ?><a href="https://scratch.mit.edu/studios/<?= (int)$s['id'] ?>/" target="_blank" rel="noopener" title="<?= e($full) ?>"><?= e(shortTitle($full)) ?></a> <span class="muted">#<?= (int)$s['id'] ?></span></td>
+            <td><?php $full = $s['title'] !== null && $s['title'] !== '' ? $s['title'] : 'Studio ' . $s['id']; ?><span class="who"><?= studioPicHtml((int)$s['id']) ?><span><a href="https://scratch.mit.edu/studios/<?= (int)$s['id'] ?>/" target="_blank" rel="noopener" title="<?= e($full) ?>"><?= e(shortTitle($full)) ?></a> <span class="muted">#<?= (int)$s['id'] ?></span></span></span></td>
             <td><?php if (!empty($s['host_username'])): ?><a href="https://scratch.mit.edu/users/<?= e($s['host_username']) ?>/" target="_blank" rel="noopener"><?= e($s['host_username']) ?></a><?php else: ?><span class="muted">-</span><?php endif; ?></td>
             <td><span class="tag <?= $s['open_to_all'] ? 'open' : 'closed' ?>"><?= $s['open_to_all'] ? 'Open' : 'Closed' ?></span></td>
             <td class="count"><?= (int)$s['project_count'] >= 100 ? '100+' : number_format((int)$s['project_count']) ?></td>
