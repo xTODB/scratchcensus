@@ -124,6 +124,7 @@ a { color: #ffaa33; }
 
     <div class="control-row">
         <a class="btn" href="/s/census/studios" style="background: #2a2d31; color: #ffaa33; border: 1px solid #ffaa33;">Studios</a>
+        <a class="btn" href="/s/census/forums" style="background: #2a2d31; color: #ffaa33; border: 1px solid #ffaa33;">Forums</a>
         <a class="btn" href="/s/census/growth" style="background: #2a2d31; color: #ffaa33; border: 1px solid #ffaa33;">Growth</a>
         <a class="btn" href="/s/census/crawl-now.php">Crawl Users</a>
         <form method="post" action="/s/census/crawl-user.php" style="display: contents;">
