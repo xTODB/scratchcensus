@@ -70,6 +70,7 @@ a { color: #ffaa33; }
     <div class="tabs">
         <a href="/s/census/">Users</a>
         <a class="on" href="/s/census/studios">Studios</a>
+        <a href="/s/census/forums">Forums</a>
         <a href="/s/census/growth">Growth</a>
     </div>
 
