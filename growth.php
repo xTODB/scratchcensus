@@ -59,7 +59,7 @@ a { color: #ffaa33; }
 </style>
 </head>
 <body>
-    <h1>ScratchCensus</h1>
+    <h1><?php require __DIR__ . '/includes/logo.php'; ?></h1>
     <p class="sub">Who is gaining and losing followers.</p>
 
     <div class="tabs">
