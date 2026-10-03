@@ -87,7 +87,7 @@ mark { background: #ffaa33; color: #17191c; border-radius: 2px; padding: 0 0.1re
 </style>
 </head>
 <body>
-    <h1>ScratchCensus</h1>
+    <h1><?php require __DIR__ . '/includes/logo.php'; ?></h1>
     <p class="sub">Scratch forums. <?= number_format($stats['topics']) ?> topics and <?= number_format($stats['posts']) ?> searchable posts tracked so far.</p>
 
     <div class="tabs">
