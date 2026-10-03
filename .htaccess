@@ -2,6 +2,7 @@ RewriteEngine On
 RewriteRule ^changelog/?$ changelog.php [L,QSA]
 RewriteRule ^faq/?$ faq.php [L,QSA]
 RewriteRule ^crawl/?$ crawl.php [L,QSA]
+RewriteRule ^settings/?$ settings.php [L,QSA]
 RewriteRule ^studios/?$ studios.php [L,QSA]
 RewriteRule ^growth/?$ growth.php [L,QSA]
 RewriteRule ^forums/?$ forums.php [L,QSA]
