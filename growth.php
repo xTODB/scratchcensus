@@ -8,6 +8,9 @@ $type = ($_GET['type'] ?? '') === 'studios' ? 'studios' : 'users';
 $dir = ($_GET['dir'] ?? '') === 'down' ? 'down' : 'up';
 $limit = 100;
 
+require_once __DIR__ . '/page-cache.php';
+pageCacheStart('growth-' . $type . '-' . $dir);
+
 $db = getDB();
 $cmp = $dir === 'up' ? '> 0' : '< 0';
 $order = $dir === 'up' ? 'DESC' : 'ASC';
