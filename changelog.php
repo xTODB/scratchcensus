@@ -7,6 +7,7 @@ require __DIR__ . '/includes/layout-top.php';
 ?>
 <div class="prose">
 <h1>Changelog</h1>
+    <p>[Oct4] v5.6 - Public API! Read-only JSON for Scratchers, studios, forum topics and growth at /s/census/api (rate limited, cached). Also: picture rows no longer push Followers off screen on phones, and ScratchCensus visits now show up in the ScratchNews visitor log.</p>
     <p>[Oct3] v5.5 - Pictures! Scratcher profile pictures and studio thumbnails now show next to names. Open the new Settings page to turn them off or change their size (saved in your browser only). Picture ids are being filled in biggest users first, so some Scratchers show a grey circle for now.</p>
     <p>[Oct3] v5.4 - Add a forum topic! The Crawl page now has a box where you can paste a forum topic id or link, and ScratchCensus adds it right away with its forum, title and replies.</p>
     <p>[Oct3] v5.3 - Crawl everything! The Crawl page now has buttons for Scratchers, studios, forum topics and forum posts, plus a way to add one studio by id or link. There is also a Home button in the sidebar.</p>
