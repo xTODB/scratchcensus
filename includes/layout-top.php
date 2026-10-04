@@ -4,6 +4,8 @@
 $pageTitle = $pageTitle ?? 'ScratchCensus - a ScratchNews Site';
 $pageDesc = $pageDesc ?? 'Track everything Scratch: Scratchers, studios and forums.';
 $navActive = $navActive ?? '';
+require_once __DIR__ . '/visit-log.php';
+censusLogVisit(); // no-op if the page already logged itself (index.php does, before its page cache)
 $cssVersion = (int)@filemtime(__DIR__ . '/../assets/census.css');
 $navItems = [
     'home' => ['/s/census/', 'Home', '<path d="M3 9l9-7 9 7v11a2 2 0 0 1-2 2H5a2 2 0 0 1-2-2z"/><polyline points="9 22 9 12 15 12 15 22"/>'],
