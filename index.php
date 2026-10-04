@@ -64,6 +64,10 @@ function censusUrl(array $over = []): string {
     return '/s/census/' . ($p ? '?' . http_build_query($p) : '');
 }
 
+// Visitor log (main ScratchNews log). Done before the page cache so cached views count too.
+require_once __DIR__ . '/includes/visit-log.php';
+censusLogVisit('/s/census' . ($cat === 'forums' ? '/forums' : ($mode === 'dynamic' ? '/growth' : ($cat === 'studios' ? '/studios' : ''))));
+
 // Plain browsing looks the same for everyone, so it is served from the page cache.
 $cacheKey = null;
 if ($cat === 'forums') {
