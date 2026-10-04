@@ -207,7 +207,7 @@ function queueUsername(string $username, ?string $discoveredFrom = null, int $pr
 }
 
 // One INSERT IGNORE per 200 usernames instead of one per username.
-// $items: list of [username, discovered_from, priority, picture id (optional)].
+// $items: list of [username, discovered_from, priority, picture id (optional), country (optional)].
 function queueUsernamesBulk(array $items): void {
     if (!$items) return;
     $db = getDB();
@@ -220,18 +220,20 @@ function queueUsernamesBulk(array $items): void {
         $unique[] = $it;
     }
     foreach (array_chunk($unique, 200) as $chunk) {
-        $placeholders = implode(',', array_fill(0, count($chunk), '(?, ?, ?, ?)'));
+        $placeholders = implode(',', array_fill(0, count($chunk), '(?, ?, ?, ?, ?)'));
         $params = [];
         foreach ($chunk as $it) {
             $params[] = $it[0];
             $params[] = $it[1];
             $params[] = (int)$it[2];
             $params[] = isset($it[3]) && $it[3] ? (int)$it[3] : null; // picture id, when the API gave one
+            $params[] = isset($it[4]) && is_string($it[4]) && $it[4] !== '' ? $it[4] : null; // country, when the API gave one
         }
-        // New names are queued as before. Names already known only get their picture id filled in if it was missing.
-        $stmt = $db->prepare("INSERT IGNORE INTO scratchers (username, discovered_from, priority, scratch_id) VALUES $placeholders
-            ON DUPLICATE KEY UPDATE scratch_id = IF(scratch_id IS NULL, VALUES(scratch_id), scratch_id)");
-        $stmt->bind_param(str_repeat('ssii', count($chunk)), ...$params);
+        // New names are queued as before. Names already known only get their picture id and country filled in if missing.
+        $stmt = $db->prepare("INSERT IGNORE INTO scratchers (username, discovered_from, priority, scratch_id, country) VALUES $placeholders
+            ON DUPLICATE KEY UPDATE scratch_id = IF(scratch_id IS NULL, VALUES(scratch_id), scratch_id),
+                                    country = IF(country IS NULL, VALUES(country), country)");
+        $stmt->bind_param(str_repeat('ssiis', count($chunk)), ...$params);
         $stmt->execute();
         $stmt->close();
     }
@@ -243,6 +245,15 @@ function scratchPictureId(array $u): ?int {
     $img = $u['profile']['images']['90x90'] ?? ($u['profile']['images']['60x60'] ?? '');
     if (is_string($img) && preg_match('~/get_image/user/(\d+)_~', $img, $m)) return (int)$m[1];
     return !empty($u['id']) ? (int)$u['id'] : null;
+}
+
+// The country on a user's profile ("Moldova", "United States", ...). Null when the API gave none,
+// which the database keeps as NULL = "not known yet" (so it still gets looked up later).
+function scratchCountry(array $u): ?string {
+    $c = $u['profile']['country'] ?? null;
+    if (!is_string($c)) return null;
+    $c = trim($c);
+    return $c === '' ? null : mb_substr($c, 0, 64);
 }
 
 // Discovery only, not a full crawl: up to DISCOVER_*_MAX_PAGES pages of
@@ -288,7 +299,7 @@ function discoverBatch(array $jobs): array {
             if (!is_array($data) || count($data) === 0) continue;
             $priority = $rq['kind'] === 'following' ? (int)$jobs[$rq['user']]['count'] : 0;
             foreach ($data as $u) {
-                if (!empty($u['username'])) $items[] = [$u['username'], $rq['user'], $priority, scratchPictureId($u)];
+                if (!empty($u['username'])) $items[] = [$u['username'], $rq['user'], $priority, scratchPictureId($u), scratchCountry($u)];
             }
             // A short page means that was the last one; otherwise keep going up to the cap.
             if (count($data) >= DISCOVER_PAGE_SIZE && $rq['page'] < $rq['max']) {
@@ -953,7 +964,7 @@ function attachCheckedAt(array &$rows): void {
     $names = array_column($rows, 'username');
     $db = getDB();
     $in = implode(',', array_fill(0, count($names), '?'));
-    $stmt = $db->prepare("SELECT username, checked_at, scratch_id, IF(checked_at >= DATE_SUB(NOW(), INTERVAL 2 DAY), follower_delta, NULL) AS delta FROM scratchers WHERE username IN ($in)");
+    $stmt = $db->prepare("SELECT username, checked_at, scratch_id, country, IF(checked_at >= DATE_SUB(NOW(), INTERVAL 2 DAY), follower_delta, NULL) AS delta FROM scratchers WHERE username IN ($in)");
     $stmt->bind_param(str_repeat('s', count($names)), ...$names);
     $stmt->execute();
     $map = [];
@@ -962,6 +973,7 @@ function attachCheckedAt(array &$rows): void {
     foreach ($rows as &$row) {
         $row['checked_at'] = $map[$row['username']]['checked_at'] ?? null;
         $row['scratch_id'] = isset($map[$row['username']]['scratch_id']) ? (int)$map[$row['username']]['scratch_id'] : null;
+        $row['country'] = $map[$row['username']]['country'] ?? null;
         $d = $map[$row['username']]['delta'] ?? null;
         $row['delta'] = $d === null ? null : (int)$d; // null = no refresh to show a change for
     }
@@ -979,9 +991,10 @@ function likeEscape(string $s): string {
 // ---- Combined search. One query string can mix any of:
 //   f>=12 f<=15     follower-count comparisons (=, <, <=, >, >=), all must hold
 //   exact:username  that one user only (still has to pass the other parts)
+//   country:Moldova  only that country; quote or use _ for two words: country:"United States", country:United_States
 //   anything else   partial, case-insensitive username match
 // e.g. "f>=12 f<=15", "f<=300 a", "exact:griffpatch f=787134".
-// Returns ['conds' => [[op, int], ...], 'exact' => ?string, 'text' => string].
+// Returns ['conds' => [[op, int], ...], 'exact' => ?string, 'country' => ?string, 'text' => string].
 function parseSearchQuery(string $q): array {
     $conds = [];
     $q = preg_replace_callback('/(?<![\w-])f\s*(<=|>=|=|<|>)\s*(\d{1,10})(?![\w-])/i', function ($m) use (&$conds) {
@@ -993,13 +1006,20 @@ function parseSearchQuery(string $q): array {
         if ($m[1] !== '') $exact = $m[1];
         return ' ';
     }, $q);
+    $country = null;
+    $q = preg_replace_callback('/(?<!\S)country:(?:"([^"]*)"|(\S*))/i', function ($m) use (&$country) {
+        $c = trim(str_replace('_', ' ', ($m[1] ?? '') !== '' ? $m[1] : ($m[2] ?? '')));
+        if ($c !== '') $country = mb_substr(preg_replace('/\s+/', ' ', $c), 0, 64);
+        return ' ';
+    }, $q);
     $text = trim(preg_replace('/\s+/', ' ', $q));
-    return ['conds' => $conds, 'exact' => $exact, 'text' => $text];
+    return ['conds' => $conds, 'exact' => $exact, 'country' => $country, 'text' => $text];
 }
 
 // Does an already-loaded row pass the follower comparisons and text part?
 // (Used for exact:, where the row is fetched by name first.)
-function rowMatchesSearch(array $row, array $conds, string $text): bool {
+function rowMatchesSearch(array $row, array $conds, string $text, ?string $country = null): bool {
+    if ($country !== null && mb_strtolower((string)($row['country'] ?? '')) !== mb_strtolower($country)) return false;
     $fc = (int)$row['follower_count'];
     foreach ($conds as [$op, $v]) {
         if ($op === '=' && !($fc == $v)) return false;
@@ -1013,10 +1033,15 @@ function rowMatchesSearch(array $row, array $conds, string $text): bool {
 
 // $conds ops are whitelisted here - never interpolate a raw user string as an
 // operator, it isn't a bound parameter. Returns [where, types, params].
-function buildSearchWhere(array $conds, string $text): array {
+function buildSearchWhere(array $conds, string $text, ?string $country = null): array {
     $where = "status = 'fetched'";
     $types = '';
     $params = [];
+    if ($country !== null) {
+        $where .= " AND country = ?";
+        $types .= 's';
+        $params[] = $country;
+    }
     foreach ($conds as [$op, $v]) {
         if (!in_array($op, ['=', '<', '<=', '>', '>='], true)) continue;
         $where .= " AND follower_count $op ?";
@@ -1035,9 +1060,11 @@ function buildSearchWhere(array $conds, string $text): array {
 // With only follower comparisons the matches are one CONTIGUOUS block of the
 // leaderboard (rank the first row, the rest are +1 each). Adding a username
 // part breaks that, so those use the histogram ranks.
-function searchScratchersAdvanced(array $conds, string $text, int $page, int $perPage = 100): array {
+// With a country the list is ordered by (country, followers, username) so the (status, country, follower_count, username)
+// index serves it: ties come out username DESC there, and the # column is the position inside that country's results.
+function searchScratchersAdvanced(array $conds, string $text, int $page, int $perPage = 100, ?string $country = null): array {
     $db = getDB();
-    [$where, $types, $params] = buildSearchWhere($conds, $text);
+    [$where, $types, $params] = buildSearchWhere($conds, $text, $country);
 
     $stmt = $db->prepare("SELECT COUNT(*) AS c FROM scratchers WHERE $where");
     if ($params) $stmt->bind_param($types, ...$params);
@@ -1047,14 +1074,17 @@ function searchScratchersAdvanced(array $conds, string $text, int $page, int $pe
 
     $offset = ($page - 1) * $perPage;
     $stmt = $db->prepare("SELECT username, follower_count FROM scratchers WHERE $where
-        ORDER BY follower_count DESC, username ASC LIMIT ? OFFSET ?");
+        ORDER BY follower_count DESC, username " . ($country !== null ? 'DESC' : 'ASC') . " LIMIT ? OFFSET ?");
     $stmt->bind_param($types . 'ii', ...array_merge($params, [$perPage, $offset]));
     $stmt->execute();
     $rows = $stmt->get_result()->fetch_all(MYSQLI_ASSOC);
     $stmt->close();
 
     attachCheckedAt($rows);
-    if ($rows) {
+    if ($rows && $country !== null) {
+        foreach ($rows as $i => &$row) $row['rank'] = $offset + $i + 1;
+        unset($row);
+    } elseif ($rows) {
         if ($text === '') {
             $first = rankOf((int)$rows[0]['follower_count'], $rows[0]['username']);
             foreach ($rows as $i => &$row) $row['rank'] = $first + $i;
@@ -1071,7 +1101,7 @@ function searchScratchersAdvanced(array $conds, string $text, int $page, int $pe
 // still pending, or errored) so the caller can offer to crawl it.
 function getExactScratcher(string $username): ?array {
     $db = getDB();
-    $stmt = $db->prepare("SELECT username, follower_count, checked_at, scratch_id, IF(checked_at >= DATE_SUB(NOW(), INTERVAL 2 DAY), follower_delta, NULL) AS delta
+    $stmt = $db->prepare("SELECT username, follower_count, checked_at, scratch_id, country, IF(checked_at >= DATE_SUB(NOW(), INTERVAL 2 DAY), follower_delta, NULL) AS delta
         FROM scratchers WHERE status = 'fetched' AND username = ?");
     $stmt->bind_param('s', $username);
     $stmt->execute();
@@ -1174,41 +1204,74 @@ function crawlSingleUsername(string $username): array {
 }
 
 
-// ---- Picture ids ------------------------------------------------------------
-// Profile pictures need the number in the picture link. Discovery fills it for the people it sees;
-// this reads it for the biggest users that still have none, one API request each, biggest first.
-// scratch_id 0 = "looked, no picture id" (a real 404), so nobody is asked twice.
-defined('ID_BACKFILL_PER_RUN') || define('ID_BACKFILL_PER_RUN', 60); // users per cron run, 0 = off
+// ---- Picture ids and countries ------------------------------------------------
+// Profile pictures need the number in the picture link and the country filter needs the profile's country.
+// Discovery fills both for the people it sees; this reads them for the biggest users that still miss one,
+// one API request each (one request gives both), biggest first.
+// scratch_id 0 = "looked, no picture id" (a real 404), so nobody is asked twice; country '' = same for the country.
+defined('ID_BACKFILL_PER_RUN') || define('ID_BACKFILL_PER_RUN', 100); // users per cron run, 0 = off (was 60 before countries; about 6s at 100)
 function backfillScratchIds(int $limit = ID_BACKFILL_PER_RUN): array {
-    $out = ['filled' => 0, 'missing' => 0, 'rate_limited' => false];
+    $out = ['filled' => 0, 'missing' => 0, 'countries' => 0, 'rate_limited' => false];
     if ($limit <= 0) return $out;
     $db = getDB();
-    $res = $db->query("SELECT username FROM scratchers WHERE status = 'fetched' AND scratch_id IS NULL ORDER BY follower_count DESC LIMIT " . (int)$limit);
-    $names = $res ? array_column($res->fetch_all(MYSQLI_ASSOC), 'username') : [];
+    // Countries first: nobody has one yet, and the filter should fill from the biggest users down.
+    $names = [];
+    $res = $db->query("SELECT username FROM scratchers WHERE status = 'fetched' AND country IS NULL ORDER BY follower_count DESC LIMIT " . (int)$limit);
+    if ($res) foreach ($res->fetch_all(MYSQLI_ASSOC) as $r) $names[$r['username']] = true;
+    if (count($names) < $limit) {
+        $res = $db->query("SELECT username FROM scratchers WHERE status = 'fetched' AND scratch_id IS NULL ORDER BY follower_count DESC LIMIT " . (int)($limit - count($names)));
+        if ($res) foreach ($res->fetch_all(MYSQLI_ASSOC) as $r) $names[$r['username']] = true;
+    }
+    $names = array_map('strval', array_keys($names));
     if (!$names) return $out;
     $urls = [];
     foreach ($names as $i => $n) $urls[$i] = 'https://api.scratch.mit.edu/users/' . rawurlencode($n);
     $r = httpMultiGet($urls);
     if ($r['rate_limited']) $out['rate_limited'] = true;
-    $upd = $db->prepare("UPDATE scratchers SET scratch_id = ? WHERE username = ? AND scratch_id IS NULL");
+    $upd = $db->prepare("UPDATE scratchers SET scratch_id = IF(scratch_id IS NULL, ?, scratch_id), country = IF(country IS NULL, ?, country) WHERE username = ?");
     foreach ($names as $i => $n) {
         $x = $r['results'][$i] ?? null;
         if (!$x) continue; // not attempted (429): leave it for the next run
         if ($x['code'] === 200) {
             $u = json_decode((string)$x['body'], true);
-            $id = is_array($u) ? scratchPictureId($u) : null;
+            if (!is_array($u)) continue;
+            $id = scratchPictureId($u);
             if (!$id) continue;
+            $country = scratchCountry($u) ?? ''; // a profile with no country is stored as '' so it is not asked again
         } elseif ($x['code'] === 404) {
             $id = 0;
+            $country = '';
             $out['missing']++;
         } else {
             continue;
         }
-        $upd->bind_param('is', $id, $n);
+        $upd->bind_param('iss', $id, $country, $n);
         $upd->execute();
         if ($id) $out['filled']++;
+        if ($country !== '') $out['countries']++;
     }
     $upd->close();
+    return $out;
+}
+
+// The country list for the Filter window: [name, how many users], plus how many users have a country at all.
+// One GROUP BY over the index, kept in a temp file for COUNTRY_LIST_CACHE_SEC.
+defined('COUNTRY_LIST_CACHE_SEC') || define('COUNTRY_LIST_CACHE_SEC', 900);
+function getCountryChoices(): array {
+    $f = sys_get_temp_dir() . '/scratchcensus_countries_' . md5(__DIR__);
+    if (is_file($f) && time() - (int)@filemtime($f) < (int)COUNTRY_LIST_CACHE_SEC) {
+        $c = json_decode((string)@file_get_contents($f), true);
+        if (is_array($c) && isset($c['list'])) return $c;
+    }
+    $list = [];
+    $known = 0;
+    try {
+        $res = getDB()->query("SELECT country, COUNT(*) AS c FROM scratchers WHERE status = 'fetched' AND country IS NOT NULL AND country <> '' GROUP BY country ORDER BY country");
+        if ($res) foreach ($res->fetch_all(MYSQLI_ASSOC) as $r) { $list[] = [$r['country'], (int)$r['c']]; $known += (int)$r['c']; }
+    } catch (\Throwable $e) {
+    }
+    $out = ['list' => $list, 'known' => $known];
+    @file_put_contents($f, json_encode($out));
     return $out;
 }
 
