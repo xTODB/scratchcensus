@@ -42,7 +42,7 @@ register_shutdown_function(function () {
 
 try {
     $start = microtime(true);
-    $ids = backfillScratchIds(); // picture ids, biggest users first (about 2-3s, one parallel round)
+    $ids = backfillScratchIds(); // picture ids and countries, biggest users first (about 6s at the default 100, one parallel round)
     $start = microtime(true);
     $processed = crawlBatch(CRAWL_BATCH_SIZE);
     $elapsed = microtime(true) - $start;
@@ -55,7 +55,7 @@ try {
         . ($rate > 0 ? " (" . number_format($rate, 2) . "/s)" : "") . ".\n";
     echo "fetched={$s['fetched']} errors={$s['errors']} retried={$s['retried']} queued={$s['queued']} remined={$s['remined']} refreshed={$s['refreshed']} requeued={$s['requeued']}\n";
     echo "pending in queue: {$pending}\n";
-    echo "picture ids: filled={$ids['filled']} missing={$ids['missing']}" . ($ids['rate_limited'] ? " (429)" : "") . "\n";
+    echo "picture ids and countries: filled={$ids['filled']} countries={$ids['countries']} missing={$ids['missing']}" . ($ids['rate_limited'] ? " (429)" : "") . "\n";
     $hv = httpVersionSeen();
     $hvName = $hv === 0 ? 'n/a' : (defined('CURL_HTTP_VERSION_2_0') && $hv === CURL_HTTP_VERSION_2_0 ? 'HTTP/2' : 'HTTP/1.x');
     echo "count fetch: early abort " . (COUNT_EARLY_ABORT ? "on" : "off") . ", {$hvName}\n";
