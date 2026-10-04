@@ -8,6 +8,7 @@ RewriteRule ^api(/.*)?$ api.php [L,QSA]
 RewriteRule ^studios/?$ studios.php [L,QSA]
 RewriteRule ^growth/?$ growth.php [L,QSA]
 RewriteRule ^forums/?$ forums.php [L,QSA]
+RewriteRule ^u/([^/]+)/?$ profile.php?u=$1 [L,QSA]
 
 # Smaller downloads: compress text, let browsers keep images for a month.
 <IfModule mod_deflate.c>
