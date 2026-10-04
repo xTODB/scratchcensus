@@ -43,6 +43,7 @@ function apiRowUser(array $r): array {
         'checked_at' => $r['checked_at'] ?? null,
         'profile_url' => 'https://scratch.mit.edu/users/' . rawurlencode($r['username']) . '/',
         'picture' => userPicUrl(isset($r['scratch_id']) ? (int)$r['scratch_id'] : null),
+        'country' => isset($r['country']) && $r['country'] !== '' ? $r['country'] : null,
     ];
 }
 function apiRowStudio(array $r): array {
@@ -63,9 +64,13 @@ function apiRowStudio(array $r): array {
 function apiPaging(int $page, int $limit, int $total): array {
     return ['page' => $page, 'limit' => $limit, 'total' => $total, 'total_pages' => max(1, (int)ceil($total / $limit))];
 }
-// q / fmin / fmax shared by users and studios. Returns [search string, was a search used]
-function apiSearchString(): array {
+// q / fmin / fmax shared by users and studios (country only for users). Returns [search string, was a search used]
+function apiSearchString(bool $withCountry = false): array {
     $q = trim(mb_substr((string)($_GET['q'] ?? ''), 0, 100));
+    if ($withCountry) {
+        $c = trim(str_replace('"', '', mb_substr((string)($_GET['country'] ?? ''), 0, 64)));
+        if ($c !== '') $q .= ' country:"' . $c . '"';
+    }
     $fmin = apiInt($_GET['fmin'] ?? null, -1, -1, 2000000000);
     $fmax = apiInt($_GET['fmax'] ?? null, -1, -1, 2000000000);
     if ($fmin >= 0) $q .= ' f>=' . $fmin;
@@ -82,7 +87,7 @@ function apiUsers(?string $name): array {
         return ['user' => apiRowUser($row)];
     }
     $limit = apiInt($_GET['limit'] ?? null, 50, 1, (int)API_MAX_LIMIT);
-    [$qs, $search] = apiSearchString();
+    [$qs, $search] = apiSearchString(true);
     $page = apiInt($_GET['page'] ?? null, 1, 1, $search ? 500 : 100000);
     if (!$search) {
         $total = getScratcherCount();
@@ -95,11 +100,11 @@ function apiUsers(?string $name): array {
         $p = parseSearchQuery($qs);
         if ($p['exact'] !== null) {
             $row = getExactScratcher($p['exact']);
-            $rows = ($row && rowMatchesSearch($row, $p['conds'], $p['text'])) ? [$row] : [];
+            $rows = ($row && rowMatchesSearch($row, $p['conds'], $p['text'], $p['country'])) ? [$row] : [];
             $total = count($rows);
             $page = 1;
         } else {
-            $res = searchScratchersAdvanced($p['conds'], $p['text'], $page, $limit);
+            $res = searchScratchersAdvanced($p['conds'], $p['text'], $page, $limit, $p['country']);
             $rows = $res['rows'];
             $total = $res['total'];
         }
@@ -177,6 +182,11 @@ function apiGrowth(): array {
     return ['type' => $type, 'direction' => $dir, 'results' => array_map($type === 'users' ? 'apiRowUser' : 'apiRowStudio', $rows)];
 }
 
+function apiCountries(): array {
+    $c = getCountryChoices();
+    return ['known_users' => (int)$c['known'], 'results' => array_map(fn($r) => ['country' => $r[0], 'users' => (int)$r[1]], $c['list'])];
+}
+
 function apiStats(): array {
     $f = getForumStatsCached();
     return ['users' => getScratcherCount(), 'studios' => getStudioCount(), 'forum_topics' => (int)$f['topics'], 'forum_posts_stored' => (int)$f['posts'], 'forums' => (int)$f['forums']];
@@ -188,11 +198,12 @@ function apiIndex(): array {
         'about' => 'Read-only JSON about tracked Scratchers, studios and forum topics. Not affiliated with the Scratch Team.',
         'base' => 'https://scratchnews.net/s/census/api',
         'docs' => 'https://scratchnews.net/s/census/api-docs',
-        'rate_limit' => ['units_per_window' => (int)API_RATE_LIMIT, 'window_seconds' => (int)API_RATE_WINDOW_SEC, 'note' => 'A plain request costs 1 unit, a search (q, fmin, fmax) costs 3. Responses carry X-RateLimit-* headers; over the limit you get HTTP 429 with Retry-After.'],
+        'rate_limit' => ['units_per_window' => (int)API_RATE_LIMIT, 'window_seconds' => (int)API_RATE_WINDOW_SEC, 'note' => 'A plain request costs 1 unit, a search (q, fmin, fmax, country) costs 3. Responses carry X-RateLimit-* headers; over the limit you get HTTP 429 with Retry-After.'],
         'cache' => 'Responses are cached for ' . (int)API_CACHE_TTL_SEC . ' seconds.',
         'max_limit' => (int)API_MAX_LIMIT,
         'endpoints' => [
-            '/users' => 'page, limit, q (search syntax like the site, e.g. exact:griffpatch or f>=100), fmin, fmax',
+            '/users' => 'page, limit, q (search syntax like the site, e.g. exact:griffpatch or f>=100), fmin, fmax, country (e.g. Moldova)',
+            '/countries' => 'every country with how many tracked Scratchers it has',
             '/users/{username}' => 'one Scratcher with rank',
             '/studios' => 'page, limit, q, fmin, fmax, access=open|closed',
             '/studios/{id}' => 'one studio with rank',
@@ -206,11 +217,11 @@ function apiIndex(): array {
 }
 
 // ---- run: rate limit, cache, handler
-$handlers = ['' => 'apiIndex', 'stats' => 'apiStats', 'forums' => 'apiForums', 'topics' => 'apiTopics', 'growth' => 'apiGrowth', 'users' => 'apiUsers', 'studios' => 'apiStudios'];
+$handlers = ['' => 'apiIndex', 'stats' => 'apiStats', 'forums' => 'apiForums', 'topics' => 'apiTopics', 'growth' => 'apiGrowth', 'countries' => 'apiCountries', 'users' => 'apiUsers', 'studios' => 'apiStudios'];
 if (!isset($handlers[$endpoint])) apiError(404, 'Unknown endpoint. See /s/census/api');
 if ($arg !== null && !in_array($endpoint, ['users', 'studios'], true)) apiError(404, 'Unknown endpoint. See /s/census/api');
 
-$isSearch = isset($_GET['q']) && trim((string)$_GET['q']) !== '' || (isset($_GET['fmin']) && $_GET['fmin'] !== '') || (isset($_GET['fmax']) && $_GET['fmax'] !== '');
+$isSearch = isset($_GET['q']) && trim((string)$_GET['q']) !== '' || (isset($_GET['fmin']) && $_GET['fmin'] !== '') || (isset($_GET['fmax']) && $_GET['fmax'] !== '') || ($endpoint === 'users' && isset($_GET['country']) && trim((string)$_GET['country']) !== '');
 $cost = $endpoint === '' ? 0 : (($isSearch && in_array($endpoint, ['users', 'studios'], true) && $arg === null) ? 3 : 1);
 $GLOBALS['api_headers'] = ['Access-Control-Allow-Origin' => '*', 'X-RateLimit-Limit' => (string)API_RATE_LIMIT];
 if ($cost > 0) {
@@ -221,7 +232,7 @@ if ($cost > 0) {
 }
 
 // cache key = the route plus only the parameters this endpoint understands
-$known = ['users' => ['page', 'limit', 'q', 'fmin', 'fmax'], 'studios' => ['page', 'limit', 'q', 'fmin', 'fmax', 'access'],
+$known = ['users' => ['page', 'limit', 'q', 'fmin', 'fmax', 'country'], 'studios' => ['page', 'limit', 'q', 'fmin', 'fmax', 'access'],
           'topics' => ['page', 'limit', 'sort', 'forum'], 'growth' => ['type', 'dir', 'limit']];
 $kp = [];
 foreach ($known[$endpoint] ?? [] as $k) if (isset($_GET[$k])) $kp[$k] = (string)$_GET[$k];
