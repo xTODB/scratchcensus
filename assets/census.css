@@ -138,11 +138,14 @@ html[data-img="on"][data-imgsize="l"] .pic.studio { width: 119px; height: 70px; 
 .setrow input[type="checkbox"] { width: 1.2rem; height: 1.2rem; accent-color: #ffaa33; }
 .setnote { color: var(--muted); margin: 0.2rem 0 1rem; }
 
+.who .cty { flex: none; font-size: 0.78rem; }
+
 /* phones: smaller pictures and padding (placed after the base picture rules so they win) */
 @media (max-width: 800px) {
     th, td { padding: 0.5rem 0.4rem; }
     .rank { width: 2.2rem; }
     .who { gap: 0.4rem; }
+    .who .cty { display: none; } /* no room next to Followers on a phone */
     html[data-img="on"][data-imgsize="s"] .pic.user { width: 24px; height: 24px; }
     html[data-img="on"][data-imgsize="m"] .pic.user { width: 34px; height: 34px; }
     html[data-img="on"][data-imgsize="l"] .pic.user { width: 48px; height: 48px; }
