@@ -18,6 +18,8 @@ $access = in_array($_GET['access'] ?? '', ['open', 'closed'], true) ? $_GET['acc
 $view = ($_GET['view'] ?? '') === 'posts' ? 'posts' : 'topics';
 $sort = ($_GET['sort'] ?? '') === 'replies' ? 'replies' : 'views';
 $forumId = max(0, (int)($_GET['f'] ?? 0));
+$country = trim(preg_replace('/\s+/', ' ', mb_substr((string)($_GET['country'] ?? ''), 0, 64)));
+if ($cat !== 'users') $country = '';
 if ($cat === 'forums' && $q !== '') $view = 'posts'; // typing a search means searching posts
 
 // The Filter window writes the same search syntax people already type (f>=100, open, closed).
@@ -26,6 +28,7 @@ if ($mode === 'static' && $cat !== 'forums') {
     if ($fmin !== null) $qEff .= ' f>=' . $fmin;
     if ($fmax !== null) $qEff .= ' f<=' . $fmax;
     if ($cat === 'studios' && $access !== '') $qEff .= ' ' . $access;
+    if ($cat === 'users' && $country !== '') $qEff .= ' country:"' . str_replace('"', '', $country) . '"';
     $qEff = trim($qEff);
 }
 
@@ -33,24 +36,25 @@ $activeFilters = 0;
 if ($cat === 'forums') {
     $activeFilters = ($view === 'posts' ? 1 : 0) + ($view === 'topics' && $sort === 'replies' ? 1 : 0) + ($forumId > 0 ? 1 : 0);
 } elseif ($mode === 'dynamic') {
-    $activeFilters = $dir === 'down' ? 1 : 0;
+    $activeFilters = ($dir === 'down' ? 1 : 0) + ($country !== '' ? 1 : 0);
 } else {
-    $activeFilters = ($fmin !== null ? 1 : 0) + ($fmax !== null ? 1 : 0) + ($cat === 'studios' && $access !== '' ? 1 : 0);
+    $activeFilters = ($fmin !== null ? 1 : 0) + ($fmax !== null ? 1 : 0) + ($cat === 'studios' && $access !== '' ? 1 : 0) + ($country !== '' ? 1 : 0);
 }
 
 // Parameters that matter for the current view, with defaults left out.
 function censusParams(array $over = []): array {
-    global $cat, $mode, $q, $page, $dir, $fmin, $fmax, $access, $view, $sort, $forumId;
+    global $cat, $mode, $q, $page, $dir, $fmin, $fmax, $access, $view, $sort, $forumId, $country;
     $p = array_merge([
         'c' => $cat, 'm' => $mode, 'q' => $q, 'page' => $page, 'dir' => $dir, 'fmin' => $fmin, 'fmax' => $fmax,
-        'access' => $access, 'view' => $view, 'sort' => $sort, 'f' => $forumId,
+        'access' => $access, 'view' => $view, 'sort' => $sort, 'f' => $forumId, 'country' => $country,
     ], $over);
     if ($p['c'] === 'forums') {
-        unset($p['m'], $p['dir'], $p['fmin'], $p['fmax'], $p['access']);
+        unset($p['m'], $p['dir'], $p['fmin'], $p['fmax'], $p['access'], $p['country']);
         if ($p['view'] === 'posts') unset($p['sort']); else unset($p['q']);
     } else {
         unset($p['view'], $p['sort'], $p['f']);
         if ($p['c'] !== 'studios') unset($p['access']);
+        if ($p['c'] !== 'users') unset($p['country']);
         if ($p['m'] === 'dynamic') unset($p['fmin'], $p['fmax'], $p['access'], $p['page']); else unset($p['dir']);
     }
     $defaults = ['c' => 'users', 'm' => 'static', 'page' => 1, 'dir' => 'up', 'view' => 'topics', 'sort' => 'views', 'f' => 0];
@@ -71,11 +75,11 @@ censusLogVisit('/s/census' . ($cat === 'forums' ? '/forums' : ($mode === 'dynami
 // Plain browsing looks the same for everyone, so it is served from the page cache.
 $cacheKey = null;
 if ($cat === 'forums') {
-    if (($view === 'topics' || $q === '') && $page <= 100) $cacheKey = 'v3-forums-' . $view . '-' . $sort . '-' . $forumId . '-' . $page;
+    if (($view === 'topics' || $q === '') && $page <= 100) $cacheKey = 'v4-forums-' . $view . '-' . $sort . '-' . $forumId . '-' . $page;
 } elseif ($mode === 'dynamic') {
-    if ($q === '') $cacheKey = 'v3-dyn-' . $cat . '-' . $dir;
+    if ($q === '' && $country === '') $cacheKey = 'v4-dyn-' . $cat . '-' . $dir;
 } elseif ($qEff === '' && $page <= 100) {
-    $cacheKey = 'v3-' . $cat . '-' . $page;
+    $cacheKey = 'v4-' . $cat . '-' . $page;
 }
 if ($cacheKey !== null) pageCacheStart($cacheKey);
 
@@ -99,7 +103,7 @@ if ($cat === 'users' && $mode === 'static') {
         $t0 = microtime(true);
         $exactRow = getExactScratcher($parsed['exact']);
         $searchTime = microtime(true) - $t0;
-        if ($exactRow && rowMatchesSearch($exactRow, $parsed['conds'], $parsed['text'])) {
+        if ($exactRow && rowMatchesSearch($exactRow, $parsed['conds'], $parsed['text'], $parsed['country'])) {
             $rows = [$exactRow];
         } elseif (!$exactRow) {
             $exactMissing = $parsed['exact'];
@@ -107,9 +111,9 @@ if ($cat === 'users' && $mode === 'static') {
         $found = count($rows);
         $page = 1;
     } elseif ($parsed !== null) {
-        $isFollowers = (bool)$parsed['conds'];
+        $isFollowers = (bool)$parsed['conds'] || $parsed['country'] !== null; // plain-name hint only makes sense for a name-only search
         $t0 = microtime(true);
-        $result = searchScratchersAdvanced($parsed['conds'], $parsed['text'], $page, $perPage);
+        $result = searchScratchersAdvanced($parsed['conds'], $parsed['text'], $page, $perPage, $parsed['country']);
         $searchTime = microtime(true) - $t0;
         $rows = $result['rows'];
         $found = $result['total'];
@@ -148,8 +152,9 @@ if ($cat === 'users' && $mode === 'static') {
     $order = $dir === 'up' ? 'DESC' : 'ASC';
     $like = $q !== '' ? '%' . likeEscape($q) . '%' : null;
     if ($cat === 'users') {
-        $sql = "SELECT username, scratch_id, follower_count, follower_delta AS delta FROM scratchers
+        $sql = "SELECT username, scratch_id, country, follower_count, follower_delta AS delta FROM scratchers
                 WHERE status = 'fetched' AND follower_delta $cmp AND checked_at >= DATE_SUB(NOW(), INTERVAL 2 DAY)"
+             . ($country !== '' ? " AND country = ?" : "")
              . ($like !== null ? " AND username LIKE ?" : "")
              . " ORDER BY follower_delta $order, username ASC LIMIT 100";
     } else {
@@ -159,11 +164,14 @@ if ($cat === 'users' && $mode === 'static') {
              . " ORDER BY follower_delta $order, id ASC LIMIT 100";
     }
     $stmt = $db->prepare($sql);
-    if ($like !== null) $stmt->bind_param('s', $like);
+    $bind = [];
+    if ($country !== '') $bind[] = $country;
+    if ($like !== null) $bind[] = $like;
+    if ($bind) $stmt->bind_param(str_repeat('s', count($bind)), ...$bind);
     $t0 = microtime(true);
     $stmt->execute();
     $rows = $stmt->get_result()->fetch_all(MYSQLI_ASSOC);
-    if ($like !== null) $searchTime = microtime(true) - $t0;
+    if ($like !== null || $country !== '') $searchTime = microtime(true) - $t0;
     $found = count($rows);
     $page = 1;
 } else { // forums
@@ -196,9 +204,10 @@ $pageDesc = [
 ][$cat];
 $navActive = 'home';
 $searchPlaceholder = $cat === 'forums' ? 'Search posts... (words, or "an exact phrase")'
-    : ($cat === 'studios' ? 'Search studio title... (open, closed, id:56, f>=100)' : 'Search username... (exact:name, f>=100)');
+    : ($cat === 'studios' ? 'Search studio title... (open, closed, id:56, f>=100)' : 'Search username... (exact:name, f>=100, country:Moldova)');
 if ($mode === 'dynamic') $searchPlaceholder = $cat === 'studios' ? 'Search studio title...' : 'Search username...';
 
+$countryData = $cat === 'users' ? getCountryChoices() : ['list' => [], 'known' => 0];
 require __DIR__ . '/includes/layout-top.php';
 ?>
 <form id="toolbar" class="toolbar" method="get" action="/s/census/">
@@ -249,6 +258,7 @@ require __DIR__ . '/includes/layout-top.php';
                             <label><input type="radio" name="dir" value="down"<?= $dir === 'down' ? ' checked' : '' ?>><span>Losing</span></label>
                         </div>
                     </div>
+                    <?php if ($cat === 'users') require __DIR__ . '/includes/country-field.php'; ?>
                 <?php else: ?>
                     <h3><?= $cat === 'studios' ? 'Studio' : 'User' ?> filters</h3>
                     <div class="field">
@@ -259,6 +269,7 @@ require __DIR__ . '/includes/layout-top.php';
                             <input type="number" name="fmax" min="0" placeholder="max" value="<?= $fmax !== null ? (int)$fmax : '' ?>" aria-label="Maximum followers">
                         </div>
                     </div>
+                    <?php if ($cat === 'users') require __DIR__ . '/includes/country-field.php'; ?>
                     <?php if ($cat === 'studios'): ?>
                     <div class="field">
                         <span class="lbl">Access</span>
@@ -272,7 +283,7 @@ require __DIR__ . '/includes/layout-top.php';
                 <?php endif; ?>
                 <div class="actions">
                     <button type="submit" class="primary">Apply</button>
-                    <a class="ghost" href="<?= e(censusUrl(['q' => '', 'page' => 1, 'dir' => 'up', 'fmin' => null, 'fmax' => null, 'access' => '', 'view' => 'topics', 'sort' => 'views', 'f' => 0])) ?>">Reset</a>
+                    <a class="ghost" href="<?= e(censusUrl(['q' => '', 'page' => 1, 'dir' => 'up', 'fmin' => null, 'fmax' => null, 'access' => '', 'view' => 'topics', 'sort' => 'views', 'f' => 0, 'country' => ''])) ?>">Reset</a>
                 </div>
             </div>
         </div>
@@ -288,9 +299,19 @@ require __DIR__ . '/includes/layout-top.php';
 <?php elseif ($mode === 'dynamic'): ?>
     <p class="summary">Change since each one's latest daily check, top <?= number_format($cat === 'users' ? REFRESH_TOP_N : STUDIO_REFRESH_TOP_N) ?> only. Shown for 2 days after the check.</p>
 <?php else: ?>
+    <?php if ($cat === 'users' && $country !== ''): ?>
+    <p class="summary"><?= number_format($found) ?> Scratcher<?= $found === 1 ? '' : 's' ?> from <?= e($country) ?>, by followers. The # column counts inside this country.</p>
+    <?php else: ?>
     <p class="summary"><?= $cat === 'users' ? 'Every Scratcher, by followers.' : 'Scratch studios, by followers.' ?> <?= number_format($tracked) ?> tracked so far.</p>
+    <?php endif; ?>
 <?php endif; ?>
 
+<?php if ($country !== '' && $cat === 'users'): ?>
+    <?php $ctotal = (int)($tracked ?: getScratcherCount()); $cknown = (int)$countryData['known']; ?>
+    <?php if ($ctotal > 0 && $cknown < $ctotal * 0.98): ?>
+    <p class="summary">Countries are still being filled in, biggest Scratchers first (<?= number_format($cknown) ?> of <?= number_format($ctotal) ?> so far), so this list is not complete yet.</p>
+    <?php endif; ?>
+<?php endif; ?>
 <?php if ($q !== '' && $cat !== 'forums' && $mode === 'static'): ?>
     <p class="search-meta">
         <?php if ($isExact && $exactMissing !== null): ?>
@@ -354,7 +375,7 @@ require __DIR__ . '/includes/layout-top.php';
         <tr>
             <td class="rank">#<?= $i + 1 ?></td>
             <td><?php if ($cat === 'users'): ?>
-                <span class="who"><?= userPicHtml(isset($r['scratch_id']) ? (int)$r['scratch_id'] : null) ?><a href="https://scratch.mit.edu/users/<?= e($r['username']) ?>/" target="_blank" rel="noopener"><?= e($r['username']) ?></a></span>
+                <span class="who"><?= userPicHtml(isset($r['scratch_id']) ? (int)$r['scratch_id'] : null) ?><a href="https://scratch.mit.edu/users/<?= e($r['username']) ?>/" target="_blank" rel="noopener"><?= e($r['username']) ?></a><?php if ($country === '' && !empty($r['country'])): ?> <span class="muted cty"><?= e($r['country']) ?></span><?php endif; ?></span>
             <?php else: $full = $r['title'] !== null && $r['title'] !== '' ? $r['title'] : 'Studio ' . $r['id']; ?>
                 <span class="who"><?= studioPicHtml((int)$r['id']) ?><span><a href="https://scratch.mit.edu/studios/<?= (int)$r['id'] ?>/" target="_blank" rel="noopener" title="<?= e($full) ?>"><?= e(shortTitle($full)) ?></a> <span class="muted">#<?= (int)$r['id'] ?></span></span></span>
             <?php endif; ?></td>
@@ -372,7 +393,7 @@ require __DIR__ . '/includes/layout-top.php';
         <?php foreach ($rows as $s): ?>
         <tr>
             <td class="rank">#<?= (int)$s['rank'] ?></td>
-            <td><span class="who"><?= userPicHtml(isset($s['scratch_id']) ? (int)$s['scratch_id'] : null) ?><a href="https://scratch.mit.edu/users/<?= e($s['username']) ?>/" target="_blank" rel="noopener"><?= e($s['username']) ?></a></span></td>
+            <td><span class="who"><?= userPicHtml(isset($s['scratch_id']) ? (int)$s['scratch_id'] : null) ?><a href="https://scratch.mit.edu/users/<?= e($s['username']) ?>/" target="_blank" rel="noopener"><?= e($s['username']) ?></a><?php if ($country === '' && !empty($s['country'])): ?> <span class="muted cty"><?= e($s['country']) ?></span><?php endif; ?></span></td>
             <td class="count"><?php $d = $s['delta'] ?? null; if ($d !== null): $d = (int)$d; ?><span class="delta <?= $d > 0 ? 'up' : ($d < 0 ? 'down' : 'zero') ?>"><?= $d < 0 ? '-' : '+' ?><?= number_format(abs($d)) ?></span> <?php endif; ?><?= number_format((int)$s['follower_count']) ?></td>
         </tr>
         <?php endforeach; ?>
