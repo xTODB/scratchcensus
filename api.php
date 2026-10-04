@@ -187,6 +187,7 @@ function apiIndex(): array {
         'name' => 'ScratchCensus API',
         'about' => 'Read-only JSON about tracked Scratchers, studios and forum topics. Not affiliated with the Scratch Team.',
         'base' => 'https://scratchnews.net/s/census/api',
+        'docs' => 'https://scratchnews.net/s/census/api-docs',
         'rate_limit' => ['units_per_window' => (int)API_RATE_LIMIT, 'window_seconds' => (int)API_RATE_WINDOW_SEC, 'note' => 'A plain request costs 1 unit, a search (q, fmin, fmax) costs 3. Responses carry X-RateLimit-* headers; over the limit you get HTTP 429 with Retry-After.'],
         'cache' => 'Responses are cached for ' . (int)API_CACHE_TTL_SEC . ' seconds.',
         'max_limit' => (int)API_MAX_LIMIT,
