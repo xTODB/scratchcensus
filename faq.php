@@ -8,7 +8,7 @@ require __DIR__ . '/includes/layout-top.php';
 <div class="prose">
 <h1>FAQ</h1>
     <h2>What is ScratchCensus?</h2>
-    <p>ScratchCensus is a Scratch website where you can see the fullest picture of every single Scratcher, by followers. It is free and <a href="https://github.com/xTODB/scratchcensus/">open-source.</a></p>
+    <p>ScratchCensus is a Scratch website where you can see the fullest picture of every single Scratcher, studio, forum topic and post. The motto is: <em>Track Everything Scratch.</em></em></p>
     <h2>How does ScratchCensus work?</h2>
     <p>When you crawl for Scratchers, ScratchCensus requests usernames, follower and following lists from the entire database of Scratch users registered on ScratchCensus. Then the data is neatly put into this website for anyone to use.</p>
     <h2>Is ScratchCensus open-source?</h2>
