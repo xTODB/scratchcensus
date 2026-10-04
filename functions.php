@@ -1294,12 +1294,18 @@ function getCountryChoices(): array {
     }
     $list = [];
     $known = 0;
+    $other = 0; // users whose country is not a real Scratch location (old free-text locations)
+    $valid = array_flip(array_map('mb_strtolower', (array)(@include __DIR__ . '/includes/country-names.php')));
     try {
         $res = getDB()->query("SELECT country, COUNT(*) AS c FROM scratchers WHERE status = 'fetched' AND country IS NOT NULL AND country <> '' GROUP BY country ORDER BY country");
-        if ($res) foreach ($res->fetch_all(MYSQLI_ASSOC) as $r) { $list[] = [$r['country'], (int)$r['c']]; $known += (int)$r['c']; }
+        if ($res) foreach ($res->fetch_all(MYSQLI_ASSOC) as $r) {
+            $known += (int)$r['c'];
+            if ($valid && !isset($valid[mb_strtolower($r['country'])])) { $other += (int)$r['c']; continue; }
+            $list[] = [$r['country'], (int)$r['c']];
+        }
     } catch (\Throwable $e) {
     }
-    $out = ['list' => $list, 'known' => $known];
+    $out = ['list' => $list, 'known' => $known, 'other' => $other];
     @file_put_contents($f, json_encode($out));
     return $out;
 }
