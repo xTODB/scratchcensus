@@ -8,7 +8,8 @@ $base = '/s/census/api';
 require __DIR__ . '/includes/layout-top.php';
 
 $endpoints = [
-    ['/users', 'The follower leaderboard, or search it.', 'page, limit (max ' . (int)API_MAX_LIMIT . '), q, fmin, fmax', $base . '/users?limit=5&pretty=1'],
+    ['/users', 'The follower leaderboard, or search it.', 'page, limit (max ' . (int)API_MAX_LIMIT . '), q, fmin, fmax, country', $base . '/users?limit=5&pretty=1'],
+    ['/countries', 'Every country with its number of tracked Scratchers. Use a name from here as the country parameter, e.g. /users?country=Moldova.', '', $base . '/countries?pretty=1'],
     ['/users/{username}', 'One Scratcher with their rank.', '', $base . '/users/griffpatch?pretty=1'],
     ['/studios', 'The studio leaderboard, or search it.', 'page, limit, q, fmin, fmax, access=open|closed', $base . '/studios?limit=5&pretty=1'],
     ['/studios/{id}', 'One studio with its rank.', '', $base . '/studios/56?pretty=1'],
@@ -39,7 +40,7 @@ $endpoints = [
 <?php endforeach; ?>
 
 <h2>Searching</h2>
-<p>For <code>q</code> you can use the same search as the site: a name or title, <code>exact:name</code>, <code>f&gt;=1000</code> style follower filters, and for studios <code>open</code>, <code>closed</code> or <code>id:56</code>. <code>fmin</code> and <code>fmax</code> do the same as the follower filters.</p>
+<p>For <code>q</code> you can use the same search as the site: a name or title, <code>exact:name</code>, <code>f&gt;=1000</code> style follower filters, <code>country:Moldova</code> (or <code>country:"United States"</code>) for users, and for studios <code>open</code>, <code>closed</code> or <code>id:56</code>. <code>fmin</code> and <code>fmax</code> do the same as the follower filters.</p>
 
 <h2>Example</h2>
 <div class="card">
