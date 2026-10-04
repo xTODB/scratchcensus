@@ -417,6 +417,7 @@ function ensureSpeedIndexes(): array {
         ],
         'scratchers' => [
             'idx_status_followers_username' => ['status', 'follower_count', 'username'],
+            'idx_status_country_followers'  => ['status', 'country', 'follower_count', 'username'],
         ],
     ];
     $db = getDB();
