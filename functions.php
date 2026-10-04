@@ -9,6 +9,12 @@ const ADMIN_SETTINGS = [
     'DISCOVER_FOLLOWING_MAX_PAGES' => ['Following pages per user (40 names each)', 1, 50],
     'DISCOVER_FOLLOWERS_MIN'       => ['Mine followers of users with at least', 0, 1000000],
     'DISCOVER_FOLLOWING_MIN'       => ['Mine following of users with at least', 0, 1000000],
+    // Forum crawler. 0..1 settings show up as an On/Off dropdown on the stats page.
+    'FORUM_ENABLED'                => ['Forum crawl', 0, 1],
+    'FORUM_POSTS_ENABLED'          => ['Forum post crawl (search text)', 0, 1],
+    'FORUM_PAGES_PER_ROUND'        => ['Forum pages fetched at once', 1, 20],
+    'FORUM_ROUND_PAUSE_MS'         => ['Pause between forum rounds (ms)', 0, 5000],
+    'FORUM_TIME_BUDGET_SEC'        => ['Forum seconds per cron run', 5, 55],
 ];
 
 // Defines the stored values as constants. Returns the names config.php already

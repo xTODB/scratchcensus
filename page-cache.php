@@ -15,6 +15,7 @@
 defined('PAGE_CACHE_ENABLED')   || define('PAGE_CACHE_ENABLED', true);
 defined('PAGE_CACHE_TTL_SEC')   || define('PAGE_CACHE_TTL_SEC', 120);
 defined('PAGE_CACHE_STALE_SEC') || define('PAGE_CACHE_STALE_SEC', 3600);
+defined('PAGE_CACHE_WARM_AGE_SEC') || define('PAGE_CACHE_WARM_AGE_SEC', 90); // the pre-warm cron (cron/warm-cache.php) rebuilds a page once its copy is this old. Keep it under PAGE_CACHE_TTL_SEC so visitors never meet an expired copy
 
 function pageCachePath(string $key): string {
     return sys_get_temp_dir() . '/scratchcensus_pc_' . md5(__DIR__ . '|' . $key);
@@ -40,19 +41,35 @@ function pageCacheFinishResponse(): bool {
     return false;
 }
 
+// True for the pre-warm cron's requests (?warm=CRON_SECRET). Those never serve the cached page: they
+// answer a few bytes ("fresh", "busy" or "warmed") and rebuild the copy when it is getting old.
+function pageCacheIsWarm(): bool {
+    return defined('CRON_SECRET') && isset($_GET['warm']) && hash_equals((string)CRON_SECRET, (string)$_GET['warm']);
+}
+
 function pageCacheStart(string $key, ?int $ttl = null): void {
     if (!PAGE_CACHE_ENABLED || ($_SERVER['REQUEST_METHOD'] ?? 'GET') !== 'GET' && ($_SERVER['REQUEST_METHOD'] ?? '') !== 'HEAD') return;
     $ttl = $ttl ?? (int)PAGE_CACHE_TTL_SEC;
+    $warm = pageCacheIsWarm();
+    if ($warm) $ttl = min($ttl, (int)PAGE_CACHE_WARM_AGE_SEC);
     $base = pageCachePath($key);
     $html = $base . '.html';
     $age = is_file($html) ? time() - (int)@filemtime($html) : null;
 
     if ($age !== null && $age < $ttl) {
+        if ($warm) { header('Content-Type: text/plain'); header('X-ScratchCensus-Cache: fresh'); echo 'fresh'; exit; }
         pageCacheServe($base, 'hit');
         exit;
     }
     $state = 'miss';
-    if ($age !== null && $age < (int)PAGE_CACHE_STALE_SEC) {
+    if ($warm) {
+        // one rebuild at a time: if a visitor (or an earlier warm run) is already rebuilding, leave it to them
+        $lock = @fopen($base . '.lock', 'c');
+        if (!$lock || !flock($lock, LOCK_EX | LOCK_NB)) { header('Content-Type: text/plain'); header('X-ScratchCensus-Cache: busy'); echo 'busy'; exit; }
+        $GLOBALS['__page_cache_lock'] = $lock;
+        header('X-ScratchCensus-Cache: warm');
+        $state = 'warm';
+    } elseif ($age !== null && $age < (int)PAGE_CACHE_STALE_SEC) {
         $lock = @fopen($base . '.lock', 'c');
         if ($lock && flock($lock, LOCK_EX | LOCK_NB)) {
             // We are the one who rebuilds. If we can hang up on the visitor first, give them the old copy
@@ -69,8 +86,10 @@ function pageCacheStart(string $key, ?int $ttl = null): void {
         }
     }
     if ($state === 'miss') header('X-ScratchCensus-Cache: miss');
-    ob_start(function (string $buf) use ($base, $html) {
+    ob_start(function (string $buf) use ($base, $html, $warm) {
+        $saved = false;
         if (http_response_code() === 200 && strlen($buf) > 500) {
+            $saved = true;
             $tmp = $base . '.' . bin2hex(random_bytes(4)) . '.tmp';
             if (@file_put_contents($tmp, $buf) !== false) @rename($tmp, $html); else @unlink($tmp);
             $tmpGz = $base . '.' . bin2hex(random_bytes(4)) . '.gz.tmp';
@@ -82,6 +101,7 @@ function pageCacheStart(string $key, ?int $ttl = null): void {
                 }
             }
         }
+        if ($warm) return $saved ? 'warmed' : 'not saved (HTTP ' . http_response_code() . ', ' . strlen($buf) . ' bytes)';
         return $buf;
     });
 }

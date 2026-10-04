@@ -31,6 +31,7 @@ function censusLogVisit(?string $page = null): void {
     static $done = false;
     if ($done || !VISIT_LOG_ENABLED) return;
     if (($_SERVER['REQUEST_METHOD'] ?? 'GET') !== 'GET') return;
+    if (isset($_GET['warm'])) return; // the cache pre-warm cron is not a visitor
     $done = true;
     if ($page === null) {
         $page = rtrim((string)parse_url($_SERVER['REQUEST_URI'] ?? '/s/census', PHP_URL_PATH), '/');

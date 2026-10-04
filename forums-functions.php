@@ -15,8 +15,9 @@ defined('FORUM_ENABLED')              || define('FORUM_ENABLED', true);   // fal
 defined('FORUM_POSTS_ENABLED')        || define('FORUM_POSTS_ENABLED', true); // false = only crawl topic lists, never topic pages
 defined('FORUM_TIME_BUDGET_SEC')      || define('FORUM_TIME_BUDGET_SEC', 20); // per cron run. Small on purpose: the other crons share this IP's rate limit
 defined('FORUM_LIST_TIME_SHARE')      || define('FORUM_LIST_TIME_SHARE', 0.6); // share of a run spent on topic lists, the rest on topic pages
-defined('FORUM_PAGES_PER_ROUND')      || define('FORUM_PAGES_PER_ROUND', 4);   // pages fetched at once per round
-defined('FORUM_ROUND_PAUSE_MS')       || define('FORUM_ROUND_PAUSE_MS', 400);  // pause between rounds. 4 pages / ~0.5s = roughly 6-8 requests/s
+defined('FORUM_PAGES_PER_ROUND')      || define('FORUM_PAGES_PER_ROUND', 6);   // pages fetched at once per round (was 4). Editable on the stats page
+defined('FORUM_ROUND_PAUSE_MS')       || define('FORUM_ROUND_PAUSE_MS', 200);  // pause between rounds (was 400). 6 pages per ~0.5s round + 0.2s pause = roughly 9-10 requests/s. Editable on the stats page
+defined('FORUM_COOLDOWN_SEC')         || define('FORUM_COOLDOWN_SEC', 90);     // after Scratch answers 429, the forum crawler sits out this long so the shared IP can recover. 0 = no cooldown
 defined('FORUM_POST_MIN_REPLIES')     || define('FORUM_POST_MIN_REPLIES', 50); // only topics with at least this many replies get their posts stored for search
 defined('FORUM_POST_MAX_PAGES')       || define('FORUM_POST_MAX_PAGES', 25);   // pages of 20 posts stored per topic (25 = the first 500 posts)
 defined('FORUM_POST_MAX_CHARS')       || define('FORUM_POST_MAX_CHARS', 3000); // stored characters per post
@@ -318,6 +319,8 @@ function crawlForumsBatch(bool $forceIndex = false): array {
     $st = ['requests' => 0, 'rate_limited' => false, 'forums_indexed' => 0, 'list_pages' => 0, 'topics_seen' => 0,
            'list_errors' => 0, 'forums_wrapped' => 0, 'post_pages' => 0, 'posts_stored' => 0, 'post_errors' => 0];
     if (!FORUM_ENABLED) return $st;
+    $cool = forumCooldownLeft();
+    if ($cool > 0) { $st['cooldown'] = $cool; return $st; }
     $start = microtime(true);
     ensureForumIndex($st, $forceIndex);
     $listBudget = FORUM_POSTS_ENABLED ? FORUM_TIME_BUDGET_SEC * FORUM_LIST_TIME_SHARE : FORUM_TIME_BUDGET_SEC;
@@ -331,7 +334,18 @@ function crawlForumsBatch(bool $forceIndex = false): array {
             usleep((int)FORUM_ROUND_PAUSE_MS * 1000);
         }
     }
+    if ($st['rate_limited'] && (int)FORUM_COOLDOWN_SEC > 0) @touch(forumCooldownFile());
     return $st;
+}
+
+// 429 cooldown: a tiny temp file marks "Scratch said slow down"; runs skip the forum crawl until it is old enough.
+function forumCooldownFile(): string {
+    return sys_get_temp_dir() . '/scratchcensus_forum_429_' . md5(__DIR__);
+}
+function forumCooldownLeft(): int {
+    $f = forumCooldownFile();
+    if (!is_file($f)) return 0;
+    return max(0, (int)FORUM_COOLDOWN_SEC - (time() - (int)@filemtime($f)));
 }
 
 // ---------------------------------------------------------------- queries

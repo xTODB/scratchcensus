@@ -59,14 +59,15 @@ try {
 
     $rate = $elapsed > 0 ? $st['requests'] / $elapsed : 0;
     echo "Forum run: " . $st['requests'] . " request(s) in " . number_format($elapsed, 1) . "s (" . number_format($rate, 1) . "/s)\n";
+    if (isset($st['cooldown'])) echo "forum crawl paused: Scratch sent a 429 recently, resuming in {$st['cooldown']}s\n";
     if ($st['forums_indexed']) echo "forum index read: {$st['forums_indexed']} forums\n";
     if (isset($st['index_error'])) echo "forum index FAILED: HTTP {$st['index_error']}\n";
     echo "topic lists: pages={$st['list_pages']} topics_seen={$st['topics_seen']} errors={$st['list_errors']} forums_wrapped={$st['forums_wrapped']}\n";
     echo "topic posts: pages={$st['post_pages']} posts_stored={$st['posts_stored']} errors={$st['post_errors']}\n";
     echo "in DB: forums={$s['forums']} topics={$s['topics']} posts={$s['posts']} big_topics_done={$s['big_done']}/{$s['big_topics']}\n";
-    if (!FORUM_ENABLED) echo "forums: OFF (FORUM_ENABLED is false)\n";
-    if (!FORUM_POSTS_ENABLED) echo "posts: OFF (FORUM_POSTS_ENABLED is false)\n";
-    if ($st['rate_limited']) echo "Scratch returned 429 - stopped early.\n";
+    if (!FORUM_ENABLED) echo "forums: OFF (switched off on the stats page or in config.php)\n";
+    if (!FORUM_POSTS_ENABLED) echo "posts: OFF (switched off on the stats page or in config.php)\n";
+    if ($st['rate_limited']) echo "Scratch returned 429 - stopped early, pausing the forum crawl for " . (int)FORUM_COOLDOWN_SEC . "s.\n";
     // Keep the stats page's numbers warm (rebuilds at most every ~4 minutes, runs after the crawl work).
     if (statsCacheWarm()) echo "stats cache rebuilt\n";
 } catch (\Throwable $e) {

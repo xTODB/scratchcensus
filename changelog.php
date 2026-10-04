@@ -7,6 +7,7 @@ require __DIR__ . '/includes/layout-top.php';
 ?>
 <div class="prose">
 <h1>Changelog</h1>
+    <p>[Oct4] v6.0 - Faster and steadier! The forum crawler fetches more pages at once and pauses by itself when Scratch asks it to slow down, forums can be switched on and off without touching any code, and the busiest pages are now rebuilt in the background before they expire, so they load instantly for everyone.</p>
     <p>[Oct4] v5.7 - New API page in the menu with every endpoint, example links and the rate limits.</p>
     <p>[Oct4] v5.6 - Public API! Read-only JSON for Scratchers, studios, forum topics and growth at /s/census/api (rate limited, cached). Also: picture rows no longer push Followers off screen on phones, and ScratchCensus visits now show up in the ScratchNews visitor log.</p>
     <p>[Oct3] v5.5 - Pictures! Scratcher profile pictures and studio thumbnails now show next to names. Open the new Settings page to turn them off or change their size (saved in your browser only). Picture ids are being filled in biggest users first, so some Scratchers show a grey circle for now.</p>

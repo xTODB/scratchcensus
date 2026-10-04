@@ -107,18 +107,18 @@ button { margin-top: 1rem; padding: 0.5rem 1rem; border-radius: 6px; border: non
         <?php endif; ?>
     </table>
 
-    <h2>Discovery settings</h2>
+    <h2>Crawler settings</h2>
     <form method="post" action="?key=<?= e(rawurlencode($_GET['key'])) ?>">
         <table>
             <?php $locked = loadAdminSettings(); foreach (ADMIN_SETTINGS as $k => [$label, $lo, $hi]): ?>
             <tr>
                 <th><label for="<?= e($k) ?>"><?= e($label) ?></label></th>
-                <td class="num"><input type="number" id="<?= e($k) ?>" name="<?= e($k) ?>" value="<?= (int)constant($k) ?>" min="<?= $lo ?>" max="<?= $hi ?>"<?= isset($locked[$k]) ? ' disabled' : '' ?>><?= isset($locked[$k]) ? '<br><span class="note">set in config.php</span>' : '' ?></td>
+                <td class="num"><?php if ($lo === 0 && $hi === 1): ?><select id="<?= e($k) ?>" name="<?= e($k) ?>"<?= isset($locked[$k]) ? ' disabled' : '' ?>><option value="1"<?= (int)constant($k) === 1 ? ' selected' : '' ?>>On</option><option value="0"<?= (int)constant($k) === 0 ? ' selected' : '' ?>>Off</option></select><?php else: ?><input type="number" id="<?= e($k) ?>" name="<?= e($k) ?>" value="<?= (int)constant($k) ?>" min="<?= $lo ?>" max="<?= $hi ?>"<?= isset($locked[$k]) ? ' disabled' : '' ?>><?php endif; ?><?= isset($locked[$k]) ? '<br><span class="note">set in config.php</span>' : '' ?></td>
             </tr>
             <?php endforeach; ?>
         </table>
         <button type="submit">Save</button> <?= isset($_GET['saved']) ? 'Saved.' : '' ?>
-        <p class="note">Applies from the next cron run. Users already mined are not re-mined with new values.</p>
+        <p class="note">Applies from the next cron run. Users already mined are not re-mined with new values. If Scratch answers 429 to the forum crawler, it pauses by itself for a minute or two.</p>
     </form>
 
     <h2>Studios</h2>
@@ -149,7 +149,7 @@ button { margin-top: 1rem; padding: 0.5rem 1rem; border-radius: 6px; border: non
         <tr><th>Big topics done</th><td class="num"><?= number_format($fs['big_done']) ?><br><span class="note"><?= number_format($postPct, 1) ?>%, <?= number_format($fs['big_topics'] - $fs['big_done']) ?> to go</span></td></tr>
         <tr><th>Sticky topics</th><td class="num"><?= number_format($fs['rows_sticky']) ?></td></tr>
         <tr><th>Claimed right now</th><td class="num"><?= number_format($fs['claimed']) ?></td></tr>
-        <tr><th>Crawl</th><td class="num"><?= !FORUM_ENABLED ? 'OFF (FORUM_ENABLED is false)' : 'on' ?><?= FORUM_ENABLED && !FORUM_POSTS_ENABLED ? ', posts off' : '' ?></td></tr>
+        <tr><th>Crawl</th><td class="num"><?= !FORUM_ENABLED ? 'OFF' : (forumCooldownLeft() > 0 ? 'paused (429), ' . forumCooldownLeft() . 's left' : 'on') ?><?= FORUM_ENABLED && !FORUM_POSTS_ENABLED ? ', posts off' : '' ?></td></tr>
         <tr><th>Forum list read</th><td class="num"><?= $fs['index_at'] ? e($fs['index_at']) : 'never' ?></td></tr>
         <tr><th>Last topic list crawled</th><td class="num"><?= $fs['last_list'] ? e($fs['last_list']) : 'never' ?></td></tr>
         <?php if ($fs['top_topic']): ?>
