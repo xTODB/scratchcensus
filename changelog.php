@@ -7,6 +7,7 @@ require __DIR__ . '/includes/layout-top.php';
 ?>
 <div class="prose">
 <h1>Changelog</h1>
+    <p>[Oct4] v6.2 - Scratcher profile pages! Click any name to see their rank, country rank, a follower graph, daily growth bars and a 30 day projection. ScratchCensus now saves one follower count per day for the top Scratchers, so graphs fill in as days pass.</p>
     <p>[Oct4] v6.1 - Country search! Pick a country in the Filter window (Users, Static or Dynamic) or type country:Moldova in the search box, and the list shows only Scratchers from there, with country shown next to names. The API got a country parameter and a /countries list. Countries are filled in biggest Scratchers first, so smaller countries and smaller accounts take a while to appear.</p>
     <p>[Oct4] v6.0 - Faster and steadier! The forum crawler fetches more pages at once and pauses by itself when Scratch asks it to slow down, forums can be switched on and off without touching any code, and the busiest pages are now rebuilt in the background before they expire, so they load instantly for everyone.</p>
     <p>[Oct4] v5.7 - New API page in the menu with every endpoint, example links and the rate limits.</p>
