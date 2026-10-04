@@ -75,11 +75,11 @@ censusLogVisit('/s/census' . ($cat === 'forums' ? '/forums' : ($mode === 'dynami
 // Plain browsing looks the same for everyone, so it is served from the page cache.
 $cacheKey = null;
 if ($cat === 'forums') {
-    if (($view === 'topics' || $q === '') && $page <= 100) $cacheKey = 'v4-forums-' . $view . '-' . $sort . '-' . $forumId . '-' . $page;
+    if (($view === 'topics' || $q === '') && $page <= 100) $cacheKey = 'v5-forums-' . $view . '-' . $sort . '-' . $forumId . '-' . $page;
 } elseif ($mode === 'dynamic') {
-    if ($q === '' && $country === '') $cacheKey = 'v4-dyn-' . $cat . '-' . $dir;
+    if ($q === '' && $country === '') $cacheKey = 'v5-dyn-' . $cat . '-' . $dir;
 } elseif ($qEff === '' && $page <= 100) {
-    $cacheKey = 'v4-' . $cat . '-' . $page;
+    $cacheKey = 'v5-' . $cat . '-' . $page;
 }
 if ($cacheKey !== null) pageCacheStart($cacheKey);
 
@@ -375,7 +375,7 @@ require __DIR__ . '/includes/layout-top.php';
         <tr>
             <td class="rank">#<?= $i + 1 ?></td>
             <td><?php if ($cat === 'users'): ?>
-                <span class="who"><?= userPicHtml(isset($r['scratch_id']) ? (int)$r['scratch_id'] : null) ?><a href="https://scratch.mit.edu/users/<?= e($r['username']) ?>/" target="_blank" rel="noopener"><?= e($r['username']) ?></a><?php if ($country === '' && !empty($r['country'])): ?> <span class="muted cty"><?= e($r['country']) ?></span><?php endif; ?></span>
+                <span class="who"><?= userPicHtml(isset($r['scratch_id']) ? (int)$r['scratch_id'] : null) ?><a href="/s/census/u/<?= rawurlencode($r['username']) ?>"><?= e($r['username']) ?></a><?php if ($country === '' && !empty($r['country'])): ?> <span class="muted cty"><?= e($r['country']) ?></span><?php endif; ?></span>
             <?php else: $full = $r['title'] !== null && $r['title'] !== '' ? $r['title'] : 'Studio ' . $r['id']; ?>
                 <span class="who"><?= studioPicHtml((int)$r['id']) ?><span><a href="https://scratch.mit.edu/studios/<?= (int)$r['id'] ?>/" target="_blank" rel="noopener" title="<?= e($full) ?>"><?= e(shortTitle($full)) ?></a> <span class="muted">#<?= (int)$r['id'] ?></span></span></span>
             <?php endif; ?></td>
@@ -393,7 +393,7 @@ require __DIR__ . '/includes/layout-top.php';
         <?php foreach ($rows as $s): ?>
         <tr>
             <td class="rank">#<?= (int)$s['rank'] ?></td>
-            <td><span class="who"><?= userPicHtml(isset($s['scratch_id']) ? (int)$s['scratch_id'] : null) ?><a href="https://scratch.mit.edu/users/<?= e($s['username']) ?>/" target="_blank" rel="noopener"><?= e($s['username']) ?></a><?php if ($country === '' && !empty($s['country'])): ?> <span class="muted cty"><?= e($s['country']) ?></span><?php endif; ?></span></td>
+            <td><span class="who"><?= userPicHtml(isset($s['scratch_id']) ? (int)$s['scratch_id'] : null) ?><a href="/s/census/u/<?= rawurlencode($s['username']) ?>"><?= e($s['username']) ?></a><?php if ($country === '' && !empty($s['country'])): ?> <span class="muted cty"><?= e($s['country']) ?></span><?php endif; ?></span></td>
             <td class="count"><?php $d = $s['delta'] ?? null; if ($d !== null): $d = (int)$d; ?><span class="delta <?= $d > 0 ? 'up' : ($d < 0 ? 'down' : 'zero') ?>"><?= $d < 0 ? '-' : '+' ?><?= number_format(abs($d)) ?></span> <?php endif; ?><?= number_format((int)$s['follower_count']) ?></td>
         </tr>
         <?php endforeach; ?>
