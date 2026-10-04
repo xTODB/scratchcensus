@@ -153,3 +153,22 @@ html[data-img="on"][data-imgsize="l"] .pic.studio { width: 119px; height: 70px; 
     html[data-img="on"][data-imgsize="m"] .pic.studio { width: 58px; height: 34px; }
     html[data-img="on"][data-imgsize="l"] .pic.studio { width: 82px; height: 48px; }
 }
+
+/* ---- Scratcher profile page (v6.2), everything scoped under .prof ---- */
+.prof .prof-head { display: flex; align-items: center; gap: 1rem; margin-bottom: 1rem; }
+.prof .prof-head h1 { margin: 0; }
+.prof .prof-head p { margin: 0.2rem 0 0; }
+.prof .prof-stats { display: flex; flex-wrap: wrap; gap: 0.8rem; margin: 0 0 1rem; }
+.prof .prof-stat { background: var(--panel-2); border: 1px solid var(--line); border-radius: 10px; padding: 0.7rem 1rem; min-width: 8rem; display: flex; flex-direction: column; gap: 0.1rem; }
+.prof .prof-stat .k { font-size: 0.78rem; text-transform: uppercase; letter-spacing: 0.06em; color: var(--muted); }
+.prof .prof-stat .v { font-size: 1.4rem; font-weight: 600; }
+.prof .prof-card { max-width: 760px; }
+.prof .prof-graph { width: 100%; height: auto; display: block; }
+.prof .prof-grid { stroke: var(--line); stroke-width: 1; }
+.prof .prof-axis { fill: var(--muted); font-size: 11px; }
+.prof .prof-line { fill: none; stroke: var(--accent); stroke-width: 2; stroke-linejoin: round; }
+.prof .prof-area { fill: var(--accent); opacity: 0.12; }
+.prof .prof-dot { fill: var(--accent); }
+.prof .prof-up { fill: var(--up); }
+.prof .prof-down { fill: var(--down); }
+.prof .prof-zero { fill: var(--muted); }
