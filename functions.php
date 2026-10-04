@@ -384,6 +384,8 @@ function markFetchedBulk(array $idToCount): void {
     $stmt->bind_param($types, ...$params);
     $stmt->execute();
     $stmt->close();
+    $th = refreshThreshold();
+    recordHistory(array_filter($idToCount, fn($c) => $c >= $th));
 }
 
 // Permanent: Scratch answered 404, so the account is deleted or never existed.
@@ -425,6 +427,32 @@ function releaseClaim(string $token): void {
     $stmt->bind_param('s', $token);
     $stmt->execute();
     $stmt->close();
+}
+
+// ---- Daily history (v6.2). One row per user per day in scratcher_history (see the 6.2 SQL).
+// Called from the crawl writes below; a missing table or any error here must never break crawling.
+function recordHistory(array $idToCount): void {
+    if (!$idToCount) return;
+    try {
+        $db = getDB();
+        $vals = [];
+        $types = '';
+        $params = [];
+        foreach ($idToCount as $id => $count) {
+            $vals[] = '(?, CURDATE(), ?)';
+            $types .= 'ii';
+            $params[] = (int)$id;
+            $params[] = max(0, (int)$count);
+        }
+        $stmt = $db->prepare('INSERT INTO scratcher_history (scratcher_id, day, follower_count) VALUES ' . implode(',', $vals)
+            . ' ON DUPLICATE KEY UPDATE follower_count = VALUES(follower_count)');
+        if (!$stmt) return;
+        $stmt->bind_param($types, ...$params);
+        $stmt->execute();
+        $stmt->close();
+    } catch (\Throwable $e) {
+        // history is optional
+    }
 }
 
 // ---- Top-user refresh. Users are normally crawled once; the biggest
@@ -538,6 +566,7 @@ function markRefreshedBulk(array $idToPair): void {
     $stmt->bind_param($types, ...$params);
     $stmt->execute();
     $stmt->close();
+    recordHistory(array_map(fn($p) => $p[0], $idToPair));
 }
 
 // Pages that failed during a refresh: just move checked_at so they wait a full interval.
