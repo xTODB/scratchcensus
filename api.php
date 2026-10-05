@@ -239,7 +239,7 @@ if ($arg !== null && !in_array($endpoint, ['users', 'studios'], true)) apiError(
 $isSearch = isset($_GET['q']) && trim((string)$_GET['q']) !== '' || (isset($_GET['fmin']) && $_GET['fmin'] !== '') || (isset($_GET['fmax']) && $_GET['fmax'] !== '') || ($endpoint === 'users' && isset($_GET['country']) && trim((string)$_GET['country']) !== '');
 $cost = $endpoint === '' ? 0 : (($isSearch && in_array($endpoint, ['users', 'studios'], true) && $arg === null) ? 3 : 1);
 $GLOBALS['api_headers'] = ['Access-Control-Allow-Origin' => '*', 'X-RateLimit-Limit' => (string)API_RATE_LIMIT];
-if ($cost > 0) {
+if ($cost > 0 && !apiTrustedCaller()) {
     [$ok, $left, $reset] = apiRateCheck($cost);
     $GLOBALS['api_headers']['X-RateLimit-Remaining'] = (string)$left;
     $GLOBALS['api_headers']['X-RateLimit-Reset'] = (string)$reset;
