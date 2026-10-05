@@ -14,6 +14,7 @@ require_once __DIR__ . '/functions.php';
 require_once __DIR__ . '/studios-functions.php';
 require_once __DIR__ . '/forums-functions.php';
 require_once __DIR__ . '/includes/api-support.php';
+require_once __DIR__ . '/profile-functions.php';
 
 $method = $_SERVER['REQUEST_METHOD'] ?? 'GET';
 if ($method === 'OPTIONS') {
@@ -31,7 +32,8 @@ $route = preg_match('~/api(?:\.php)?(/.*)?$~', $path, $m) ? trim($m[1] ?? '', '/
 $parts = $route === '' ? [] : explode('/', $route);
 $endpoint = $parts[0] ?? '';
 $arg = isset($parts[1]) ? rawurldecode($parts[1]) : null;
-if (count($parts) > 2) apiError(404, 'Unknown endpoint. See /s/census/api');
+$sub = $parts[2] ?? null; // only /users/<name>/history has a third part
+if (count($parts) > 3 || ($sub !== null && ($endpoint !== 'users' || $sub !== 'history'))) apiError(404, 'Unknown endpoint. See /s/census/api');
 
 // ---- shared helpers
 function apiRowUser(array $r): array {
@@ -187,6 +189,18 @@ function apiCountries(): array {
     return ['known_users' => (int)$c['known'], 'results' => array_map(fn($r) => ['country' => $r[0], 'users' => (int)$r[1]], $c['list'])];
 }
 
+// One Scratcher's saved daily follower counts (top Scratchers only), oldest first.
+function apiUserHistory(string $name): array {
+    if (!isValidScratchUsername($name)) apiError(400, 'That is not a valid Scratch username.');
+    $u = getProfileUser($name);
+    if (!$u) apiError(404, 'That Scratcher is not tracked yet. Add them on the Crawl page.');
+    $days = apiInt($_GET['days'] ?? null, 90, 1, 365);
+    $hist = $u['id'] ? getUserHistory((int)$u['id'], $days) : [];
+    $cr = !empty($u['country']) ? getCountryRank($u['country'], (int)$u['follower_count'], $u['username']) : null;
+    return ['user' => apiRowUser($u), 'country_rank' => $cr, 'days' => $days,
+        'history' => array_map(fn($h) => ['day' => $h['day'], 'followers' => (int)$h['n']], $hist)];
+}
+
 function apiStats(): array {
     $f = getForumStatsCached();
     return ['users' => getScratcherCount(), 'studios' => getStudioCount(), 'forum_topics' => (int)$f['topics'], 'forum_posts_stored' => (int)$f['posts'], 'forums' => (int)$f['forums']];
@@ -205,6 +219,7 @@ function apiIndex(): array {
             '/users' => 'page, limit, q (search syntax like the site, e.g. exact:griffpatch or f>=100), fmin, fmax, country (e.g. Moldova)',
             '/countries' => 'every country with how many tracked Scratchers it has',
             '/users/{username}' => 'one Scratcher with rank',
+            '/users/{username}/history' => 'saved daily follower counts for one Scratcher (days, max 365; top Scratchers only)',
             '/studios' => 'page, limit, q, fmin, fmax, access=open|closed',
             '/studios/{id}' => 'one studio with rank',
             '/forums' => 'the forums',
@@ -232,17 +247,17 @@ if ($cost > 0) {
 }
 
 // cache key = the route plus only the parameters this endpoint understands
-$known = ['users' => ['page', 'limit', 'q', 'fmin', 'fmax', 'country'], 'studios' => ['page', 'limit', 'q', 'fmin', 'fmax', 'access'],
+$known = ['users' => ['page', 'limit', 'q', 'fmin', 'fmax', 'country', 'days'], 'studios' => ['page', 'limit', 'q', 'fmin', 'fmax', 'access'],
           'topics' => ['page', 'limit', 'sort', 'forum'], 'growth' => ['type', 'dir', 'limit']];
 $kp = [];
 foreach ($known[$endpoint] ?? [] as $k) if (isset($_GET[$k])) $kp[$k] = (string)$_GET[$k];
 ksort($kp);
-$key = $endpoint . '/' . ($arg ?? '') . '?' . http_build_query($kp);
+$key = $endpoint . '/' . ($arg ?? '') . ($sub !== null ? '/' . $sub : '') . '?' . http_build_query($kp);
 
 $json = $endpoint === '' ? null : apiCacheGet($key);
 if ($json === null) {
     try {
-        $data = $endpoint === 'users' || $endpoint === 'studios' ? $handlers[$endpoint]($arg) : $handlers[$endpoint]();
+        $data = $endpoint === 'users' && $sub === 'history' ? apiUserHistory((string)$arg) : ($endpoint === 'users' || $endpoint === 'studios' ? $handlers[$endpoint]($arg) : $handlers[$endpoint]());
     } catch (\Throwable $e) {
         apiError(500, 'The API is having trouble right now. Try again in a moment.');
     }
