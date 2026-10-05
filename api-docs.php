@@ -11,6 +11,7 @@ $endpoints = [
     ['/users', 'The follower leaderboard, or search it.', 'page, limit (max ' . (int)API_MAX_LIMIT . '), q, fmin, fmax, country', $base . '/users?limit=5&pretty=1'],
     ['/countries', 'Every country with its number of tracked Scratchers. Use a name from here as the country parameter, e.g. /users?country=Moldova.', '', $base . '/countries?pretty=1'],
     ['/users/{username}', 'One Scratcher with their rank.', '', $base . '/users/griffpatch?pretty=1'],
+    ['/users/{username}/history', 'Saved daily follower counts for one Scratcher, oldest first, with their rank and country rank. Only the top Scratchers have history.', 'days (default 90, max 365)', $base . '/users/griffpatch/history?pretty=1'],
     ['/studios', 'The studio leaderboard, or search it.', 'page, limit, q, fmin, fmax, access=open|closed', $base . '/studios?limit=5&pretty=1'],
     ['/studios/{id}', 'One studio with its rank.', '', $base . '/studios/56?pretty=1'],
     ['/topics', 'Forum topics by views or replies.', 'page, limit, sort=views|replies, forum={id}', $base . '/topics?sort=replies&limit=5&pretty=1'],
