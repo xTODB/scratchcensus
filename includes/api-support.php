@@ -26,6 +26,14 @@ function apiClientIp(): string {
 }
 
 // Fixed window counter per IP. Returns [allowed, remaining, resetInSeconds].
+// A caller that sends the X-Census-Key header matching API_TRUSTED_KEY (set in config.php) skips the rate limit.
+// Used by our own sister sites, which call the API from this server's single IP.
+function apiTrustedCaller(): bool {
+    if (!defined('API_TRUSTED_KEY') || (string)API_TRUSTED_KEY === '') return false;
+    $k = (string)($_SERVER['HTTP_X_CENSUS_KEY'] ?? '');
+    return $k !== '' && hash_equals((string)API_TRUSTED_KEY, $k);
+}
+
 function apiRateCheck(int $cost): array {
     $limit = (int)API_RATE_LIMIT;
     $win = max(1, (int)API_RATE_WINDOW_SEC);
