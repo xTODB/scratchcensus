@@ -42,7 +42,12 @@ register_shutdown_function(function () {
 
 try {
     $start = microtime(true);
-    $ids = backfillScratchIds(); // picture ids and countries, biggest users first (about 6s at the default 100, one parallel round)
+    $ids = ['filled' => 0, 'countries' => 0, 'missing' => 0, 'rate_limited' => false];
+    try {
+        $ids = backfillScratchIds(); // picture ids and countries, biggest users first (about 6s at the default 100, one parallel round)
+    } catch (\Throwable $e) {
+        echo "backfill skipped: " . $e->getMessage() . "\n"; // never let this stop the crawl itself
+    }
     $start = microtime(true);
     $processed = crawlBatch(CRAWL_BATCH_SIZE);
     $elapsed = microtime(true) - $start;
