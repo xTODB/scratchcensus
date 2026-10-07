@@ -1257,7 +1257,9 @@ function backfillScratchIds(int $limit = ID_BACKFILL_PER_RUN): array {
     foreach ($names as $i => $n) $urls[$i] = 'https://api.scratch.mit.edu/users/' . rawurlencode($n);
     $r = httpMultiGet($urls);
     if ($r['rate_limited']) $out['rate_limited'] = true;
-    $upd = $db->prepare("UPDATE scratchers SET scratch_id = IF(scratch_id IS NULL, ?, scratch_id), country = IF(country IS NULL, ?, country) WHERE username = ?");
+    // Two plain updates instead of one IF(): IF(country IS NULL, ?, country) mixes the connection's utf8mb4 text with the latin1 column, which MySQL refuses.
+    $updId = $db->prepare("UPDATE scratchers SET scratch_id = ? WHERE username = ? AND scratch_id IS NULL");
+    $updCountry = $db->prepare("UPDATE scratchers SET country = ? WHERE username = ? AND country IS NULL");
     foreach ($names as $i => $n) {
         $x = $r['results'][$i] ?? null;
         if (!$x) continue; // not attempted (429): leave it for the next run
@@ -1274,12 +1276,15 @@ function backfillScratchIds(int $limit = ID_BACKFILL_PER_RUN): array {
         } else {
             continue;
         }
-        $upd->bind_param('iss', $id, $country, $n);
-        $upd->execute();
+        $updId->bind_param('is', $id, $n);
+        $updId->execute();
+        $updCountry->bind_param('ss', $country, $n);
+        $updCountry->execute();
         if ($id) $out['filled']++;
         if ($country !== '') $out['countries']++;
     }
-    $upd->close();
+    $updId->close();
+    $updCountry->close();
     return $out;
 }
 
