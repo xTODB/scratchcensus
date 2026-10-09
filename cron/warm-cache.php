@@ -1,5 +1,6 @@
 <?php
 require_once __DIR__ . '/../functions.php';
+require_once __DIR__ . '/../studios-functions.php';
 
 // Page cache pre-warm cron. Keeps the busiest pages cached so visitors always get an instant copy.
 // Two ways to run it, same as the other crons (every minute is right):
@@ -46,6 +47,10 @@ try {
     }
     $pages['forums-views']   = ['c' => 'forums'];
     $pages['forums-replies'] = ['c' => 'forums', 'sort' => 'replies'];
+
+    // The studio follower histograms (used by every studio list and search) are cached in temp files;
+    // refresh them here so no visitor has to wait for the rebuild.
+    try { echo studioWarmHistograms() . "\n"; } catch (\Throwable $e) { echo "studio histograms: " . $e->getMessage() . "\n"; }
 
     $start = microtime(true);
     $warmed = $fresh = $busy = $failed = 0;

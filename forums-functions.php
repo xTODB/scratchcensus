@@ -447,6 +447,22 @@ function ensureSpeedIndexes(): array {
             }
         }
     }
+
+    // FULLTEXT index on studio titles: lets the studio search find words without reading every
+    // title. Adding the first FULLTEXT index rebuilds the table, which can take several minutes
+    // on millions of studios (and the studio crawler waits meanwhile), so it is done once.
+    try {
+        $r = $db->query("SELECT COUNT(*) AS c FROM information_schema.statistics WHERE table_schema = DATABASE() AND table_name = 'studios' AND index_type = 'FULLTEXT' AND column_name = 'title'");
+        if ($r && (int)$r->fetch_assoc()['c'] > 0) {
+            $out[] = 'studios: FULLTEXT title index already present';
+        } else {
+            $t0 = microtime(true);
+            $ok = $db->query("ALTER TABLE `studios` ADD FULLTEXT INDEX `idx_title_ft` (`title`)");
+            $out[] = $ok ? 'studios: added FULLTEXT idx_title_ft (title) in ' . number_format(microtime(true) - $t0, 1) . 's' : 'studios: FAILED FULLTEXT idx_title_ft: ' . $db->error;
+        }
+    } catch (\Throwable $e) {
+        $out[] = 'studios: FAILED FULLTEXT idx_title_ft: ' . $e->getMessage();
+    }
     return $out;
 }
 

@@ -496,7 +496,30 @@ function parseStudioSearch(string $q): array {
     return ['conds' => $base['conds'], 'id' => $id, 'open' => $open, 'text' => $text];
 }
 
-function buildStudioWhere(array $p): array {
+// InnoDB's built-in stopwords: a FULLTEXT search ignores them, so a query containing one
+// has to use the plain LIKE path instead.
+const STUDIO_FT_STOPWORDS = ['a', 'about', 'an', 'are', 'as', 'at', 'be', 'by', 'com', 'de', 'en', 'for', 'from', 'how',
+    'i', 'in', 'is', 'it', 'la', 'of', 'on', 'or', 'that', 'the', 'this', 'to', 'was', 'what', 'when', 'where', 'who',
+    'will', 'with', 'und', 'www'];
+
+// Title words as a FULLTEXT boolean-mode string ("+add* +game*": every word must start a word
+// in the title), or null when the text can't use FULLTEXT (words under 3 characters, stopwords,
+// punctuation, more than 6 words). null means: use the LIKE scan instead.
+function studioFulltextQuery(string $text): ?string {
+    if ($text === '') return null;
+    $words = preg_split('/\s+/u', $text, -1, PREG_SPLIT_NO_EMPTY);
+    if (!$words || count($words) > 6) return null;
+    $bool = [];
+    foreach ($words as $w) {
+        if (!preg_match('/^[\p{L}\p{N}]{3,40}$/u', $w)) return null;
+        if (in_array(mb_strtolower($w), STUDIO_FT_STOPWORDS, true)) return null;
+        $bool[] = '+' . $w . '*';
+    }
+    return implode(' ', $bool);
+}
+
+// $ft = a studioFulltextQuery() string to match the title with the FULLTEXT index; null = LIKE.
+function buildStudioWhere(array $p, ?string $ft = null): array {
     $where = "status = 'fetched'";
     $types = '';
     $params = [];
@@ -508,7 +531,15 @@ function buildStudioWhere(array $p): array {
     }
     if ($p['id'] !== null) { $where .= " AND id = ?"; $types .= 'i'; $params[] = $p['id']; }
     if ($p['open'] !== null) { $where .= " AND open_to_all = ?"; $types .= 'i'; $params[] = $p['open']; }
-    if ($p['text'] !== '') { $where .= " AND title LIKE ?"; $types .= 's'; $params[] = '%' . likeEscape($p['text']) . '%'; }
+    if ($ft !== null) {
+        $where .= " AND MATCH(title) AGAINST (? IN BOOLEAN MODE)";
+        $types .= 's';
+        $params[] = $ft;
+    } elseif ($p['text'] !== '') {
+        $where .= " AND title LIKE ?";
+        $types .= 's';
+        $params[] = '%' . likeEscape($p['text']) . '%';
+    }
     return [$where, $types, $params];
 }
 
@@ -523,26 +554,93 @@ function getStudioCount(): int {
     return $count;
 }
 
-// follower_count => number of fetched studios with exactly that count, cached 60s.
+// follower_count => number of fetched studios with exactly that count.
 // $open = 1 / 0 counts only open / closed studios (null = all). The open/closed
 // variants need INDEX (status, open_to_all, follower_count, id) to stay fast.
-function studioFollowerHistogram(?int $open = null): array {
-    $file = sys_get_temp_dir() . '/scratchcensus_studiohist_' . md5(__DIR__) . '_' . ($open === null ? 'all' : $open) . '.json';
-    if (is_file($file) && (time() - (int)@filemtime($file)) < 60) {
-        $cached = json_decode((string)@file_get_contents($file), true);
-        if (is_array($cached) && $cached) {
-            $hist = [];
-            foreach ($cached as $fc => $c) $hist[(int)$fc] = (int)$c;
-            return $hist;
-        }
-    }
+// Building it reads every studio row's index entry (a few seconds on millions of
+// rows), so it is cached in a temp file: fresh for STUDIO_HIST_TTL_SEC, and after
+// that ONE request rebuilds it while everyone else keeps using the old copy.
+// cron/warm-cache.php refreshes it before it gets that old (studioWarmHistograms),
+// so visitors normally never wait for it.
+defined('STUDIO_HIST_TTL_SEC') || define('STUDIO_HIST_TTL_SEC', 600);
+
+function studioHistFile(?int $open): string {
+    return sys_get_temp_dir() . '/scratchcensus_studiohist_' . md5(__DIR__) . '_' . ($open === null ? 'all' : $open) . '.json';
+}
+
+function studioHistRead(string $file): ?array {
+    $cached = json_decode((string)@file_get_contents($file), true);
+    if (!is_array($cached) || !$cached) return null;
+    $hist = [];
+    foreach ($cached as $fc => $c) $hist[(int)$fc] = (int)$c;
+    return $hist;
+}
+
+function studioHistBuild(?int $open, string $file): array {
     $sql = "SELECT follower_count, COUNT(*) AS c FROM studios WHERE status = 'fetched'"
          . ($open === null ? '' : ' AND open_to_all = ' . (int)$open) . ' GROUP BY follower_count';
     $res = getDB()->query($sql);
     $hist = [];
     while ($row = $res->fetch_assoc()) $hist[(int)$row['follower_count']] = (int)$row['c'];
-    @file_put_contents($file, json_encode($hist), LOCK_EX);
+    // write to a temp name and rename, so a reader never sees half a file
+    $tmp = $file . '.' . getmypid() . '.tmp';
+    if (@file_put_contents($tmp, json_encode($hist)) !== false) @rename($tmp, $file);
     return $hist;
+}
+
+function studioFollowerHistogram(?int $open = null): array {
+    $file = studioHistFile($open);
+    $age = is_file($file) ? time() - (int)@filemtime($file) : null;
+    if ($age !== null && $age < (int)STUDIO_HIST_TTL_SEC) {
+        $hist = studioHistRead($file);
+        if ($hist !== null) return $hist;
+    }
+    $lock = @fopen($file . '.lock', 'c');
+    if ($lock) {
+        if ($age !== null) {
+            // an old copy exists: rebuild only if nobody else is, otherwise just use the old one
+            if (!flock($lock, LOCK_EX | LOCK_NB)) {
+                $hist = studioHistRead($file);
+                if ($hist !== null) { fclose($lock); return $hist; }
+                flock($lock, LOCK_EX); // old copy unreadable: wait for the rebuild
+            }
+        } else {
+            flock($lock, LOCK_EX); // no copy at all: wait for whoever is building the first one
+        }
+        // someone may have finished a rebuild while we waited
+        clearstatcache(true, $file);
+        if (is_file($file) && time() - (int)@filemtime($file) < (int)STUDIO_HIST_TTL_SEC) {
+            $hist = studioHistRead($file);
+            if ($hist !== null) { flock($lock, LOCK_UN); fclose($lock); return $hist; }
+        }
+    }
+    try {
+        $hist = studioHistBuild($open, $file);
+    } finally {
+        if ($lock) { flock($lock, LOCK_UN); fclose($lock); }
+    }
+    return $hist;
+}
+
+// Refreshes the histograms that are older than $maxAge seconds (cron/warm-cache.php calls this
+// every minute). Returns a one-line report.
+function studioWarmHistograms(int $maxAge = 240): string {
+    $out = [];
+    foreach ([null, 1, 0] as $open) {
+        $file = studioHistFile($open);
+        if (is_file($file) && time() - (int)@filemtime($file) < $maxAge) continue;
+        $lock = @fopen($file . '.lock', 'c');
+        if (!$lock || !flock($lock, LOCK_EX | LOCK_NB)) { if ($lock) fclose($lock); continue; }
+        $t0 = microtime(true);
+        try {
+            studioHistBuild($open, $file);
+            $out[] = ($open === null ? 'all' : ($open ? 'open' : 'closed')) . ' ' . number_format(microtime(true) - $t0, 1) . 's';
+        } finally {
+            flock($lock, LOCK_UN);
+            fclose($lock);
+        }
+    }
+    return $out ? 'studio histograms rebuilt: ' . implode(', ', $out) : 'studio histograms fresh';
 }
 
 // The histogram narrowed to the follower comparisons of a search (f>=100 etc).
@@ -649,33 +747,51 @@ function studioRankOf(int $followers, int $id): int {
 
 // Adds 'rank' (position in the FULL list) to rows that are not a contiguous slice of
 // it. Studios above = running total from the cached histogram; position inside the
-// tie group = one covering-index read of that group's ids per distinct follower_count
-// on the page, instead of two COUNT(*) scans per row.
+// tie group (follower_count, id ASC) is worked out per distinct follower_count on the
+// page, from the covering index only (no row reads):
+//   small group  - read the ids between the page's lowest and highest id in it
+//   huge group   - (most studios have 0 followers) ONE pass that counts, for every row of
+//                  the page at once, how many ids in the group are lower: SUM(id < ?) ...
 function studioAttachRanks(array &$rows): void {
     if (!$rows) return;
     $hist = studioFollowerHistogram();
     krsort($hist);
-    $maxId = [];
-    foreach ($rows as $r) {
-        $fc = (int)$r['follower_count'];
-        $maxId[$fc] = max($maxId[$fc] ?? 0, (int)$r['id']);
-    }
+    $ids = [];
+    foreach ($rows as $r) $ids[(int)$r['follower_count']][] = (int)$r['id'];
     $above = [];
     $run = 0;
     foreach ($hist as $fc => $c) {
-        if (isset($maxId[$fc])) $above[$fc] = $run;
+        if (isset($ids[$fc])) $above[$fc] = $run;
         $run += $c;
     }
     $db = getDB();
-    $stmt = $db->prepare("SELECT id FROM studios WHERE status = 'fetched' AND follower_count = ? AND id <= ? ORDER BY id ASC");
     $pos = [];
-    foreach ($maxId as $fc => $mid) {
-        $stmt->bind_param('ii', $fc, $mid);
-        $stmt->execute();
-        $i = 0;
-        foreach ($stmt->get_result()->fetch_all(MYSQLI_NUM) as [$id]) $pos[$fc][(int)$id] = $i++;
+    foreach ($ids as $fc => $list) {
+        sort($list);
+        $mn = $list[0];
+        $mx = $list[count($list) - 1];
+        if (($hist[$fc] ?? 0) <= 20000) {
+            $stmt = $db->prepare("SELECT COUNT(*) FROM studios WHERE status = 'fetched' AND follower_count = ? AND id < ?");
+            $stmt->bind_param('ii', $fc, $mn);
+            $stmt->execute();
+            $base = (int)$stmt->get_result()->fetch_row()[0];
+            $stmt->close();
+            $stmt = $db->prepare("SELECT id FROM studios WHERE status = 'fetched' AND follower_count = ? AND id BETWEEN ? AND ? ORDER BY id ASC");
+            $stmt->bind_param('iii', $fc, $mn, $mx);
+            $stmt->execute();
+            $i = 0;
+            foreach ($stmt->get_result()->fetch_all(MYSQLI_NUM) as [$id]) $pos[$fc][(int)$id] = $base + $i++;
+            $stmt->close();
+        } else {
+            $sums = implode(', ', array_fill(0, count($list), 'COALESCE(SUM(id < ?), 0)'));
+            $stmt = $db->prepare("SELECT $sums FROM studios WHERE status = 'fetched' AND follower_count = ? AND id <= ?");
+            $stmt->bind_param(str_repeat('i', count($list)) . 'ii', ...array_merge($list, [$fc, $mx]));
+            $stmt->execute();
+            $res = $stmt->get_result()->fetch_row();
+            $stmt->close();
+            foreach ($list as $k => $id) $pos[$fc][$id] = (int)$res[$k];
+        }
     }
-    $stmt->close();
     foreach ($rows as &$r) {
         $fc = (int)$r['follower_count'];
         $r['rank'] = isset($above[$fc], $pos[$fc][(int)$r['id']]) ? $above[$fc] + $pos[$fc][(int)$r['id']] + 1 : studioRankOf($fc, (int)$r['id']);
@@ -685,7 +801,6 @@ function studioAttachRanks(array &$rows): void {
 
 // $p = null for plain browsing. Returns ['rows' => [...with 'rank'...], 'total' => int].
 function getStudiosPage(?array $p, int $page, int $perPage = 100): array {
-    $db = getDB();
     $offset = ($page - 1) * $perPage;
     // open/closed and follower comparisons only (no title text, no id): served from
     // the indexes and histograms, no sort and no scan.
@@ -706,16 +821,36 @@ function getStudiosPage(?array $p, int $page, int $perPage = 100): array {
         return ['rows' => $rows, 'total' => $total];
     }
 
-    [$where, $types, $params] = buildStudioWhere($p);
+    // Title search. With the FULLTEXT index (stats.php?indexes=1 adds it) a word search reads only
+    // the matching studios; without it, or for text FULLTEXT can't take, the LIKE scan runs.
+    $ft = studioFulltextQuery((string)$p['text']);
+    if ($ft !== null) {
+        try {
+            $res = studioTextPage($p, $ft, $perPage, $offset);
+            if ($res !== null) return $res;
+        } catch (\Throwable $e) {
+            // no FULLTEXT index yet, or the engine refused the query: fall through to LIKE
+        }
+    }
+    return studioTextPage($p, null, $perPage, $offset) ?? ['rows' => [], 'total' => 0];
+}
+
+// One title search: total + one page, ordered like the main list. Null when a statement can't be prepared.
+function studioTextPage(array $p, ?string $ft, int $perPage, int $offset): ?array {
+    $db = getDB();
+    [$where, $types, $params] = buildStudioWhere($p, $ft);
     $stmt = $db->prepare("SELECT COUNT(*) AS c FROM studios WHERE $where");
+    if (!$stmt) return null;
     if ($params) $stmt->bind_param($types, ...$params);
     $stmt->execute();
     $total = (int)$stmt->get_result()->fetch_assoc()['c'];
     $stmt->close();
+    if ($total === 0 || $offset >= $total) return ['rows' => [], 'total' => $total];
 
     $stmt = $db->prepare("SELECT id, title, host_username, follower_count, project_count, open_to_all, created_on,
         IF(checked_at >= DATE_SUB(NOW(), INTERVAL 2 DAY), follower_delta, NULL) AS delta
         FROM studios WHERE $where ORDER BY follower_count DESC, id ASC LIMIT ? OFFSET ?");
+    if (!$stmt) return null;
     $stmt->bind_param($types . 'ii', ...array_merge($params, [$perPage, $offset]));
     $stmt->execute();
     $rows = $stmt->get_result()->fetch_all(MYSQLI_ASSOC);

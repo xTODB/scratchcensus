@@ -133,10 +133,13 @@ if ($cat === 'users' && $mode === 'static') {
     $t0 = microtime(true);
     $tracked = getStudioCount();
     if ($parsed !== null) {
-        $totalForPages = getStudiosPage($parsed, 1, 1)['total'];
-        $totalPages = max(1, (int)ceil($totalForPages / $perPage));
-        $page = min($page, $totalPages);
+        // One search gives both the page and the total; only a page past the end needs a second look.
         $res = getStudiosPage($parsed, $page, $perPage);
+        $totalPages = max(1, (int)ceil($res['total'] / $perPage));
+        if ($page > $totalPages) {
+            $page = $totalPages;
+            $res = getStudiosPage($parsed, $page, $perPage);
+        }
         $searchTime = microtime(true) - $t0;
     } else {
         $totalPages = max(1, (int)ceil($tracked / $perPage));
