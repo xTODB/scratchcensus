@@ -15,8 +15,8 @@ if (($_GET['key'] ?? '') !== CRON_SECRET) {
 
 const SCRATCH_UA = 'Mozilla/5.0 (compatible; ScratchCensus/1.0)';
 const SESSION_MAX_AGE = 43200; // reuse a login for 12 hours
-const MAX_PER_RUN = 10;        // studios handled per request
-const PAUSE_SEC = 4;           // pause between studios
+const MAX_PER_RUN = 25;        // studios handled per request
+const PAUSE_SEC = 2;           // pause between studios
 
 // One HTTP call. Returns [status code, raw headers, body].
 function scratch_http(string $method, string $url, string $jar, array $headers = [], ?string $body = null): array {
