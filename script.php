@@ -1,6 +1,8 @@
 <?php
 // Adds (or removes) a project in a Scratch studio using the account in config.php.
-// Usage: script.php?key=CRON_SECRET&studio=12345678&project=987654321[&action=remove]
+// Usage: script.php?key=CRON_SECRET&studio=111,222,333&project=987654321[&action=remove]
+// studio takes one ID or a comma/space separated list. At most MAX_PER_RUN studios per request,
+// with PAUSE_SEC between them. The leftover IDs are printed so you can paste them into the next run.
 
 require_once __DIR__ . '/config.php';
 
@@ -13,6 +15,8 @@ if (($_GET['key'] ?? '') !== CRON_SECRET) {
 
 const SCRATCH_UA = 'Mozilla/5.0 (compatible; ScratchCensus/1.0)';
 const SESSION_MAX_AGE = 43200; // reuse a login for 12 hours
+const MAX_PER_RUN = 10;        // studios handled per request
+const PAUSE_SEC = 4;           // pause between studios
 
 // One HTTP call. Returns [status code, raw headers, body].
 function scratch_http(string $method, string $url, string $jar, array $headers = [], ?string $body = null): array {
@@ -136,13 +140,20 @@ function studio_request(string $method, int $studio, int $project, array $auth, 
 }
 
 try {
-    $studio  = (int)($_GET['studio'] ?? 0);
+    set_time_limit(180);
+    $studios = array_values(array_unique(array_filter(
+        array_map('intval', preg_split('/[\s,;]+/', (string)($_GET['studio'] ?? ''), -1, PREG_SPLIT_NO_EMPTY)),
+        fn($n) => $n > 0
+    )));
     $project = (int)($_GET['project'] ?? 0);
     $method  = (($_GET['action'] ?? 'add') === 'remove') ? 'DELETE' : 'POST';
 
-    if ($studio <= 0 || $project <= 0) {
+    if (!$studios || $project <= 0) {
         throw new Exception('Missing studio or project parameter.');
     }
+
+    $todo = array_slice($studios, 0, MAX_PER_RUN);
+    $rest = array_slice($studios, MAX_PER_RUN);
 
     $base = __DIR__ . '/scratch-session-' . md5(CRON_SECRET . SCRATCH_USER);
     $jar = $base . '.cookies';
@@ -155,15 +166,37 @@ try {
         $fresh = true;
     }
 
-    [$code, , $body] = studio_request($method, $studio, $project, $auth, $jar);
-
-    // A saved session can go stale: log in again once and retry.
-    if (!$fresh && ($code === 401 || $code === 403)) {
-        $auth = scratch_login(SCRATCH_USER, SCRATCH_PASS, $jar, $stateFile);
+    $ok = 0;
+    foreach ($todo as $n => $studio) {
+        if ($n > 0) {
+            sleep(PAUSE_SEC);
+        }
         [$code, , $body] = studio_request($method, $studio, $project, $auth, $jar);
+
+        // A saved session can go stale: log in again once and retry.
+        if (!$fresh && ($code === 401 || $code === 403)) {
+            $auth = scratch_login(SCRATCH_USER, SCRATCH_PASS, $jar, $stateFile);
+            $fresh = true;
+            [$code, , $body] = studio_request($method, $studio, $project, $auth, $jar);
+        }
+
+        echo "$studio: HTTP $code " . substr(trim(preg_replace('/\s+/', ' ', $body)), 0, 150) . "\n";
+        if ($code >= 200 && $code < 300) {
+            $ok++;
+        }
+
+        // Rate limited: stop and hand back everything not yet tried.
+        if ($code === 429) {
+            $rest = array_merge(array_slice($todo, $n + 1), $rest);
+            echo "Stopped: rate limited. Wait a while before continuing.\n";
+            break;
+        }
     }
 
-    echo "HTTP $code\n$body\n";
+    echo "\nDone: $ok ok of " . count($todo) . " tried.\n";
+    if ($rest) {
+        echo 'Remaining (' . count($rest) . '): ' . implode(',', $rest) . "\n";
+    }
 } catch (Throwable $e) {
     echo 'Error: ', $e->getMessage(), "\n";
 }

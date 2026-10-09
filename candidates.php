@@ -145,7 +145,9 @@ input[type=text]{width:100%;max-width:520px}
 <p class="muted"><?= number_format($total) ?> studios found (up to <?= number_format($depth) ?> per keyword group), <?= number_format($took, 2) ?>s.
 Open studios only, biggest first. Add to a handful at a time through script.php.</p>
 <?php if ($rows): ?>
-<p><label>IDs on this page<br><textarea readonly onclick="this.select()"><?= e(implode("\n", array_map(fn($r) => $r['id'], $rows))) ?></textarea></label></p>
+<?php $idList = array_map(fn($r) => (int)$r['id'], $rows); ?>
+<p><label>IDs for script.php (studio=...)<br><textarea readonly onclick="this.select()"><?= e(implode(',', $idList)) ?></textarea></label></p>
+<p><label>PHP array<br><textarea readonly onclick="this.select()">[<?= e(implode(', ', $idList)) ?>]</textarea></label></p>
 <table>
 <tr><th class="n">#</th><th>Studio</th><th class="n">Followers</th><th class="n">Projects</th><th>Matched</th></tr>
 <?php foreach ($rows as $i => $r): $title = (string)$r['title'] !== '' ? (string)$r['title'] : 'Studio ' . $r['id']; ?>
