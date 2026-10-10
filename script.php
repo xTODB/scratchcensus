@@ -1,297 +1,335 @@
 <?php
-// Adds (or removes) a project in a Scratch studio using the account in config.php.
-// Usage: script.php?key=CRON_SECRET&studio=111,222,333&project=987654321[&action=remove]
-//    or: script.php?key=CRON_SECRET&project=987654321&action=removeall
-//    or: script.php?key=CRON_SECRET&project=987654321&action=queue
-// queue adds the project to the top MAX_PER_RUN IDs of scratch-session-queue.txt (filled by the
-// "Add this page to queue" button in candidates.php) and deletes each ID from the file once it was tried.
-// An ID stays queued only if the run was rate limited (429) or Scratch/the network failed (5xx).
-// removeall removes the project from every studio the log (scratch-session-log.txt) says it is still in.
-// Run it again until it says nothing is left.
-// studio takes one ID or a comma/space separated list. At most MAX_PER_RUN studios per request,
-// with PAUSE_SEC between them. The leftover IDs are printed so you can paste them into the next run.
+// Candidate list: open studios whose title matches any of your keywords, biggest first.
+// Key-gated (same CRON_SECRET as the other private pages).
+//
+//   /s/census/candidates.php?key=SECRET
+//   /s/census/candidates.php?key=SECRET&q=add,popular,viral,#&n=50&page=1&min=0
+//
+// q    comma separated keywords. A plain word (3+ letters) matches the START of a word in the title,
+//      using the FULLTEXT index. Anything else ("#", "1000 projects") is matched as plain text anywhere
+//      in the title (every space separated part must appear).
+// n    studios per page (default 50, at most 100)
+// page which page of the combined list (1 = biggest studios)
+// min  only studios with at least this many followers
+//
+// words=1  (the "Top words" button) skips the search and instead counts the most common words and
+//      two-word phrases in the titles of the biggest open studios. top=N is how many studios to scan
+//      (default 20000, at most 50000). Every word links back to a search for it.
+//
+// Speed: the keyword searches are merged into at most two queries (one FULLTEXT, one LIKE with OR), and
+// the result list is cached in the temp dir for 15 minutes (Top words: 1 hour), so paging, changing n
+// and the queue button are instant. Add &fresh=1 to skip the cache.
+//
+// This only lists studios. Adding a project is still done one studio at a time with script.php.
+require_once __DIR__ . '/functions.php';
+require_once __DIR__ . '/studios-functions.php';
 
-require_once __DIR__ . '/config.php';
-
-header('Content-Type: text/plain; charset=utf-8');
-
-if (($_GET['key'] ?? '') !== CRON_SECRET) {
+if (!hash_equals((string)CRON_SECRET, (string)($_GET['key'] ?? ''))) {
     http_response_code(404);
     exit;
 }
 
-const SCRATCH_UA = 'Mozilla/5.0 (compatible; ScratchCensus/1.0)';
-const SESSION_MAX_AGE = 43200; // reuse a login for 12 hours
-const MAX_PER_RUN = 50;        // studios handled per request
-const PAUSE_SEC = 1;           // pause between studios
+const CANDIDATE_DEFAULT_KEYWORDS = 'add, popular, projects, viral, games, follow, friends, #';
+const CANDIDATE_MAX_DEPTH = 1000; // offset + n never goes past this
+const CANDIDATE_DEPTH_STEP = 250; // lists are fetched in steps of this many, so a few pages share one query
 
-// One HTTP call. Returns [status code, raw headers, body].
-function scratch_http(string $method, string $url, string $jar, array $headers = [], ?string $body = null): array {
-    $ch = curl_init($url);
-    $opts = [
-        CURLOPT_RETURNTRANSFER => true,
-        CURLOPT_HEADER => true,
-        CURLOPT_CUSTOMREQUEST => $method,
-        CURLOPT_COOKIEFILE => $jar,
-        CURLOPT_COOKIEJAR => $jar,
-        CURLOPT_USERAGENT => SCRATCH_UA,
-        CURLOPT_TIMEOUT => 20,
-        CURLOPT_HTTPHEADER => array_merge(['Referer: https://scratch.mit.edu/'], $headers),
-    ];
-    if ($body !== null) {
-        $opts[CURLOPT_POSTFIELDS] = $body;
-    } elseif ($method === 'POST' || $method === 'PUT') {
-        $opts[CURLOPT_POSTFIELDS] = '';
+// "add, #, 1000 projects" -> ['ft' => ['add'], 'like' => [['#'], ['1000', 'projects']]]
+function candidateTerms(string $q): array {
+    $ft = [];
+    $like = [];
+    foreach (explode(',', $q) as $item) {
+        $item = trim(str_replace('*', '', $item));
+        if ($item === '') continue;
+        $parts = preg_split('/\s+/u', $item, -1, PREG_SPLIT_NO_EMPTY);
+        if (count($parts) === 1 && preg_match('/^[\p{L}\p{N}]{3,40}$/u', $parts[0])
+            && !in_array(mb_strtolower($parts[0]), STUDIO_FT_STOPWORDS, true)) {
+            $ft[] = $parts[0];
+        } else {
+            $like[] = array_slice($parts, 0, 4);
+        }
+        if (count($ft) + count($like) >= 12) break;
     }
-    curl_setopt_array($ch, $opts);
-    $raw = curl_exec($ch);
-    $code = (int)curl_getinfo($ch, CURLINFO_HTTP_CODE);
-    $hsize = (int)curl_getinfo($ch, CURLINFO_HEADER_SIZE);
-    $err = curl_error($ch);
-    curl_close($ch);
-    if ($raw === false) {
-        throw new Exception("cURL error: $err");
-    }
-    return [$code, substr($raw, 0, $hsize), substr($raw, $hsize)];
+    return ['ft' => array_values(array_unique($ft)), 'like' => $like];
 }
 
-// Newest scratchcsrftoken value found in the cookie jar file.
-function csrf_from_jar(string $jar): ?string {
-    $found = null;
-    if (is_file($jar)) {
-        foreach (file($jar) as $line) {
-            if (strpos($line, 'scratchcsrftoken') !== false) {
-                $parts = preg_split('/\s+/', trim($line));
-                $val = end($parts);
-                if ($val !== '' && $val !== '""') {
-                    $found = $val;
+function candidateCacheFile(string $key): string {
+    return sys_get_temp_dir() . '/candidates-' . md5(__DIR__ . '|' . $key) . '.json';
+}
+function candidateCacheRead(string $key, int $ttl): ?array {
+    $f = candidateCacheFile($key);
+    if (!empty($_GET['fresh']) || !is_file($f) || time() - (int)filemtime($f) > $ttl) return null;
+    $d = json_decode((string)@file_get_contents($f), true);
+    return is_array($d) ? $d : null;
+}
+function candidateCacheWrite(string $key, array $data): void {
+    $f = candidateCacheFile($key);
+    $tmp = $f . '.' . getmypid() . '.tmp';
+    if (@file_put_contents($tmp, json_encode($data, JSON_INVALID_UTF8_SUBSTITUTE)) !== false) @rename($tmp, $f);
+}
+
+function candidateRows(string $sql, string $types, array $params): array {
+    $stmt = getDB()->prepare($sql);
+    if (!$stmt) throw new RuntimeException('query could not be prepared');
+    $stmt->bind_param($types, ...$params);
+    $stmt->execute();
+    $rows = $stmt->get_result()->fetch_all(MYSQLI_ASSOC);
+    $stmt->close();
+    return $rows;
+}
+
+// Most common words and two-word phrases in the titles of the top open studios by followers.
+function candidateWordStats(int $top, int $min): array {
+    $rows = candidateRows(
+        "SELECT title, follower_count FROM studios WHERE status = 'fetched' AND open_to_all = 1 AND follower_count >= ?"
+        . ' ORDER BY follower_count DESC, id DESC LIMIT ?', 'ii', [$min, $top]);
+    $skip = array_flip(array_merge(STUDIO_FT_STOPWORDS, ['studio', 'studios', 'the', 'and', 'for', 'you', 'your', 'are', 'with', 'this', 'that', 'all', 'any', 'can', 'our', 'not']));
+    $words = [];
+    $phrases = [];
+    foreach ($rows as $r) {
+        $tokens = preg_split('/[^\p{L}\p{N}]+/u', mb_strtolower((string)$r['title']), -1, PREG_SPLIT_NO_EMPTY);
+        $f = (int)$r['follower_count'];
+        $seen = [];
+        $prev = null;
+        foreach ($tokens as $t) {
+            $ok = mb_strlen($t) >= 3 && !isset($skip[$t]) && !ctype_digit($t);
+            if ($ok) {
+                $seen['w' . $t] = true;
+                if ($prev !== null) $seen['p' . $prev . ' ' . $t] = true;
+            }
+            $prev = $ok ? $t : null;
+        }
+        foreach ($seen as $k => $_) {
+            $k = (string)$k;
+            $word = substr($k, 1);
+            if ($k[0] === 'w') {
+                $words[$word] = ($words[$word] ?? [0, 0]);
+                $words[$word][0]++;
+                $words[$word][1] += $f;
+            } else {
+                $phrases[$word] = ($phrases[$word] ?? [0, 0]);
+                $phrases[$word][0]++;
+                $phrases[$word][1] += $f;
+            }
+        }
+    }
+    $sort = function (array $a): array {
+        uasort($a, fn($x, $y) => [$y[0], $y[1]] <=> [$x[0], $x[1]]);
+        return $a;
+    };
+    $phrases = array_filter($phrases, fn($v) => $v[0] >= 3);
+    return [array_slice($sort($words), 0, 60, true), array_slice($sort($phrases), 0, 40, true), count($rows)];
+}
+
+$wordsMode = !empty($_GET['words']);
+$topN = max(1000, min(50000, (int)($_GET['top'] ?? 20000)));
+
+$q = trim((string)($_GET['q'] ?? ''));
+if ($q === '') $q = CANDIDATE_DEFAULT_KEYWORDS;
+$n = max(1, min(100, (int)($_GET['n'] ?? 50)));
+$page = max(1, (int)($_GET['page'] ?? 1));
+$min = max(0, (int)($_GET['min'] ?? 0));
+$offset = ($page - 1) * $n;
+$depth = min(CANDIDATE_MAX_DEPTH, (int)(ceil(($offset + $n) / CANDIDATE_DEPTH_STEP) * CANDIDATE_DEPTH_STEP));
+
+$terms = candidateTerms($q);
+$cols = 'id, title, follower_count, project_count';
+// follower_count DESC, id DESC can be read straight off the (status, open_to_all, follower_count, id)
+// index with no sort, so a rare keyword stops scanning as soon as it has enough matches.
+$tail = ' ORDER BY follower_count DESC, id DESC LIMIT ?';
+$base = "SELECT $cols FROM studios WHERE status = 'fetched' AND open_to_all = 1 AND follower_count >= ?";
+
+$all = [];
+$error = '';
+$fromCache = false;
+$t0 = microtime(true);
+try {
+    if ($wordsMode) {
+        $wk = "words|$topN|$min";
+        $c = candidateCacheRead($wk, 3600);
+        if ($c && isset($c['w'], $c['p'], $c['n'])) {
+            [$topWords, $topPhrases, $scanned] = [$c['w'], $c['p'], $c['n']];
+            $fromCache = true;
+        } else {
+            [$topWords, $topPhrases, $scanned] = candidateWordStats($topN, $min);
+            candidateCacheWrite($wk, ['w' => $topWords, 'p' => $topPhrases, 'n' => $scanned]);
+        }
+    } else {
+        $lk = 'list|' . mb_strtolower($q) . "|$min";
+        $c = candidateCacheRead($lk, 900);
+        if ($c && isset($c['depth'], $c['rows']) && (int)$c['depth'] >= $depth) {
+            foreach ($c['rows'] as $r) $all[(int)$r['id']] = $r;
+            $depth = (int)$c['depth'];
+            $fromCache = true;
+        } else {
+            if ($terms['ft']) {
+                $bool = implode(' ', array_map(fn($w) => $w . '*', $terms['ft'])); // no "+": any of the words
+                try {
+                    foreach (candidateRows("$base AND MATCH(title) AGAINST (? IN BOOLEAN MODE)$tail", 'isi', [$min, $bool, $depth]) as $r) $all[(int)$r['id']] = $r;
+                } catch (\Throwable $e) {
+                    // no FULLTEXT index: fall back to plain text matching for these words
+                    foreach ($terms['ft'] as $w) $terms['like'][] = [$w];
                 }
             }
-        }
-    }
-    return $found;
-}
-
-// scratchcsrftoken from Set-Cookie headers, falling back to the jar.
-function csrf_from_response(string $headers, string $jar): ?string {
-    if (preg_match_all('/scratchcsrftoken=([^;\s"]+)/i', $headers, $m) && !empty($m[1])) {
-        return $m[1][count($m[1]) - 1];
-    }
-    return csrf_from_jar($jar);
-}
-
-function scratch_login(string $user, string $pass, string $jar, string $stateFile): array {
-    @unlink($jar);
-    @unlink($stateFile);
-
-    $csrf = null;
-    $info = '';
-    for ($i = 0; $i < 3 && !$csrf; $i++) {
-        if ($i > 0) {
-            usleep(800000);
-        }
-        [$code, $headers] = scratch_http('GET', 'https://scratch.mit.edu/csrf_token/', $jar);
-        $csrf = csrf_from_response($headers, $jar);
-        preg_match_all('/Set-Cookie:\s*([^=;\s]+)=/i', $headers, $names);
-        $info = "HTTP $code, cookies received: " . (implode(',', $names[1]) ?: 'none');
-    }
-    if (!$csrf) {
-        throw new Exception("No CSRF token after 3 tries ($info). Scratch may be blocking this server.");
-    }
-
-    [$code, , $body] = scratch_http('POST', 'https://scratch.mit.edu/login/', $jar, [
-        'Content-Type: application/json',
-        'X-CSRFToken: ' . $csrf,
-        'X-Requested-With: XMLHttpRequest',
-    ], json_encode([
-        'username' => $user,
-        'password' => $pass,
-        'useMessages' => true,
-    ]));
-
-    $res = json_decode($body, true);
-    if (empty($res[0]['token'])) {
-        $snippet = substr(trim(strip_tags($body)), 0, 200);
-        throw new Exception("Login failed (HTTP $code). Response: $snippet");
-    }
-
-    // Django rotates the CSRF token on login, so take the new one from the jar.
-    $auth = [
-        'token' => $res[0]['token'],
-        'csrf' => csrf_from_jar($jar) ?: $csrf,
-        'saved' => time(),
-    ];
-    file_put_contents($stateFile, json_encode($auth));
-    return $auth;
-}
-
-function load_session(string $jar, string $stateFile): ?array {
-    if (!is_file($jar) || !is_file($stateFile)) {
-        return null;
-    }
-    $s = json_decode((string)file_get_contents($stateFile), true);
-    if (!$s || empty($s['token']) || time() - ($s['saved'] ?? 0) > SESSION_MAX_AGE) {
-        return null;
-    }
-    $s['csrf'] = csrf_from_jar($jar) ?: ($s['csrf'] ?? '');
-    return $s;
-}
-
-function studio_request(string $method, int $studio, int $project, array $auth, string $jar): array {
-    return scratch_http($method, "https://api.scratch.mit.edu/studios/$studio/project/$project", $jar, [
-        'X-Token: ' . $auth['token'],
-        'X-CSRFToken: ' . (csrf_from_jar($jar) ?: $auth['csrf']),
-        'X-Requested-With: XMLHttpRequest',
-        'Origin: https://scratch.mit.edu',
-    ]);
-}
-
-// Finish the batch even if the browser tab is closed or backgrounded.
-ignore_user_abort(true);
-set_time_limit(180);
-
-// Print and also append to a log you can open later (matches the scratch-session-* gitignore rule).
-function out(string $line): void {
-    echo $line;
-    @file_put_contents(__DIR__ . '/scratch-session-log.txt', date('Y-m-d H:i:s') . ' ' . $line, FILE_APPEND);
-    if (function_exists('ob_flush')) { @ob_flush(); }
-    flush();
-}
-
-// Studios the log says the project is currently in: the last ADD/DEL line per studio decides.
-// Old log lines without a tag count as an ADD only when their JSON names this project.
-function logged_studios(int $project): array {
-    $file = __DIR__ . '/scratch-session-log.txt';
-    if (!is_file($file)) {
-        return [];
-    }
-    $in = [];
-    foreach (file($file, FILE_IGNORE_NEW_LINES) as $line) {
-        if (preg_match('/ (ADD|DEL) (\d+) (\d+): HTTP 2\d\d/', $line, $m)) {
-            if ((int)$m[2] === $project) {
-                if ($m[1] === 'ADD') { $in[(int)$m[3]] = true; } else { unset($in[(int)$m[3]]); }
+            if ($terms['like']) {
+                // one query for all LIKE groups: (a AND b) OR (c) OR ..., read off the index in order
+                $sql = $base;
+                $types = 'i';
+                $params = [$min];
+                $ors = [];
+                foreach ($terms['like'] as $parts) {
+                    $ands = [];
+                    foreach ($parts as $part) {
+                        $ands[] = 'title LIKE ?';
+                        $types .= 's';
+                        $params[] = '%' . likeEscape($part) . '%';
+                    }
+                    $ors[] = '(' . implode(' AND ', $ands) . ')';
+                }
+                $sql .= ' AND (' . implode(' OR ', $ors) . ')';
+                $types .= 'i';
+                $params[] = $depth;
+                foreach (candidateRows($sql . $tail, $types, $params) as $r) $all[(int)$r['id']] = $r;
             }
-        } elseif (preg_match('/ (\d+): HTTP 2\d\d .*"projectId":"' . $project . '"/', $line, $m)) {
-            $in[(int)$m[1]] = true;
+            uasort($all, fn($x, $y) => [(int)$y['follower_count'], (int)$y['id']] <=> [(int)$x['follower_count'], (int)$x['id']]);
+            $all = array_slice($all, 0, $depth, true);
+            candidateCacheWrite($lk, ['depth' => $depth, 'rows' => array_values($all)]);
         }
     }
-    return array_keys($in);
+} catch (\Throwable $e) {
+    $error = $e->getMessage();
 }
+$took = microtime(true) - $t0;
 
-const QUEUE_FILE = __DIR__ . '/scratch-session-queue.txt';
+uasort($all, function ($a, $b) {
+    return [(int)$b['follower_count'], (int)$b['id']] <=> [(int)$a['follower_count'], (int)$a['id']];
+});
+$total = count($all);
+// more pages exist if rows remain, or if the list was cut at its depth and a deeper fetch is allowed
+$more = ($offset + $n < $total) || ($total >= $depth && $depth < CANDIDATE_MAX_DEPTH);
+$rows = array_slice(array_values($all), $offset, $n);
 
-function queue_ids(): array {
-    $lines = is_file(QUEUE_FILE) ? file(QUEUE_FILE, FILE_IGNORE_NEW_LINES) : [];
+// Queue: the "Add this page to queue" button appends this page's IDs to scratch-session-queue.txt
+// (one ID per line, no duplicates). script.php?action=queue takes them from the top and removes them.
+const CANDIDATE_QUEUE_FILE = __DIR__ . '/scratch-session-queue.txt';
+function candidateQueueIds(): array {
+    $lines = is_file(CANDIDATE_QUEUE_FILE) ? file(CANDIDATE_QUEUE_FILE, FILE_IGNORE_NEW_LINES) : [];
     return array_values(array_unique(array_filter(array_map('intval', $lines), fn($v) => $v > 0)));
 }
-
-// Remove one ID from the queue file (locked, so a button press during a run is not lost).
-function queue_remove(int $id): void {
-    $fh = @fopen(QUEUE_FILE, 'c+');
-    if (!$fh || !flock($fh, LOCK_EX)) {
-        return;
-    }
-    $keep = [];
-    while (($l = fgets($fh)) !== false) {
-        $v = (int)$l;
-        if ($v > 0 && $v !== $id) {
-            $keep[] = $v;
+$queueMsg = '';
+if (!$wordsMode && ($_SERVER['REQUEST_METHOD'] ?? '') === 'POST' && isset($_POST['queue']) && $rows) {
+    $fh = fopen(CANDIDATE_QUEUE_FILE, 'c+');
+    if ($fh && flock($fh, LOCK_EX)) {
+        $have = [];
+        while (($l = fgets($fh)) !== false) {
+            if ((int)$l > 0) $have[(int)$l] = true;
         }
+        $new = 0;
+        $out = '';
+        foreach ($rows as $r) {
+            $id = (int)$r['id'];
+            if (!isset($have[$id])) { $have[$id] = true; $out .= $id . "\n"; $new++; }
+        }
+        fseek($fh, 0, SEEK_END);
+        if ($out !== '' && ftell($fh) > 0) {
+            // make sure the last existing line ended with a newline
+            fseek($fh, -1, SEEK_END);
+            if (fgetc($fh) !== "\n") $out = "\n" . $out;
+            fseek($fh, 0, SEEK_END);
+        }
+        fwrite($fh, $out);
+        flock($fh, LOCK_UN);
+        fclose($fh);
+        $queueMsg = "Queued $new new IDs (" . (count($rows) - $new) . ' were already queued). ';
+    } else {
+        $queueMsg = 'Could not write the queue file. ';
     }
-    ftruncate($fh, 0);
-    rewind($fh);
-    fwrite($fh, $keep ? implode("\n", $keep) . "\n" : '');
-    flock($fh, LOCK_UN);
-    fclose($fh);
 }
 
-try {
-    $studios = array_values(array_unique(array_filter(
-        array_map('intval', preg_split('/[\s,;]+/', (string)($_GET['studio'] ?? ''), -1, PREG_SPLIT_NO_EMPTY)),
-        fn($n) => $n > 0
-    )));
-    $project = (int)($_GET['project'] ?? 0);
-    $action  = (string)($_GET['action'] ?? 'add');
-    $method  = ($action === 'remove' || $action === 'removeall') ? 'DELETE' : 'POST';
-    $tag     = ($method === 'DELETE') ? 'DEL' : 'ADD';
-
-    if ($action === 'removeall' && $project > 0) {
-        $studios = logged_studios($project);
-        if (!$studios) {
-            echo "Nothing left to remove for project $project according to the log.\n";
-            exit;
-        }
-        echo count($studios) . " studios still logged for project $project.\n";
+// which keywords each title contains
+$labels = array_merge($terms['ft'], array_map(fn($p) => implode(' ', $p), $terms['like']));
+function candidateMatched(string $title, array $labels): string {
+    $hit = [];
+    foreach ($labels as $l) {
+        $ok = true;
+        foreach (preg_split('/\s+/u', $l) as $part) if (stripos($title, $part) === false) { $ok = false; break; }
+        if ($ok) $hit[] = $l;
     }
-
-    if ($action === 'queue' && $project > 0) {
-        $studios = queue_ids();
-        if (!$studios) {
-            echo "The queue is empty.\n";
-            exit;
-        }
-        echo count($studios) . " IDs in the queue.\n";
-    }
-
-    if (!$studios || $project <= 0) {
-        throw new Exception('Missing studio or project parameter.');
-    }
-
-    $todo = array_slice($studios, 0, MAX_PER_RUN);
-    $rest = array_slice($studios, MAX_PER_RUN);
-
-    $base = __DIR__ . '/scratch-session-' . md5(CRON_SECRET . SCRATCH_USER);
-    $jar = $base . '.cookies';
-    $stateFile = $base . '.json';
-
-    $auth = load_session($jar, $stateFile);
-    $fresh = false;
-    if (!$auth) {
-        $auth = scratch_login(SCRATCH_USER, SCRATCH_PASS, $jar, $stateFile);
-        $fresh = true;
-    }
-
-    $ok = 0;
-    foreach ($todo as $n => $studio) {
-        if ($n > 0) {
-            sleep(PAUSE_SEC);
-        }
-        [$code, , $body] = studio_request($method, $studio, $project, $auth, $jar);
-
-        // A saved session can go stale: log in again once and retry.
-        // DELETE rotates the CSRF token: retry once with the fresh one from the jar.
-        if ($code === 419) {
-            [$code, , $body] = studio_request($method, $studio, $project, $auth, $jar);
-        }
-
-        if (!$fresh && in_array($code, [401, 403, 419], true)) {
-            $auth = scratch_login(SCRATCH_USER, SCRATCH_PASS, $jar, $stateFile);
-            $fresh = true;
-            [$code, , $body] = studio_request($method, $studio, $project, $auth, $jar);
-        }
-
-        out("$tag $project $studio: HTTP $code " . substr(trim(preg_replace('/\s+/', ' ', $body)), 0, 150) . "\n");
-        if ($code >= 200 && $code < 300) {
-            $ok++;
-        }
-        if ($action === 'queue' && $code > 0 && $code < 500 && $code !== 429) {
-            queue_remove($studio);
-        }
-
-        // Rate limited: stop and hand back everything not yet tried.
-        if ($code === 429) {
-            $rest = array_merge(array_slice($todo, $n + 1), $rest);
-            out("Stopped: rate limited. Wait a while before continuing.\n");
-            break;
-        }
-    }
-
-    out("\nDone: $ok ok of " . count($todo) . " tried.\n");
-    if ($action === 'queue') {
-        out('Left in queue: ' . count(queue_ids()) . "\n");
-    } elseif ($rest) {
-        out('Remaining (' . count($rest) . '): ' . implode(',', $rest) . "\n");
-    }
-} catch (Throwable $e) {
-    echo 'Error: ', $e->getMessage(), "\n";
+    return implode(', ', $hit);
 }
+
+$keyQ = rawurlencode((string)$_GET['key']);
+$link = function (int $p) use ($keyQ, $q, $n, $min) {
+    return '?key=' . $keyQ . '&q=' . rawurlencode($q) . '&n=' . $n . '&min=' . $min . '&page=' . $p;
+};
+header('Content-Type: text/html; charset=utf-8');
+header('X-Robots-Tag: noindex');
+?><!doctype html>
+<html lang="en"><head><meta charset="utf-8"><meta name="viewport" content="width=device-width, initial-scale=1">
+<meta name="robots" content="noindex">
+<title>Studio candidates - ScratchCensus</title>
+<style>
+body{font:15px/1.4 system-ui,sans-serif;margin:16px;max-width:1000px}
+table{border-collapse:collapse;width:100%}th,td{padding:6px 8px;border-bottom:1px solid #ddd;text-align:left;vertical-align:top}
+td.n,th.n{text-align:right}.muted{color:#777}textarea{width:100%;height:70px;font-family:monospace}
+input[type=text]{width:100%;max-width:520px}
+</style></head><body>
+<h1>Open studio candidates</h1>
+<form method="get">
+    <input type="hidden" name="key" value="<?= e((string)$_GET['key']) ?>">
+    <p><label>Keywords, comma separated<br><input type="text" name="q" value="<?= e($q) ?>"></label></p>
+    <p>Per page <input type="number" name="n" value="<?= (int)$n ?>" min="1" max="100" style="width:5em">
+       Minimum followers <input type="number" name="min" value="<?= (int)$min ?>" min="0" style="width:7em">
+       Page <input type="number" name="page" value="<?= (int)$page ?>" min="1" style="width:5em">
+       <button type="submit">Search</button></p>
+    <p>Scan top <input type="number" name="top" value="<?= (int)$topN ?>" min="1000" max="50000" step="1000" style="width:6em"> open studios
+       <button type="submit" name="words" value="1">Top words</button></p>
+</form>
+<?php if ($error !== ''): ?><p><strong>Error:</strong> <?= e($error) ?></p><?php endif; ?>
+<?php if ($wordsMode && !$error): ?>
+<p class="muted">Scanned the top <?= number_format($scanned) ?> open studios by followers (min <?= (int)$min ?>), <?= number_format($took, 2) ?>s<?= $fromCache ? ' (cached)' : '' ?>. "Studios" is how many titles contain it. Click a word to search it.</p>
+<?php $wl = function (string $w) use ($keyQ, $n, $min) { return '?key=' . $keyQ . '&q=' . rawurlencode($w) . '&n=' . $n . '&min=' . $min; }; ?>
+<p><label>Top 20 words as keywords (paste into the box above)<br><textarea readonly onclick="this.select()"><?= e(implode(', ', array_slice(array_keys($topWords), 0, 20))) ?></textarea></label></p>
+<table style="width:auto;display:inline-block;vertical-align:top;margin-right:24px">
+<tr><th>Word</th><th class="n">Studios</th><th class="n">Followers</th></tr>
+<?php foreach ($topWords as $w => $v): ?>
+<tr><td><a href="<?= e($wl((string)$w)) ?>"><?= e((string)$w) ?></a></td><td class="n"><?= number_format($v[0]) ?></td><td class="n"><?= number_format($v[1]) ?></td></tr>
+<?php endforeach; ?>
+</table>
+<table style="width:auto;display:inline-block;vertical-align:top">
+<tr><th>Phrase</th><th class="n">Studios</th><th class="n">Followers</th></tr>
+<?php foreach ($topPhrases as $w => $v): ?>
+<tr><td><a href="<?= e($wl((string)$w)) ?>"><?= e((string)$w) ?></a></td><td class="n"><?= number_format($v[0]) ?></td><td class="n"><?= number_format($v[1]) ?></td></tr>
+<?php endforeach; ?>
+</table>
+</body></html>
+<?php exit; endif; ?>
+<p class="muted"><?= number_format($total) ?><?= $more && $total >= $depth ? '+' : '' ?> studios found (top <?= number_format($depth) ?> by followers), <?= number_format($took, 2) ?>s<?= $fromCache ? ' (cached)' : '' ?>.
+Open studios only, biggest first. Add to a handful at a time through script.php.</p>
+<?php if ($rows): ?>
+<?php $idList = array_map(fn($r) => (int)$r['id'], $rows); ?>
+<p><label>IDs for script.php (studio=...)<br><textarea readonly onclick="this.select()"><?= e(implode(',', $idList)) ?></textarea></label></p>
+<form method="post" action="<?= e($link((int)$page)) ?>" style="margin:0 0 12px">
+    <button type="submit" name="queue" value="1">Add this page to queue</button>
+    <span class="muted"><?= e($queueMsg) ?><?= number_format(count(candidateQueueIds())) ?> IDs waiting. Run script.php?key=...&amp;project=...&amp;action=queue</span>
+</form>
+<p><label>PHP array<br><textarea readonly onclick="this.select()">[<?= e(implode(', ', $idList)) ?>]</textarea></label></p>
+<table>
+<tr><th class="n">#</th><th>Studio</th><th class="n">Followers</th><th class="n">Projects</th><th>Matched</th></tr>
+<?php foreach ($rows as $i => $r): $title = (string)$r['title'] !== '' ? (string)$r['title'] : 'Studio ' . $r['id']; ?>
+<tr>
+    <td class="n"><?= $offset + $i + 1 ?></td>
+    <td><a href="https://scratch.mit.edu/studios/<?= (int)$r['id'] ?>/" target="_blank" rel="noopener"><?= e(shortTitle($title)) ?></a> <span class="muted">#<?= (int)$r['id'] ?></span></td>
+    <td class="n"><?= number_format((int)$r['follower_count']) ?></td>
+    <td class="n"><?= number_format((int)$r['project_count']) ?></td>
+    <td class="muted"><?= e(candidateMatched($title, $labels)) ?></td>
+</tr>
+<?php endforeach; ?>
+</table>
+<p>
+<?php if ($page > 1): ?><a href="<?= e($link($page - 1)) ?>">&larr; Previous</a> <?php endif; ?>
+<?php if ($more): ?><a href="<?= e($link($page + 1)) ?>">Next &rarr;</a><?php endif; ?>
+</p>
+<?php elseif ($error === ''): ?>
+<p>No open studios matched.</p>
+<?php endif; ?>
+</body></html>
