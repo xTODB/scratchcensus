@@ -47,6 +47,8 @@ try {
     }
     $pages['forums-views']   = ['c' => 'forums'];
     $pages['forums-replies'] = ['c' => 'forums', 'sort' => 'replies'];
+    // The private studio candidates list (default keywords). '_path' points at another file than index.php.
+    $pages['candidates']     = ['_path' => 'candidates.php'];
 
     // The studio follower histograms (used by every studio list and search) are cached in temp files;
     // refresh them here so no visitor has to wait for the rebuild.
@@ -57,7 +59,9 @@ try {
     $skipped = 0;
     foreach ($pages as $name => $params) {
         if (microtime(true) - $start > WARM_TIME_BUDGET_SEC) { $skipped++; continue; }
-        $url = rtrim(WARM_BASE_URL, '/') . '/?' . http_build_query($params + ['warm' => CRON_SECRET]);
+        $path = (string)($params['_path'] ?? '');
+        unset($params['_path']);
+        $url = rtrim(WARM_BASE_URL, '/') . '/' . $path . '?' . http_build_query($params + ['warm' => CRON_SECRET]);
         $state = ''; $code = 0;
         $ch = curl_init($url);
         curl_setopt_array($ch, [
