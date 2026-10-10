@@ -20,3 +20,14 @@ RewriteRule ^u/([^/]+)/?$ profile.php?u=$1 [L,QSA]
     ExpiresByType image/svg+xml "access plus 30 days"
     ExpiresByType image/x-icon "access plus 30 days"
 </IfModule>
+
+# Private working files written next to script.php (login cookies, log, queue): never served.
+<FilesMatch "^scratch-session-">
+    <IfModule mod_authz_core.c>
+        Require all denied
+    </IfModule>
+    <IfModule !mod_authz_core.c>
+        Order allow,deny
+        Deny from all
+    </IfModule>
+</FilesMatch>
