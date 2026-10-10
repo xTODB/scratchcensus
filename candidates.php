@@ -12,6 +12,10 @@
 // page which page of the combined list (1 = biggest studios)
 // min  only studios with at least this many followers
 //
+// words=1  (the "Top words" button) skips the search and instead counts the most common words and
+//      two-word phrases in the titles of the biggest open studios. top=N is how many studios to scan
+//      (default 20000, at most 50000). Every word links back to a search for it.
+//
 // This only lists studios. Adding a project is still done one studio at a time with script.php.
 require_once __DIR__ . '/functions.php';
 require_once __DIR__ . '/studios-functions.php';
@@ -53,6 +57,52 @@ function candidateRows(string $sql, string $types, array $params): array {
     return $rows;
 }
 
+// Most common words and two-word phrases in the titles of the top open studios by followers.
+function candidateWordStats(int $top, int $min): array {
+    $rows = candidateRows(
+        "SELECT title, follower_count FROM studios WHERE status = 'fetched' AND open_to_all = 1 AND follower_count >= ?"
+        . ' ORDER BY follower_count DESC, id DESC LIMIT ?', 'ii', [$min, $top]);
+    $skip = array_flip(array_merge(STUDIO_FT_STOPWORDS, ['studio', 'studios', 'the', 'and', 'for', 'you', 'your', 'are', 'with', 'this', 'that', 'all', 'any', 'can', 'our', 'not']));
+    $words = [];
+    $phrases = [];
+    foreach ($rows as $r) {
+        $tokens = preg_split('/[^\p{L}\p{N}]+/u', mb_strtolower((string)$r['title']), -1, PREG_SPLIT_NO_EMPTY);
+        $f = (int)$r['follower_count'];
+        $seen = [];
+        $prev = null;
+        foreach ($tokens as $t) {
+            $ok = mb_strlen($t) >= 3 && !isset($skip[$t]) && !ctype_digit($t);
+            if ($ok) {
+                $seen['w' . $t] = true;
+                if ($prev !== null) $seen['p' . $prev . ' ' . $t] = true;
+            }
+            $prev = $ok ? $t : null;
+        }
+        foreach ($seen as $k => $_) {
+            $k = (string)$k;
+            $word = substr($k, 1);
+            if ($k[0] === 'w') {
+                $words[$word] = ($words[$word] ?? [0, 0]);
+                $words[$word][0]++;
+                $words[$word][1] += $f;
+            } else {
+                $phrases[$word] = ($phrases[$word] ?? [0, 0]);
+                $phrases[$word][0]++;
+                $phrases[$word][1] += $f;
+            }
+        }
+    }
+    $sort = function (array $a): array {
+        uasort($a, fn($x, $y) => [$y[0], $y[1]] <=> [$x[0], $x[1]]);
+        return $a;
+    };
+    $phrases = array_filter($phrases, fn($v) => $v[0] >= 3);
+    return [array_slice($sort($words), 0, 60, true), array_slice($sort($phrases), 0, 40, true), count($rows)];
+}
+
+$wordsMode = !empty($_GET['words']);
+$topN = max(1000, min(50000, (int)($_GET['top'] ?? 20000)));
+
 $q = trim((string)($_GET['q'] ?? ''));
 if ($q === '') $q = CANDIDATE_DEFAULT_KEYWORDS;
 $n = max(1, min(100, (int)($_GET['n'] ?? 50)));
@@ -72,7 +122,9 @@ $all = [];
 $error = '';
 $t0 = microtime(true);
 try {
-    if ($terms['ft']) {
+    if ($wordsMode) {
+        [$topWords, $topPhrases, $scanned] = candidateWordStats($topN, $min);
+    } elseif ($terms['ft']) {
         $bool = implode(' ', array_map(fn($w) => $w . '*', $terms['ft'])); // no "+": any of the words
         try {
             foreach (candidateRows("$base AND MATCH(title) AGAINST (? IN BOOLEAN MODE)$tail", 'isi', [$min, $bool, $depth]) as $r) $all[(int)$r['id']] = $r;
@@ -81,7 +133,7 @@ try {
             foreach ($terms['ft'] as $w) $terms['like'][] = [$w];
         }
     }
-    foreach ($terms['like'] as $parts) {
+    if (!$wordsMode) foreach ($terms['like'] as $parts) {
         $sql = $base;
         $types = 'i';
         $params = [$min];
@@ -140,8 +192,28 @@ input[type=text]{width:100%;max-width:520px}
     <p>Per page <input type="number" name="n" value="<?= (int)$n ?>" min="1" max="100" style="width:5em">
        Minimum followers <input type="number" name="min" value="<?= (int)$min ?>" min="0" style="width:7em">
        <button type="submit">Search</button></p>
+    <p>Scan top <input type="number" name="top" value="<?= (int)$topN ?>" min="1000" max="50000" step="1000" style="width:6em"> open studios
+       <button type="submit" name="words" value="1">Top words</button></p>
 </form>
 <?php if ($error !== ''): ?><p><strong>Error:</strong> <?= e($error) ?></p><?php endif; ?>
+<?php if ($wordsMode && !$error): ?>
+<p class="muted">Scanned the top <?= number_format($scanned) ?> open studios by followers (min <?= (int)$min ?>), <?= number_format($took, 2) ?>s. "Studios" is how many titles contain it. Click a word to search it.</p>
+<?php $wl = function (string $w) use ($keyQ, $n, $min) { return '?key=' . $keyQ . '&q=' . rawurlencode($w) . '&n=' . $n . '&min=' . $min; }; ?>
+<p><label>Top 20 words as keywords (paste into the box above)<br><textarea readonly onclick="this.select()"><?= e(implode(', ', array_slice(array_keys($topWords), 0, 20))) ?></textarea></label></p>
+<table style="width:auto;display:inline-block;vertical-align:top;margin-right:24px">
+<tr><th>Word</th><th class="n">Studios</th><th class="n">Followers</th></tr>
+<?php foreach ($topWords as $w => $v): ?>
+<tr><td><a href="<?= e($wl((string)$w)) ?>"><?= e((string)$w) ?></a></td><td class="n"><?= number_format($v[0]) ?></td><td class="n"><?= number_format($v[1]) ?></td></tr>
+<?php endforeach; ?>
+</table>
+<table style="width:auto;display:inline-block;vertical-align:top">
+<tr><th>Phrase</th><th class="n">Studios</th><th class="n">Followers</th></tr>
+<?php foreach ($topPhrases as $w => $v): ?>
+<tr><td><a href="<?= e($wl((string)$w)) ?>"><?= e((string)$w) ?></a></td><td class="n"><?= number_format($v[0]) ?></td><td class="n"><?= number_format($v[1]) ?></td></tr>
+<?php endforeach; ?>
+</table>
+</body></html>
+<?php exit; endif; ?>
 <p class="muted"><?= number_format($total) ?> studios found (up to <?= number_format($depth) ?> per keyword group), <?= number_format($took, 2) ?>s.
 Open studios only, biggest first. Add to a handful at a time through script.php.</p>
 <?php if ($rows): ?>
