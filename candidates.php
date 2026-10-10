@@ -191,6 +191,7 @@ input[type=text]{width:100%;max-width:520px}
     <p><label>Keywords, comma separated<br><input type="text" name="q" value="<?= e($q) ?>"></label></p>
     <p>Per page <input type="number" name="n" value="<?= (int)$n ?>" min="1" max="100" style="width:5em">
        Minimum followers <input type="number" name="min" value="<?= (int)$min ?>" min="0" style="width:7em">
+       Page <input type="number" name="page" value="<?= (int)$page ?>" min="1" style="width:5em">
        <button type="submit">Search</button></p>
     <p>Scan top <input type="number" name="top" value="<?= (int)$topN ?>" min="1000" max="50000" step="1000" style="width:6em"> open studios
        <button type="submit" name="words" value="1">Top words</button></p>
