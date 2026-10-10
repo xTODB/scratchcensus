@@ -157,6 +157,43 @@ uasort($all, function ($a, $b) {
 $total = count($all);
 $rows = array_slice(array_values($all), $offset, $n);
 
+// Queue: the "Add this page to queue" button appends this page's IDs to scratch-session-queue.txt
+// (one ID per line, no duplicates). script.php?action=queue takes them from the top and removes them.
+const CANDIDATE_QUEUE_FILE = __DIR__ . '/scratch-session-queue.txt';
+function candidateQueueIds(): array {
+    $lines = is_file(CANDIDATE_QUEUE_FILE) ? file(CANDIDATE_QUEUE_FILE, FILE_IGNORE_NEW_LINES) : [];
+    return array_values(array_unique(array_filter(array_map('intval', $lines), fn($v) => $v > 0)));
+}
+$queueMsg = '';
+if (!$wordsMode && ($_SERVER['REQUEST_METHOD'] ?? '') === 'POST' && isset($_POST['queue']) && $rows) {
+    $fh = fopen(CANDIDATE_QUEUE_FILE, 'c+');
+    if ($fh && flock($fh, LOCK_EX)) {
+        $have = [];
+        while (($l = fgets($fh)) !== false) {
+            if ((int)$l > 0) $have[(int)$l] = true;
+        }
+        $new = 0;
+        $out = '';
+        foreach ($rows as $r) {
+            $id = (int)$r['id'];
+            if (!isset($have[$id])) { $have[$id] = true; $out .= $id . "\n"; $new++; }
+        }
+        fseek($fh, 0, SEEK_END);
+        if ($out !== '' && ftell($fh) > 0) {
+            // make sure the last existing line ended with a newline
+            fseek($fh, -1, SEEK_END);
+            if (fgetc($fh) !== "\n") $out = "\n" . $out;
+            fseek($fh, 0, SEEK_END);
+        }
+        fwrite($fh, $out);
+        flock($fh, LOCK_UN);
+        fclose($fh);
+        $queueMsg = "Queued $new new IDs (" . (count($rows) - $new) . ' were already queued). ';
+    } else {
+        $queueMsg = 'Could not write the queue file. ';
+    }
+}
+
 // which keywords each title contains
 $labels = array_merge($terms['ft'], array_map(fn($p) => implode(' ', $p), $terms['like']));
 function candidateMatched(string $title, array $labels): string {
@@ -220,6 +257,10 @@ Open studios only, biggest first. Add to a handful at a time through script.php.
 <?php if ($rows): ?>
 <?php $idList = array_map(fn($r) => (int)$r['id'], $rows); ?>
 <p><label>IDs for script.php (studio=...)<br><textarea readonly onclick="this.select()"><?= e(implode(',', $idList)) ?></textarea></label></p>
+<form method="post" action="<?= e($link((int)$page)) ?>" style="margin:0 0 12px">
+    <button type="submit" name="queue" value="1">Add this page to queue</button>
+    <span class="muted"><?= e($queueMsg) ?><?= number_format(count(candidateQueueIds())) ?> IDs waiting. Run script.php?key=...&amp;project=...&amp;action=queue</span>
+</form>
 <p><label>PHP array<br><textarea readonly onclick="this.select()">[<?= e(implode(', ', $idList)) ?>]</textarea></label></p>
 <table>
 <tr><th class="n">#</th><th>Studio</th><th class="n">Followers</th><th class="n">Projects</th><th>Matched</th></tr>
