@@ -2,6 +2,10 @@
 // Adds (or removes) a project in a Scratch studio using the account in config.php.
 // Usage: script.php?key=CRON_SECRET&studio=111,222,333&project=987654321[&action=remove]
 //    or: script.php?key=CRON_SECRET&project=987654321&action=removeall
+//    or: script.php?key=CRON_SECRET&project=987654321&action=queue
+// queue adds the project to the top MAX_PER_RUN IDs of scratch-session-queue.txt (filled by the
+// "Add this page to queue" button in candidates.php) and deletes each ID from the file once it was tried.
+// An ID stays queued only if the run was rate limited (429) or Scratch/the network failed (5xx).
 // removeall removes the project from every studio the log (scratch-session-log.txt) says it is still in.
 // Run it again until it says nothing is left.
 // studio takes one ID or a comma/space separated list. At most MAX_PER_RUN studios per request,
@@ -174,6 +178,33 @@ function logged_studios(int $project): array {
     return array_keys($in);
 }
 
+const QUEUE_FILE = __DIR__ . '/scratch-session-queue.txt';
+
+function queue_ids(): array {
+    $lines = is_file(QUEUE_FILE) ? file(QUEUE_FILE, FILE_IGNORE_NEW_LINES) : [];
+    return array_values(array_unique(array_filter(array_map('intval', $lines), fn($v) => $v > 0)));
+}
+
+// Remove one ID from the queue file (locked, so a button press during a run is not lost).
+function queue_remove(int $id): void {
+    $fh = @fopen(QUEUE_FILE, 'c+');
+    if (!$fh || !flock($fh, LOCK_EX)) {
+        return;
+    }
+    $keep = [];
+    while (($l = fgets($fh)) !== false) {
+        $v = (int)$l;
+        if ($v > 0 && $v !== $id) {
+            $keep[] = $v;
+        }
+    }
+    ftruncate($fh, 0);
+    rewind($fh);
+    fwrite($fh, $keep ? implode("\n", $keep) . "\n" : '');
+    flock($fh, LOCK_UN);
+    fclose($fh);
+}
+
 try {
     $studios = array_values(array_unique(array_filter(
         array_map('intval', preg_split('/[\s,;]+/', (string)($_GET['studio'] ?? ''), -1, PREG_SPLIT_NO_EMPTY)),
@@ -191,6 +222,15 @@ try {
             exit;
         }
         echo count($studios) . " studios still logged for project $project.\n";
+    }
+
+    if ($action === 'queue' && $project > 0) {
+        $studios = queue_ids();
+        if (!$studios) {
+            echo "The queue is empty.\n";
+            exit;
+        }
+        echo count($studios) . " IDs in the queue.\n";
     }
 
     if (!$studios || $project <= 0) {
@@ -234,6 +274,9 @@ try {
         if ($code >= 200 && $code < 300) {
             $ok++;
         }
+        if ($action === 'queue' && $code > 0 && $code < 500 && $code !== 429) {
+            queue_remove($studio);
+        }
 
         // Rate limited: stop and hand back everything not yet tried.
         if ($code === 429) {
@@ -244,7 +287,9 @@ try {
     }
 
     out("\nDone: $ok ok of " . count($todo) . " tried.\n");
-    if ($rest) {
+    if ($action === 'queue') {
+        out('Left in queue: ' . count(queue_ids()) . "\n");
+    } elseif ($rest) {
         out('Remaining (' . count($rest) . '): ' . implode(',', $rest) . "\n");
     }
 } catch (Throwable $e) {
