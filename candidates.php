@@ -9,20 +9,21 @@
 //      using the FULLTEXT index. Anything else ("#", "1000 projects") is matched as plain text anywhere
 //      in the title (every space separated part must appear).
 // n    studios per page (default 50, at most 100)
-// page which page of the combined list (1 = biggest studios)
+// page which page of the combined list (1 = biggest studios). The page count is shown under the form.
 // min  only studios with at least this many followers
 //
 // words=1  (the "Top words" button) skips the search and instead counts the most common words and
 //      two-word phrases in the titles of the biggest open studios. top=N is how many studios to scan
 //      (default 20000, at most 50000). Every word links back to a search for it.
 //
-// Speed: the keyword searches are merged into at most two queries (one FULLTEXT, one LIKE with OR), and
-// the result list is cached in the temp dir for 15 minutes (Top words: 1 hour), so paging, changing n
-// and the queue button are instant. Add &fresh=1 to skip the cache. The line under the form shows how long
-// the FULLTEXT and the LIKE query took (or how old the cached copy is), so the slow one is easy to spot.
+// Speed: the keyword searches are merged into at most two queries (one FULLTEXT, one LIKE with OR). They return
+// the ids of every match, biggest first, and that id list is cached in the temp dir for 30 minutes (Top words:
+// 1 hour), so paging, changing n and the queue button are instant. Add &fresh=1 to skip the cache. The line under
+// the form shows how long the FULLTEXT and the LIKE query took (or how old the cached copy is).
+// Each query stops at CANDIDATE_MAX_MATCHES matches as a safety net; a list that hits it shows "100,000+".
 //
 // warm=CRON_SECRET (used by cron/warm-cache.php, no key needed) rebuilds the cached list for the default
-// keywords once it is older than 8 minutes, so the first visit is instant too.
+// keywords once it is older than 25 minutes, so the first visit is instant too.
 //
 // This only lists studios. Adding a project is still done one studio at a time with script.php.
 require_once __DIR__ . '/functions.php';
@@ -35,9 +36,9 @@ if (!$warming && !hash_equals((string)CRON_SECRET, (string)($_GET['key'] ?? ''))
 }
 
 const CANDIDATE_DEFAULT_KEYWORDS = 'add, popular, projects, viral, games, follow, friends, #';
-const CANDIDATE_MAX_DEPTH = 1000; // offset + n never goes past this
-const CANDIDATE_DEPTH_STEP = 250; // lists are fetched in steps of this many, so a few pages share one query
-const CANDIDATE_WARM_AGE_SEC = 480; // the cron rebuilds the default list once its copy is older than this
+const CANDIDATE_MAX_MATCHES = 100000; // safety cap per query (FULLTEXT and LIKE each), keeps memory and time bounded
+const CANDIDATE_LIST_TTL_SEC = 1800; // how long a cached list is used
+const CANDIDATE_WARM_AGE_SEC = 1500; // the cron rebuilds the default list once its copy is older than this
 
 // "add, #, 1000 projects" -> ['ft' => ['add'], 'like' => [['#'], ['1000', 'projects']]]
 function candidateTerms(string $q): array {
@@ -77,31 +78,45 @@ function candidateCacheAge(string $key): ?int {
     clearstatcache(true, $f);
     return is_file($f) ? max(0, time() - (int)filemtime($f)) : null;
 }
+function candidateListKey(string $q, int $min): string {
+    return 'list2|' . mb_strtolower($q) . "|$min";
+}
 
-function candidateRows(string $sql, string $types, array $params): array {
+function candidateRows(string $sql, string $types, array $params, int $mode = MYSQLI_ASSOC): array {
     $stmt = getDB()->prepare($sql);
     if (!$stmt) throw new RuntimeException('query could not be prepared');
     $stmt->bind_param($types, ...$params);
     $stmt->execute();
-    $rows = $stmt->get_result()->fetch_all(MYSQLI_ASSOC);
+    $rows = $stmt->get_result()->fetch_all($mode);
     $stmt->close();
     return $rows;
 }
 
-// The matching list for these terms: at most $depth rows, biggest first. $timing gets the seconds the
-// FULLTEXT query and the LIKE query took (null when that query was not needed).
-function candidateBuildList(array &$terms, int $min, int $depth, array &$timing): array {
-    $base = "SELECT id, title, follower_count, project_count FROM studios WHERE status = 'fetched' AND open_to_all = 1 AND follower_count >= ?";
+// Ids of every studio matching these terms, biggest first: ['ids' => [...], 'capped' => bool]. $timing gets the
+// seconds the FULLTEXT query and the LIKE query took (null when that query was not needed). Each query stops at
+// CANDIDATE_MAX_MATCHES; when one does, the list is cut where that query's coverage ends so it stays exact.
+function candidateBuildList(array &$terms, int $min, array &$timing): array {
+    $base = "SELECT id, follower_count FROM studios WHERE status = 'fetched' AND open_to_all = 1 AND follower_count >= ?";
     // follower_count DESC, id DESC can be read straight off the (status, open_to_all, follower_count, id)
     // index with no sort, so a rare keyword stops scanning as soon as it has enough matches.
     $tail = ' ORDER BY follower_count DESC, id DESC LIMIT ?';
-    $all = [];
+    $cap = CANDIDATE_MAX_MATCHES;
+    $all = [];  // id => follower_count
+    $cuts = []; // [follower_count, id] of the last row of every query that hit the cap
     $timing = ['ft' => null, 'like' => null];
+    $run = function (string $sql, string $types, array $params) use (&$all, &$cuts, $cap): void {
+        $rows = candidateRows($sql, $types, $params, MYSQLI_NUM);
+        foreach ($rows as $r) $all[(int)$r[0]] = (int)$r[1];
+        if (count($rows) >= $cap) {
+            $last = end($rows);
+            $cuts[] = [(int)$last[1], (int)$last[0]];
+        }
+    };
     if ($terms['ft']) {
         $t = microtime(true);
         $bool = implode(' ', array_map(fn($w) => $w . '*', $terms['ft'])); // no "+": any of the words
         try {
-            foreach (candidateRows("$base AND MATCH(title) AGAINST (? IN BOOLEAN MODE)$tail", 'isi', [$min, $bool, $depth]) as $r) $all[(int)$r['id']] = $r;
+            $run("$base AND MATCH(title) AGAINST (? IN BOOLEAN MODE)$tail", 'isi', [$min, $bool, $cap]);
         } catch (\Throwable $e) {
             // no FULLTEXT index: fall back to plain text matching for these words
             foreach ($terms['ft'] as $w) $terms['like'][] = [$w];
@@ -126,12 +141,32 @@ function candidateBuildList(array &$terms, int $min, int $depth, array &$timing)
         }
         $sql .= ' AND (' . implode(' OR ', $ors) . ')';
         $types .= 'i';
-        $params[] = $depth;
-        foreach (candidateRows($sql . $tail, $types, $params) as $r) $all[(int)$r['id']] = $r;
+        $params[] = $cap;
+        $run($sql . $tail, $types, $params);
         $timing['like'] = microtime(true) - $t;
     }
-    uasort($all, fn($x, $y) => [(int)$y['follower_count'], (int)$y['id']] <=> [(int)$x['follower_count'], (int)$x['id']]);
-    return array_slice($all, 0, $depth, true);
+    if ($cuts) {
+        // below the shallowest cut the other query may have matches we never fetched, so drop everything under it
+        $cut = [PHP_INT_MIN, PHP_INT_MIN];
+        foreach ($cuts as $c) if ($c > $cut) $cut = $c;
+        foreach ($all as $id => $f) if ([$f, $id] < $cut) unset($all[$id]);
+    }
+    $ids = array_keys($all);
+    $fols = array_values($all);
+    array_multisort($fols, SORT_DESC, SORT_NUMERIC, $ids, SORT_DESC, SORT_NUMERIC);
+    return ['ids' => $ids, 'capped' => (bool)$cuts];
+}
+
+// Rows (id, title, followers, projects) for one page of ids, in the order given.
+function candidatePageRows(array $ids): array {
+    if (!$ids) return [];
+    $rows = candidateRows('SELECT id, title, follower_count, project_count FROM studios WHERE id IN (' . implode(',', array_fill(0, count($ids), '?')) . ')',
+        str_repeat('i', count($ids)), array_map('intval', $ids));
+    $by = [];
+    foreach ($rows as $r) $by[(int)$r['id']] = $r;
+    $out = [];
+    foreach ($ids as $id) if (isset($by[(int)$id])) $out[] = $by[(int)$id];
+    return $out;
 }
 
 // Most common words and two-word phrases in the titles of the top open studios by followers.
@@ -181,6 +216,8 @@ function candidateWordStats(int $top, int $min): array {
 if ($warming) {
     header('Content-Type: text/plain; charset=utf-8');
     header('X-Robots-Tag: noindex');
+    ignore_user_abort(true);
+    @set_time_limit(180);
     $wLock = @fopen(sys_get_temp_dir() . '/candidates-warm-' . md5(__DIR__) . '.lock', 'c');
     if (!$wLock || !flock($wLock, LOCK_EX | LOCK_NB)) {
         header('X-ScratchCensus-Cache: busy');
@@ -188,19 +225,17 @@ if ($warming) {
         exit;
     }
     try {
-        $wKey = 'list|' . mb_strtolower(CANDIDATE_DEFAULT_KEYWORDS) . '|0';
-        $wCached = candidateCacheRead($wKey, 900);
+        $wKey = candidateListKey(CANDIDATE_DEFAULT_KEYWORDS, 0);
+        $wCached = candidateCacheRead($wKey, CANDIDATE_LIST_TTL_SEC);
         $wAge = candidateCacheAge($wKey);
-        if ($wCached && (int)($wCached['depth'] ?? 0) >= CANDIDATE_DEPTH_STEP && $wAge !== null && $wAge < CANDIDATE_WARM_AGE_SEC) {
+        if ($wCached && isset($wCached['ids']) && $wAge !== null && $wAge < CANDIDATE_WARM_AGE_SEC) {
             header('X-ScratchCensus-Cache: fresh');
             echo 'fresh';
             exit;
         }
-        $wDepth = max(CANDIDATE_DEPTH_STEP, (int)($wCached['depth'] ?? 0)); // never shrink a list someone paged deep into
         $wTerms = candidateTerms(CANDIDATE_DEFAULT_KEYWORDS);
         $wTiming = [];
-        $wRows = candidateBuildList($wTerms, 0, $wDepth, $wTiming);
-        candidateCacheWrite($wKey, ['depth' => $wDepth, 'rows' => array_values($wRows)]);
+        candidateCacheWrite($wKey, candidateBuildList($wTerms, 0, $wTiming));
         echo 'warmed';
     } catch (\Throwable $e) {
         http_response_code(500);
@@ -218,11 +253,11 @@ $n = max(1, min(100, (int)($_GET['n'] ?? 50)));
 $page = max(1, (int)($_GET['page'] ?? 1));
 $min = max(0, (int)($_GET['min'] ?? 0));
 $offset = ($page - 1) * $n;
-$depth = min(CANDIDATE_MAX_DEPTH, (int)(ceil(($offset + $n) / CANDIDATE_DEPTH_STEP) * CANDIDATE_DEPTH_STEP));
 
 $terms = candidateTerms($q);
 
-$all = [];
+$list = ['ids' => [], 'capped' => false];
+$rows = [];
 $error = '';
 $fromCache = false;
 $cacheAge = null;
@@ -240,30 +275,27 @@ try {
             candidateCacheWrite($wk, ['w' => $topWords, 'p' => $topPhrases, 'n' => $scanned]);
         }
     } else {
-        $lk = 'list|' . mb_strtolower($q) . "|$min";
-        $c = candidateCacheRead($lk, 900);
-        if ($c && isset($c['depth'], $c['rows']) && (int)$c['depth'] >= $depth) {
-            foreach ($c['rows'] as $r) $all[(int)$r['id']] = $r;
-            $depth = (int)$c['depth'];
+        @set_time_limit(120);
+        $lk = candidateListKey($q, $min);
+        $c = candidateCacheRead($lk, CANDIDATE_LIST_TTL_SEC);
+        if ($c && isset($c['ids']) && is_array($c['ids'])) {
+            $list = $c;
             $fromCache = true;
             $cacheAge = candidateCacheAge($lk);
         } else {
-            $all = candidateBuildList($terms, $min, $depth, $timing);
-            candidateCacheWrite($lk, ['depth' => $depth, 'rows' => array_values($all)]);
+            $list = candidateBuildList($terms, $min, $timing);
+            candidateCacheWrite($lk, $list);
         }
+        $rows = candidatePageRows(array_slice($list['ids'], $offset, $n));
     }
 } catch (\Throwable $e) {
     $error = $e->getMessage();
 }
 $took = microtime(true) - $t0;
 
-uasort($all, function ($a, $b) {
-    return [(int)$b['follower_count'], (int)$b['id']] <=> [(int)$a['follower_count'], (int)$a['id']];
-});
-$total = count($all);
-// more pages exist if rows remain, or if the list was cut at its depth and a deeper fetch is allowed
-$more = ($offset + $n < $total) || ($total >= $depth && $depth < CANDIDATE_MAX_DEPTH);
-$rows = array_slice(array_values($all), $offset, $n);
+$total = count($list['ids']);
+$capped = !empty($list['capped']);
+$pages = max(1, (int)ceil($total / $n));
 
 // Queue: the "Add this page to queue" button appends this page's IDs to scratch-session-queue.txt
 // (one ID per line, no duplicates). script.php?action=queue takes them from the top and removes them.
@@ -346,7 +378,7 @@ input[type=text]{width:100%;max-width:520px}
     <p><label>Keywords, comma separated<br><input type="text" name="q" value="<?= e($q) ?>"></label></p>
     <p>Per page <input type="number" name="n" value="<?= (int)$n ?>" min="1" max="100" style="width:5em">
        Minimum followers <input type="number" name="min" value="<?= (int)$min ?>" min="0" style="width:7em">
-       Page <input type="number" name="page" value="<?= (int)$page ?>" min="1" style="width:5em">
+       Page <input type="number" name="page" value="<?= (int)$page ?>" min="1" max="<?= (int)$pages ?>" style="width:5em"> of <?= number_format($pages) ?><?= $capped ? '+' : '' ?>
        <button type="submit">Search</button></p>
     <p>Scan top <input type="number" name="top" value="<?= (int)$topN ?>" min="1000" max="50000" step="1000" style="width:6em"> open studios
        <button type="submit" name="words" value="1">Top words</button></p>
@@ -370,8 +402,8 @@ input[type=text]{width:100%;max-width:520px}
 </table>
 </body></html>
 <?php exit; endif; ?>
-<p class="muted"><?= number_format($total) ?><?= $more && $total >= $depth ? '+' : '' ?> studios found (top <?= number_format($depth) ?> by followers), <?= number_format($took, 2) ?>s<?= e($note) ?>. <a href="<?= e($link((int)$page) . '&fresh=1') ?>">Refresh</a><br>
-Open studios only, biggest first. Add to a handful at a time through script.php.</p>
+<p class="muted"><?= number_format($total) ?><?= $capped ? '+' : '' ?> studios found on <?= number_format($pages) ?><?= $capped ? '+' : '' ?> pages of <?= (int)$n ?>, <?= number_format($took, 2) ?>s<?= e($note) ?>. <a href="<?= e($link((int)$page) . '&fresh=1') ?>">Refresh</a><br>
+Open studios only, biggest first<?= $capped ? '. A query hit the ' . number_format(CANDIDATE_MAX_MATCHES) . ' match limit, so the smallest studios are left out' : '' ?>. Add to a handful at a time through script.php.</p>
 <?php if ($rows): ?>
 <?php $idList = array_map(fn($r) => (int)$r['id'], $rows); ?>
 <p><label>IDs for script.php (studio=...)<br><textarea readonly onclick="this.select()"><?= e(implode(',', $idList)) ?></textarea></label></p>
@@ -393,9 +425,12 @@ Open studios only, biggest first. Add to a handful at a time through script.php.
 <?php endforeach; ?>
 </table>
 <p>
-<?php if ($page > 1): ?><a href="<?= e($link($page - 1)) ?>">&larr; Previous</a> <?php endif; ?>
-<?php if ($more): ?><a href="<?= e($link($page + 1)) ?>">Next &rarr;</a><?php endif; ?>
+<?php if ($page > 1): ?><a href="<?= e($link(1)) ?>">&laquo; First</a> <a href="<?= e($link(min($page - 1, $pages))) ?>">&larr; Previous</a> <?php endif; ?>
+Page <?= number_format($page) ?> of <?= number_format($pages) ?><?= $capped ? '+' : '' ?>
+<?php if ($page < $pages): ?><a href="<?= e($link($page + 1)) ?>">Next &rarr;</a> <a href="<?= e($link($pages)) ?>">Last &raquo;</a><?php endif; ?>
 </p>
+<?php elseif ($error === '' && $total > 0): ?>
+<p>Page <?= number_format($page) ?> is past the end. <a href="<?= e($link($pages)) ?>">Go to the last page (<?= number_format($pages) ?>)</a></p>
 <?php elseif ($error === ''): ?>
 <p>No open studios matched.</p>
 <?php endif; ?>
