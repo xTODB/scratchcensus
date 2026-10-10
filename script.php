@@ -16,7 +16,7 @@ if (($_GET['key'] ?? '') !== CRON_SECRET) {
 const SCRATCH_UA = 'Mozilla/5.0 (compatible; ScratchCensus/1.0)';
 const SESSION_MAX_AGE = 43200; // reuse a login for 12 hours
 const MAX_PER_RUN = 50;        // studios handled per request
-const PAUSE_SEC = 1;           // pause between studios
+const PAUSE_SEC = 0;           // pause between studios
 
 // One HTTP call. Returns [status code, raw headers, body].
 function scratch_http(string $method, string $url, string $jar, array $headers = [], ?string $body = null): array {
@@ -139,8 +139,19 @@ function studio_request(string $method, int $studio, int $project, array $auth, 
     ]);
 }
 
+// Finish the batch even if the browser tab is closed or backgrounded.
+ignore_user_abort(true);
+set_time_limit(180);
+
+// Print and also append to a log you can open later (matches the scratch-session-* gitignore rule).
+function out(string $line): void {
+    echo $line;
+    @file_put_contents(__DIR__ . '/scratch-session-log.txt', date('Y-m-d H:i:s') . ' ' . $line, FILE_APPEND);
+    if (function_exists('ob_flush')) { @ob_flush(); }
+    flush();
+}
+
 try {
-    set_time_limit(180);
     $studios = array_values(array_unique(array_filter(
         array_map('intval', preg_split('/[\s,;]+/', (string)($_GET['studio'] ?? ''), -1, PREG_SPLIT_NO_EMPTY)),
         fn($n) => $n > 0
@@ -180,7 +191,7 @@ try {
             [$code, , $body] = studio_request($method, $studio, $project, $auth, $jar);
         }
 
-        echo "$studio: HTTP $code " . substr(trim(preg_replace('/\s+/', ' ', $body)), 0, 150) . "\n";
+        out("$studio: HTTP $code " . substr(trim(preg_replace('/\s+/', ' ', $body)), 0, 150) . "\n");
         if ($code >= 200 && $code < 300) {
             $ok++;
         }
@@ -188,14 +199,14 @@ try {
         // Rate limited: stop and hand back everything not yet tried.
         if ($code === 429) {
             $rest = array_merge(array_slice($todo, $n + 1), $rest);
-            echo "Stopped: rate limited. Wait a while before continuing.\n";
+            out("Stopped: rate limited. Wait a while before continuing.\n");
             break;
         }
     }
 
-    echo "\nDone: $ok ok of " . count($todo) . " tried.\n";
+    out("\nDone: $ok ok of " . count($todo) . " tried.\n");
     if ($rest) {
-        echo 'Remaining (' . count($rest) . '): ' . implode(',', $rest) . "\n";
+        out('Remaining (' . count($rest) . '): ' . implode(',', $rest) . "\n");
     }
 } catch (Throwable $e) {
     echo 'Error: ', $e->getMessage(), "\n";
