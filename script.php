@@ -133,7 +133,7 @@ function load_session(string $jar, string $stateFile): ?array {
 function studio_request(string $method, int $studio, int $project, array $auth, string $jar): array {
     return scratch_http($method, "https://api.scratch.mit.edu/studios/$studio/project/$project", $jar, [
         'X-Token: ' . $auth['token'],
-        'X-CSRFToken: ' . $auth['csrf'],
+        'X-CSRFToken: ' . (csrf_from_jar($jar) ?: $auth['csrf']),
         'X-Requested-With: XMLHttpRequest',
         'Origin: https://scratch.mit.edu',
     ]);
@@ -185,7 +185,12 @@ try {
         [$code, , $body] = studio_request($method, $studio, $project, $auth, $jar);
 
         // A saved session can go stale: log in again once and retry.
-        if (!$fresh && ($code === 401 || $code === 403)) {
+        // DELETE rotates the CSRF token: retry once with the fresh one from the jar.
+        if ($code === 419) {
+            [$code, , $body] = studio_request($method, $studio, $project, $auth, $jar);
+        }
+
+        if (!$fresh && in_array($code, [401, 403, 419], true)) {
             $auth = scratch_login(SCRATCH_USER, SCRATCH_PASS, $jar, $stateFile);
             $fresh = true;
             [$code, , $body] = studio_request($method, $studio, $project, $auth, $jar);
