@@ -1,6 +1,9 @@
 <?php
 // Adds (or removes) a project in a Scratch studio using the account in config.php.
 // Usage: script.php?key=CRON_SECRET&studio=111,222,333&project=987654321[&action=remove]
+//    or: script.php?key=CRON_SECRET&project=987654321&action=removeall
+// removeall removes the project from every studio the log (scratch-session-log.txt) says it is still in.
+// Run it again until it says nothing is left.
 // studio takes one ID or a comma/space separated list. At most MAX_PER_RUN studios per request,
 // with PAUSE_SEC between them. The leftover IDs are printed so you can paste them into the next run.
 
@@ -151,13 +154,44 @@ function out(string $line): void {
     flush();
 }
 
+// Studios the log says the project is currently in: the last ADD/DEL line per studio decides.
+// Old log lines without a tag count as an ADD only when their JSON names this project.
+function logged_studios(int $project): array {
+    $file = __DIR__ . '/scratch-session-log.txt';
+    if (!is_file($file)) {
+        return [];
+    }
+    $in = [];
+    foreach (file($file, FILE_IGNORE_NEW_LINES) as $line) {
+        if (preg_match('/ (ADD|DEL) (\d+) (\d+): HTTP 2\d\d/', $line, $m)) {
+            if ((int)$m[2] === $project) {
+                if ($m[1] === 'ADD') { $in[(int)$m[3]] = true; } else { unset($in[(int)$m[3]]); }
+            }
+        } elseif (preg_match('/ (\d+): HTTP 2\d\d .*"projectId":"' . $project . '"/', $line, $m)) {
+            $in[(int)$m[1]] = true;
+        }
+    }
+    return array_keys($in);
+}
+
 try {
     $studios = array_values(array_unique(array_filter(
         array_map('intval', preg_split('/[\s,;]+/', (string)($_GET['studio'] ?? ''), -1, PREG_SPLIT_NO_EMPTY)),
         fn($n) => $n > 0
     )));
     $project = (int)($_GET['project'] ?? 0);
-    $method  = (($_GET['action'] ?? 'add') === 'remove') ? 'DELETE' : 'POST';
+    $action  = (string)($_GET['action'] ?? 'add');
+    $method  = ($action === 'remove' || $action === 'removeall') ? 'DELETE' : 'POST';
+    $tag     = ($method === 'DELETE') ? 'DEL' : 'ADD';
+
+    if ($action === 'removeall' && $project > 0) {
+        $studios = logged_studios($project);
+        if (!$studios) {
+            echo "Nothing left to remove for project $project according to the log.\n";
+            exit;
+        }
+        echo count($studios) . " studios still logged for project $project.\n";
+    }
 
     if (!$studios || $project <= 0) {
         throw new Exception('Missing studio or project parameter.');
@@ -196,7 +230,7 @@ try {
             [$code, , $body] = studio_request($method, $studio, $project, $auth, $jar);
         }
 
-        out("$studio: HTTP $code " . substr(trim(preg_replace('/\s+/', ' ', $body)), 0, 150) . "\n");
+        out("$tag $project $studio: HTTP $code " . substr(trim(preg_replace('/\s+/', ' ', $body)), 0, 150) . "\n");
         if ($code >= 200 && $code < 300) {
             $ok++;
         }
