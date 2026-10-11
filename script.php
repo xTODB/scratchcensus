@@ -11,6 +11,7 @@
 // Cron: run the queue action on a schedule. A lock file makes a run stop at once while the previous one is still
 // going, and after a 429 the queue action does nothing until Scratch's Retry-After (else 30 minutes) is over.
 // Add &force=1 to run the queue anyway during that wait.
+// Add &manual=1 to run the queue even while it is paused (the Pause button in candidates.php) for a manual run or test.
 // studio takes one ID or a comma/space separated list. At most MAX_PER_RUN studios per request,
 // with PAUSE_SEC between them. The leftover IDs are printed so you can paste them into the next run.
 
@@ -392,7 +393,7 @@ try {
         
         // Check if paused
         $pauseFile = __DIR__ . '/scratch-session-paused.txt';
-        if (is_file($pauseFile)) {
+        if (is_file($pauseFile) && empty($_GET['manual'])) {
             $pausedAt = (int)@file_get_contents($pauseFile);
             $pausedFor = $pausedAt > 0 ? 'since ' . date('Y-m-d H:i:s', $pausedAt) : '';
             out("Queue is paused $pausedFor. Exiting.\n");
