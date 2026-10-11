@@ -38,7 +38,7 @@ const RUN_BUDGET_SEC = 50;      // a queue run starts new requests for this many
 const PAUSE_SEC = 0.2;          // gap between request STARTS in seconds (decimals are fine): the speed limit is 1 / PAUSE_SEC per second
 const MAX_INFLIGHT = 4;         // queue only: requests allowed to be on the way at once (about request time / PAUSE_SEC + 1)
 const ACCOUNT_CYCLE_STUDIOS = 300; // switch accounts after this many successful adds on one account
-const EMAIL_EVERY_SWITCHES = 5;   // send email report after this many account switches
+const EMAIL_EVERY_SWITCHES = 100; // one summary email after this many account switches
 
 // A configured curl handle for one Scratch call. $shareConn reuses the TLS connection between plain calls.
 function scratch_handle(string $method, string $url, string $jar, array $headers = [], ?string $body = null, bool $shareConn = true) {
@@ -328,30 +328,118 @@ function mail_send(string $subject, string $body): array {
     return [false, "FAILED: $err (to " . EMAIL_REPORT_TO . ", from $from)"];
 }
 
-// Email report of account switches and activity. Sends at most one per EMAIL_MIN_GAP_SEC and logs the result.
-const EMAIL_MIN_GAP_SEC = 900;
-function send_activity_report(array $recent_lines, int $switch_count): void {
-    $last = (int)(state_get()['last_mail'] ?? 0);
-    if (time() - $last < EMAIL_MIN_GAP_SEC) {
-        out("Email report skipped: one was sent less than " . (int)(EMAIL_MIN_GAP_SEC / 60) . " minutes ago.\n");
+// Counters for the summary email: status codes of all requests and notable events since the last email.
+function stats_add(array $codes, array $ev = [], int $runs = 0): void {
+    if (!$codes && !$ev && !$runs) {
         return;
     }
-    state_update(function (array &$st) {
-        $st['last_mail'] = time();
+    state_update(function (array &$st) use ($codes, $ev, $runs) {
+        $s = $st['stats'] ?? [];
+        $s['since'] = $s['since'] ?? time();
+        $s['runs'] = (int)($s['runs'] ?? 0) + $runs;
+        foreach ($codes as $c => $n) {
+            $s['codes'][(string)$c] = (int)($s['codes'][(string)$c] ?? 0) + $n;
+        }
+        foreach ($ev as $e => $n) {
+            $s['ev'][$e] = (int)($s['ev'][$e] ?? 0) + $n;
+        }
+        $st['stats'] = $s;
     });
-    $body = "Account switch #$switch_count.\n\nRecent activity (last " . count($recent_lines) . " lines):\n\n" . implode("\n", $recent_lines);
-    [, $info] = mail_send("ScratchCensus: account switch #$switch_count", $body);
-    out("Email report $info\n");
 }
 
-// Record an account switch: save the index, restart the run counter, log it, send the periodic report.
+function stats_event(string $name): void {
+    stats_add([], [$name => 1]);
+}
+
+function build_digest(array $stats, int $switches): string {
+    $codes = $stats['codes'] ?? [];
+    ksort($codes);
+    $ok = 0;
+    $bad = [];
+    foreach ($codes as $c => $n) {
+        if (is_numeric($c) && (int)$c >= 200 && (int)$c < 300) {
+            $ok += $n;
+        } else {
+            $bad[$c] = $n;
+        }
+    }
+    $ev = $stats['ev'] ?? [];
+    $labels = [
+        'switch_429' => 'switches after a 429',
+        'switch_cycle' => 'switches after ' . ACCOUNT_CYCLE_STUDIOS . ' adds',
+        'switch_skip_limited' => 'accounts skipped, still rate limited',
+        '419_stops' => 'runs stopped by a 419',
+        'all_limited_stops' => 'times every account was rate limited',
+        'login_failures' => 'failed logins',
+        'errors' => 'script errors',
+    ];
+    $t = 'ScratchCensus summary at account switch #' . $switches . "\n";
+    $t .= 'Since ' . date('Y-m-d H:i:s', (int)($stats['since'] ?? time())) . ', queue runs: ' . (int)($stats['runs'] ?? 0) . "\n\n";
+    $t .= 'Studios added OK (2xx): ' . $ok . "\n\n";
+    $t .= "Not OK, studios per status code:\n";
+    if ($bad) {
+        foreach ($bad as $c => $n) {
+            $t .= '  ' . (is_numeric($c) ? "HTTP $c" : ($c === 'net' ? 'network error' : $c)) . ': ' . $n . "\n";
+        }
+    } else {
+        $t .= "  none\n";
+    }
+    $t .= "\nEvents:\n";
+    $any = false;
+    foreach ($labels as $k => $label) {
+        if (!empty($ev[$k])) {
+            $t .= "  $label: " . $ev[$k] . "\n";
+            $any = true;
+        }
+    }
+    if (!$any) {
+        $t .= "  none\n";
+    }
+    $t .= "\nRight now:\n";
+    $t .= '  IDs left in queue: ' . count(queue_ids()) . "\n";
+    $t .= '  accounts: ' . count(load_accounts()) . ', rate limited: ' . count(limits_load()) . "\n";
+    $wait = cooldown_left();
+    if ($wait > 0) {
+        $t .= '  shared wait: ' . (int)ceil($wait / 60) . " more minutes\n";
+    }
+    $lines = array_filter(get_activity_since(500), function ($l) {
+        return preg_match('/HTTP [3-5]\d\d|Stopped|failed|Error|network error|rate limited/i', $l);
+    });
+    $lines = array_slice(array_values($lines), -10);
+    if ($lines) {
+        $t .= "\nLast problem lines from the log:\n" . implode("\n", $lines) . "\n";
+    }
+    return $t;
+}
+
+// Send the summary when do_switch() marked one as due. Counters restart after a successful send.
+function send_digest_if_due(): void {
+    $st = state_get();
+    if (empty($st['mail_due'])) {
+        return;
+    }
+    $n = (int)($st['switches'] ?? 0);
+    [$sent, $info] = mail_send("ScratchCensus summary, switch #$n", build_digest($st['stats'] ?? [], $n));
+    out("Email summary $info\n");
+    state_update(function (array &$st) use ($sent) {
+        unset($st['mail_due']);
+        if ($sent) {
+            $st['stats'] = ['since' => time()];
+        }
+    });
+}
+
+// Record an account switch: save the index, restart the add counter, log it, mark the summary email due every EMAIL_EVERY_SWITCHES.
 function do_switch(int $idx, int $total, string $why): void {
     set_account_idx($idx);
     set_cycle_counter(0);
     $n = increment_switch_counter();
     out('ACCOUNT_SWITCH: Switched to account ' . ($idx + 1) . " of $total (switch #$n$why)\n");
+    stats_event($why === ', after 429' ? 'switch_429' : ($why === ', previous account rate limited' ? 'switch_skip_limited' : 'switch_cycle'));
     if ($n % EMAIL_EVERY_SWITCHES === 0) {
-        send_activity_report(get_activity_since(100), $n);
+        state_update(function (array &$st) {
+            $st['mail_due'] = true;
+        });
     }
 }
 
@@ -696,6 +784,7 @@ try {
                 if ($free === null) {
                     $wait = limits_min_left($accounts, $limits);
                     cooldown_set($wait);
+                    stats_event('all_limited_stops');
                     out('All ' . count($accounts) . ' accounts are rate limited. Queue runs wait ' . (int)ceil($wait / 60) . " minutes (add &force=1 to run anyway).\n");
                     exit;
                 }
@@ -717,6 +806,7 @@ try {
     });
 
     $ok = 0;          // successful calls this run
+    $runCodes = [];   // status code => studios, for the summary email
     $tried = 0;       // requests started
     $acctOk = 0;      // successful adds by the current account this run
     $cdCleared = false;
@@ -754,6 +844,7 @@ try {
                 return true;
             } catch (Throwable $e) {
                 out('Login failed for account ' . ($accountIdx + 1) . ': ' . $e->getMessage() . "\n");
+                stats_event('login_failures');
                 limit_set($currentUser, 3600);
                 $free = next_free_account($accounts, $accountIdx, limits_load());
             }
@@ -796,6 +887,7 @@ try {
                 }
                 $wait = limits_min_left($accounts, limits_load());
                 cooldown_set($wait);
+                stats_event('all_limited_stops');
                 out('Stopped: all ' . count($accounts) . ' accounts are rate limited. Queue runs wait ' . (int)ceil($wait / 60) . " minutes (add &force=1 to run anyway).\n");
                 $retry = array_merge($retryAfterSwitch, $retry);
                 $retryAfterSwitch = [];
@@ -837,6 +929,7 @@ try {
         foreach ($done as [$studio, $code, $hdrs, $body, $g, $err]) {
             if ($code === 0) {
                 out("$tag $project $studio: network error $err\n");
+                $runCodes['net'] = ($runCodes['net'] ?? 0) + 1;
                 if (++$netErrs >= 5) {
                     out("Stopped: 5 network errors in a row.\n");
                     $halt = true;
@@ -853,8 +946,10 @@ try {
 
             // Queue run: a 419 means this account's session is bad. Stop, the next queue run uses the next account.
             if ($code === 419 && $action === 'queue') {
+                $runCodes[419] = ($runCodes[419] ?? 0) + 1;
                 if (!$hit419) {
                     $hit419 = true;
+                    stats_event('419_stops');
                     $stop = true;
                     out("$tag $project $studio: HTTP 419. " . ($manual ? 'The config.php account was rejected, run again to log in fresh.' : 'Account ' . ($accountIdx + 1) . ' failed, the next queue run switches account.') . "\n");
                 }
@@ -875,6 +970,7 @@ try {
             }
 
             out("$tag $project $studio: HTTP $code " . substr(trim(preg_replace('/\s+/', ' ', $body)), 0, 150) . "\n");
+            $runCodes[$code] = ($runCodes[$code] ?? 0) + 1;
             if ($code >= 200 && $code < 300) {
                 $ok++;
                 $acctOk++;
@@ -940,8 +1036,14 @@ try {
     }
     $rest = array_merge($retry, array_slice($todo, $queueIdx), $rest);
 
+    if ($action === 'queue') {
+        stats_add($runCodes, [], 1);
+    }
     session_persist($currentUser, $jar);
     queue_flush();
+    if ($action === 'queue') {
+        send_digest_if_due(); // after the queue file is saved, so the summary shows the real queue size
+    }
     $secs = microtime(true) - $T0;
     out("\nDone: $ok ok of $tried tried in " . number_format($secs, 2) . 's (' . number_format($secs > 0 ? $tried / $secs : 0, 2) . " studios/s).\n");
     if ($action === 'queue') {
@@ -951,4 +1053,5 @@ try {
     }
 } catch (Throwable $e) {
     out('Error: ' . $e->getMessage() . "\n");
+    stats_event('errors');
 }
