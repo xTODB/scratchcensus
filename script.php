@@ -28,7 +28,7 @@ $T0 = microtime(true);
 
 const SCRATCH_UA = 'Mozilla/5.0 (compatible; ScratchCensus/1.0)';
 const SESSION_MAX_AGE = 43200; // reuse a login for 12 hours
-const MAX_PER_RUN = 50;        // studios handled per request
+const MAX_PER_RUN = 100;        // studios handled per request
 const PAUSE_SEC = 0.35;           // pause between studios, in seconds (decimals are fine)
 const ACCOUNT_CYCLE_RUNS = 6;     // switch accounts after this many queue runs (6 runs * 50 studios = 300)
 const EMAIL_EVERY_SWITCHES = 5;   // send email report after this many account switches
