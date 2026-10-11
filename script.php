@@ -230,22 +230,57 @@ function get_activity_since(int $lines_back = 500): array {
     return array_slice($all, -$lines_back);
 }
 
-// Send email report of account switches and activity
-function send_activity_report(string $email, array $recent_lines, int $switch_count): void {
-    if (!$email || !filter_var($email, FILTER_VALIDATE_EMAIL)) {
+// Send email report of account switches and activity. Never throws, and logs what happened.
+const EMAIL_MIN_GAP_SEC = 900; // at most one report per 15 minutes, however often accounts switch
+function send_activity_report(array $recent_lines, int $switch_count): void {
+    if (!defined('EMAIL_REPORT_TO') || !filter_var(EMAIL_REPORT_TO, FILTER_VALIDATE_EMAIL)) {
+        out("Email report skipped: EMAIL_REPORT_TO is missing or not a valid address in config.php.\n");
         return;
     }
-    
-    $activity = implode("\n", $recent_lines);
-    $subject = "ScratchCensus: Account switch #$switch_count completed";
-    $body = "Account switched for the {$switch_count}th time.\n\n";
+    $gapFile = __DIR__ . '/scratch-session-last-mail.txt';
+    $last = is_file($gapFile) ? (int)@file_get_contents($gapFile) : 0;
+    if (time() - $last < EMAIL_MIN_GAP_SEC) {
+        out("Email report skipped: one was sent less than " . (int)(EMAIL_MIN_GAP_SEC / 60) . " minutes ago.\n");
+        return;
+    }
+    @file_put_contents($gapFile, (string)time());
+
+    $from = defined('EMAIL_REPORT_FROM') ? EMAIL_REPORT_FROM : 'noreply@scratchnews.net';
+    $subject = "ScratchCensus: account switch #$switch_count";
+    $body = "Account switch #$switch_count.\n\n";
     $body .= "Recent activity (last " . count($recent_lines) . " lines):\n\n";
-    $body .= $activity;
-    
-    $headers = "From: noreply@scratchcensus.local\n";
-    $headers .= "Content-Type: text/plain; charset=utf-8\n";
-    
-    @mail($email, $subject, $body, $headers);
+    $body .= implode("\n", $recent_lines);
+
+    $headers = "From: ScratchCensus <$from>\r\n";
+    $headers .= "Content-Type: text/plain; charset=utf-8\r\n";
+
+    $sent = @mail(EMAIL_REPORT_TO, $subject, $body, $headers);
+    out('Email report ' . ($sent ? 'handed to the mail system' : 'FAILED, mail() returned false') . " (switch #$switch_count, from $from).\n");
+}
+
+// Record an account switch: save the index, restart the run counter, log it, send the periodic report.
+function do_switch(int $idx, int $total, string $why): void {
+    set_account_idx($idx);
+    @file_put_contents(__DIR__ . '/scratch-session-cycle-count.txt', '0');
+    $n = increment_switch_counter();
+    out('ACCOUNT_SWITCH: Switched to account ' . ($idx + 1) . " of $total (switch #$n$why)\n");
+    if ($n % EMAIL_EVERY_SWITCHES === 0) {
+        send_activity_report(get_activity_since(100), $n);
+    }
+}
+
+// Log in (or reuse the saved session) for one account.
+function open_session(string $user, string $pass): array {
+    $base = __DIR__ . '/scratch-session-' . md5(CRON_SECRET . $user);
+    $jar = $base . '.cookies';
+    $stateFile = $base . '.json';
+    $auth = load_session($jar, $stateFile);
+    $fresh = false;
+    if (!$auth) {
+        $auth = scratch_login($user, $pass, $jar, $stateFile);
+        $fresh = true;
+    }
+    return [$auth, $jar, $stateFile, $fresh];
 }
 
 function studio_request(string $method, int $studio, int $project, array $auth, string $jar): array {
@@ -292,6 +327,62 @@ function logged_studios(int $project): array {
 const QUEUE_FILE = __DIR__ . '/scratch-session-queue.txt';
 const COOLDOWN_FILE = __DIR__ . '/scratch-session-cooldown.txt';
 const COOLDOWN_DEFAULT_SEC = 1800; // wait this long after a 429 when Scratch does not say how long
+
+const LIMITS_FILE = __DIR__ . '/scratch-session-limits.json';
+
+// Seconds to hold an account back after a 429: Scratch's Retry-After (60 s to 24 h), else the default above.
+function retry_after_sec(string $headers): int {
+    if (preg_match('/^Retry-After:\s*(\d+)/mi', $headers, $m)) {
+        return max(60, min(86400, (int)$m[1]));
+    }
+    return COOLDOWN_DEFAULT_SEC;
+}
+
+// username => unix time until which that account is rate limited (expired entries are dropped).
+function limits_load(): array {
+    $d = is_file(LIMITS_FILE) ? json_decode((string)@file_get_contents(LIMITS_FILE), true) : [];
+    $now = time();
+    $res = [];
+    if (is_array($d)) {
+        foreach ($d as $u => $t) {
+            if ((int)$t > $now) {
+                $res[(string)$u] = (int)$t;
+            }
+        }
+    }
+    return $res;
+}
+
+function limit_set(string $user, int $sec): void {
+    $l = limits_load();
+    $l[$user] = time() + $sec;
+    @file_put_contents(LIMITS_FILE, json_encode($l), LOCK_EX);
+}
+
+// Next account after $from that is not rate limited, or null when every other account is.
+function next_free_account(array $accounts, int $from, array $limits): ?int {
+    $c = count($accounts);
+    for ($i = 1; $i < $c; $i++) {
+        $idx = ($from + $i) % $c;
+        if (!isset($limits[$accounts[$idx]['user']])) {
+            return $idx;
+        }
+    }
+    return null;
+}
+
+// Seconds until the first rate limited account is free again (at least 60).
+function limits_min_left(array $accounts, array $limits): int {
+    $now = time();
+    $min = null;
+    foreach ($accounts as $a) {
+        $left = ($limits[$a['user']] ?? $now) - $now;
+        if ($min === null || $left < $min) {
+            $min = $left;
+        }
+    }
+    return max(60, (int)$min);
+}
 
 // After a 429 the queue action waits: Scratch's Retry-After if it sent one (60 s to 24 h), else the default above.
 function cooldown_start(string $headers): int {
@@ -413,58 +504,49 @@ try {
     // Handle account rotation in queue mode
     $currentUser = SCRATCH_USER;
     $currentPass = SCRATCH_PASS;
-    
+    $accounts = [];
+    $accountIdx = 0;
+
     if ($action === 'queue') {
         $accounts = load_accounts();
         if (!empty($accounts)) {
-            // Increment cycle counter
             $cycle = increment_cycle_counter();
             $accountIdx = get_current_account_idx();
-            
-            // Switch account every ACCOUNT_CYCLE_RUNS
+
+            // Switch account every ACCOUNT_CYCLE_RUNS runs
             if ($cycle >= ACCOUNT_CYCLE_RUNS) {
-                $accountIdx++;
-                if ($accountIdx >= count($accounts)) {
-                    $accountIdx = 0;
-                }
-                set_account_idx($accountIdx);
-                $switchCount = increment_switch_counter();
-                out("ACCOUNT_SWITCH: Switched to account " . ($accountIdx + 1) . " of " . count($accounts) . " (switch #$switchCount)\n");
-                
-                // Send email report every EMAIL_EVERY_SWITCHES
-                if ($switchCount % EMAIL_EVERY_SWITCHES === 0) {
-                    $activity = get_activity_since(100);
-                    send_activity_report(EMAIL_REPORT_TO, $activity, $switchCount);
-                    out("Sent activity report email (switch #$switchCount)\n");
-                }
-                
-                @file_put_contents(__DIR__ . '/scratch-session-cycle-count.txt', '0');
+                $accountIdx = ($accountIdx + 1) % count($accounts);
+                do_switch($accountIdx, count($accounts), '');
             }
-            
-            if (isset($accounts[$accountIdx])) {
-                $currentUser = $accounts[$accountIdx]['user'];
-                $currentPass = $accounts[$accountIdx]['pass'];
+
+            // Skip an account that is still waiting out a 429
+            $limits = limits_load();
+            if (empty($_GET['force']) && isset($limits[$accounts[$accountIdx]['user']])) {
+                $free = next_free_account($accounts, $accountIdx, $limits);
+                if ($free === null) {
+                    $wait = limits_min_left($accounts, $limits);
+                    @file_put_contents(COOLDOWN_FILE, (string)(time() + $wait));
+                    out('All ' . count($accounts) . ' accounts are rate limited. Queue runs wait ' . (int)ceil($wait / 60) . " minutes (add &force=1 to run anyway).\n");
+                    exit;
+                }
+                $accountIdx = $free;
+                do_switch($accountIdx, count($accounts), ', previous account rate limited');
             }
+
+            $currentUser = $accounts[$accountIdx]['user'];
+            $currentPass = $accounts[$accountIdx]['pass'];
         }
     }
-    
-    $base = __DIR__ . '/scratch-session-' . md5(CRON_SECRET . $currentUser);
-    $jar = $base . '.cookies';
-    $stateFile = $base . '.json';
 
-    $auth = load_session($jar, $stateFile);
-    $fresh = false;
-    if (!$auth) {
-        $auth = scratch_login($currentUser, $currentPass, $jar, $stateFile);
-        $fresh = true;
-    }
+    [$auth, $jar, $stateFile, $fresh] = open_session($currentUser, $currentPass);
 
     $ok = 0;
     $tried = 0;
     $lastStart = 0.0;
-    foreach ($todo as $n => $studio) {
+    for ($n = 0; $n < count($todo); $n++) {
+        $studio = $todo[$n];
         // PAUSE_SEC is the gap between request starts, so time spent waiting on Scratch counts towards it
-        if ($n > 0) {
+        if ($lastStart > 0) {
             $gap = PAUSE_SEC - (microtime(true) - $lastStart);
             if ($gap > 0) {
                 usleep((int)round($gap * 1000000));
@@ -482,7 +564,7 @@ try {
             @file_put_contents(__DIR__ . '/scratch-session-cycle-count.txt', (string)ACCOUNT_CYCLE_RUNS);
             @unlink($jar);
             @unlink($stateFile);
-            out("$tag $project $studio: HTTP 419. Account " . (isset($accountIdx) ? $accountIdx + 1 : 0) . " failed, the next queue run switches account.\n");
+            out("$tag $project $studio: HTTP 419. Account " . ($accountIdx + 1) . " failed, the next queue run switches account.\n");
             break;
         }
         if ($code === 419) {
@@ -510,8 +592,36 @@ try {
             }
         }
 
-        // Rate limited: stop and hand back everything not yet tried.
+        // Rate limited
         if ($code === 429) {
+            // Several accounts: hold this one back and carry on at once with the next free account.
+            if ($action === 'queue' && count($accounts) > 1) {
+                limit_set($currentUser, retry_after_sec((string)$hdrs));
+                $free = next_free_account($accounts, $accountIdx, limits_load());
+                while ($free !== null) {
+                    $accountIdx = $free;
+                    do_switch($accountIdx, count($accounts), ', after 429');
+                    $currentUser = $accounts[$accountIdx]['user'];
+                    $currentPass = $accounts[$accountIdx]['pass'];
+                    try {
+                        [$auth, $jar, $stateFile, $fresh] = open_session($currentUser, $currentPass);
+                        break;
+                    } catch (Throwable $e) {
+                        out('Login failed for account ' . ($accountIdx + 1) . ': ' . $e->getMessage() . "\n");
+                        limit_set($currentUser, 3600);
+                        $free = next_free_account($accounts, $accountIdx, limits_load());
+                    }
+                }
+                if ($free !== null) {
+                    $n--; // same studio again, with the new account
+                    continue;
+                }
+                $wait = limits_min_left($accounts, limits_load());
+                @file_put_contents(COOLDOWN_FILE, (string)(time() + $wait));
+                out('Stopped: all ' . count($accounts) . ' accounts are rate limited. Queue runs wait ' . (int)ceil($wait / 60) . " minutes (add &force=1 to run anyway).\n");
+                break;
+            }
+            // One account only: stop and hand back everything not yet tried.
             $rest = array_merge(array_slice($todo, $n + 1), $rest);
             if ($action === 'queue') {
                 $wait = cooldown_start((string)$hdrs);
@@ -532,5 +642,5 @@ try {
         out('Remaining (' . count($rest) . '): ' . implode(',', $rest) . "\n");
     }
 } catch (Throwable $e) {
-    echo 'Error: ', $e->getMessage(), "\n";
+    out('Error: ' . $e->getMessage() . "\n");
 }
