@@ -4,7 +4,7 @@
 //    or: script.php?key=CRON_SECRET&project=987654321&action=removeall
 //    or: script.php?key=CRON_SECRET&project=987654321&action=queue
 //    or: script.php?key=CRON_SECRET&action=testmail   (sends a test email to EMAIL_REPORT_TO and says what happened)
-// queue adds the project to the top MAX_PER_RUN IDs of scratch-session-queue.txt (filled by the
+// queue adds the project to IDs from the top of scratch-session-queue.txt for RUN_BUDGET_SEC seconds (filled by the
 // "Add this page to queue" button in candidates.php) and deletes each ID from the file once it was tried.
 // An ID stays queued only if the run was rate limited (429) or Scratch/the network failed (5xx).
 // removeall removes the project from every studio the log (scratch-session-log.txt) says it is still in.
@@ -17,7 +17,7 @@
 // the counters or the shared 429 wait.
 // All bookkeeping (rotation, counters, 429 waits, saved logins) lives in scratch-session-state.json. Besides it only the log,
 // the queue, the run lock and the pause flag exist as scratch-session-* files.
-// studio takes one ID or a comma/space separated list. At most MAX_PER_RUN studios per request,
+// studio takes one ID or a comma/space separated list. At most MAX_PER_RUN studios per add/remove request,
 // with PAUSE_SEC between them. The leftover IDs are printed so you can paste them into the next run.
 
 require_once __DIR__ . '/config.php';
@@ -33,20 +33,22 @@ $T0 = microtime(true);
 
 const SCRATCH_UA = 'Mozilla/5.0 (compatible; ScratchCensus/1.0)';
 const SESSION_MAX_AGE = 43200; // reuse a login for 12 hours
-const MAX_PER_RUN = 100;        // studios handled per request
-const PAUSE_SEC = 0.2;           // pause between studios, in seconds (decimals are fine)
-const ACCOUNT_CYCLE_RUNS = 3;     // switch accounts after this many queue runs (6 runs * 50 studios = 300)
+const MAX_PER_RUN = 100;        // studios per add/remove request (the queue action is limited by time instead)
+const RUN_BUDGET_SEC = 50;      // a queue run starts new requests for this many seconds, then finishes the ones in flight
+const PAUSE_SEC = 0.2;          // gap between request STARTS in seconds (decimals are fine): the speed limit is 1 / PAUSE_SEC per second
+const MAX_INFLIGHT = 4;         // queue only: requests allowed to be on the way at once (about request time / PAUSE_SEC + 1)
+const ACCOUNT_CYCLE_STUDIOS = 300; // switch accounts after this many successful adds on one account
 const EMAIL_EVERY_SWITCHES = 5;   // send email report after this many account switches
 
-// One HTTP call. Returns [status code, raw headers, body].
-function scratch_http(string $method, string $url, string $jar, array $headers = [], ?string $body = null): array {
+// A configured curl handle for one Scratch call. $shareConn reuses the TLS connection between plain calls.
+function scratch_handle(string $method, string $url, string $jar, array $headers = [], ?string $body = null, bool $shareConn = true) {
     static $share = null;
-    if ($share === null && function_exists('curl_share_init')) {
+    if ($shareConn && $share === null && function_exists('curl_share_init')) {
         $share = curl_share_init();
         curl_share_setopt($share, CURLSHOPT_SHARE, CURL_LOCK_DATA_CONNECT);
     }
     $ch = curl_init($url);
-    if ($share) {
+    if ($shareConn && $share) {
         curl_setopt($ch, CURLOPT_SHARE, $share);
     }
     $opts = [
@@ -65,11 +67,18 @@ function scratch_http(string $method, string $url, string $jar, array $headers =
         $opts[CURLOPT_POSTFIELDS] = '';
     }
     curl_setopt_array($ch, $opts);
+    return $ch;
+}
+
+// One HTTP call. Returns [status code, raw headers, body].
+function scratch_http(string $method, string $url, string $jar, array $headers = [], ?string $body = null): array {
+    $ch = scratch_handle($method, $url, $jar, $headers, $body);
     $raw = curl_exec($ch);
     $code = (int)curl_getinfo($ch, CURLINFO_HTTP_CODE);
     $hsize = (int)curl_getinfo($ch, CURLINFO_HEADER_SIZE);
     $err = curl_error($ch);
     curl_close($ch);
+    unset($ch);
     if ($raw === false) {
         throw new Exception("cURL error: $err");
     }
@@ -279,14 +288,6 @@ function set_account_idx(int $idx): void {
     });
 }
 
-// Increment the account cycle counter
-function increment_cycle_counter(): int {
-    return (int)state_update(function (array &$st) {
-        $st['cycle'] = (int)($st['cycle'] ?? 0) + 1;
-        return $st['cycle'];
-    });
-}
-
 function set_cycle_counter(int $n): void {
     state_update(function (array &$st) use ($n) {
         $st['cycle'] = $n;
@@ -407,13 +408,25 @@ function open_session(string $user, string $pass): array {
     return [$auth, $jar, true];
 }
 
-function studio_request(string $method, int $studio, int $project, array $auth, string $jar): array {
-    return scratch_http($method, "https://api.scratch.mit.edu/studios/$studio/project/$project", $jar, [
+function studio_url(int $studio, int $project): string {
+    return "https://api.scratch.mit.edu/studios/$studio/project/$project";
+}
+
+function studio_headers(array $auth, string $jar): array {
+    return [
         'X-Token: ' . $auth['token'],
         'X-CSRFToken: ' . (csrf_from_jar($jar) ?: $auth['csrf']),
         'X-Requested-With: XMLHttpRequest',
         'Origin: https://scratch.mit.edu',
-    ]);
+    ];
+}
+
+function studio_request(string $method, int $studio, int $project, array $auth, string $jar): array {
+    return scratch_http($method, studio_url($studio, $project), $jar, studio_headers($auth, $jar));
+}
+
+function hkey($ch): int {
+    return is_object($ch) ? spl_object_id($ch) : (int)$ch;
 }
 
 // Finish the batch even if the browser tab is closed or backgrounded.
@@ -644,14 +657,16 @@ try {
         throw new Exception('Missing studio or project parameter.');
     }
 
-    $todo = array_slice($studios, 0, MAX_PER_RUN);
-    $rest = array_slice($studios, MAX_PER_RUN);
+    $perRun = ($action === 'queue') ? count($studios) : MAX_PER_RUN; // the queue is limited by RUN_BUDGET_SEC, not by a count
+    $todo = array_slice($studios, 0, $perRun);
+    $rest = array_slice($studios, $perRun);
 
     // Handle account rotation in queue mode
     $currentUser = SCRATCH_USER;
     $currentPass = SCRATCH_PASS;
     $accounts = [];
     $accountIdx = 0;
+    $cycleBase = 0; // successful adds the current account already did before this run
 
     if ($manual) {
         $lim = limits_load();
@@ -664,13 +679,14 @@ try {
     if ($action === 'queue' && !$manual) {
         $accounts = load_accounts();
         if (!empty($accounts)) {
-            $cycle = increment_cycle_counter();
             $accountIdx = get_current_account_idx();
+            $cycleBase = (int)(state_get()['cycle'] ?? 0);
 
-            // Switch account every ACCOUNT_CYCLE_RUNS runs
-            if ($cycle >= ACCOUNT_CYCLE_RUNS) {
+            // This account has done its share: use the next one
+            if ($cycleBase >= ACCOUNT_CYCLE_STUDIOS) {
                 $accountIdx = ($accountIdx + 1) % count($accounts);
                 do_switch($accountIdx, count($accounts), '');
+                $cycleBase = 0;
             }
 
             // Skip an account that is still waiting out a 429
@@ -685,6 +701,7 @@ try {
                 }
                 $accountIdx = $free;
                 do_switch($accountIdx, count($accounts), ', previous account rate limited');
+                $cycleBase = 0;
             }
 
             $currentUser = $accounts[$accountIdx]['user'];
@@ -699,109 +716,229 @@ try {
         session_persist((string)($currentUser ?? ''), (string)($jar ?? ''));
     });
 
-    $ok = 0;
-    $tried = 0;
+    $ok = 0;          // successful calls this run
+    $tried = 0;       // requests started
+    $acctOk = 0;      // successful adds by the current account this run
     $cdCleared = false;
+    $gen = 0;         // counts logins, so answers to requests sent with an old login can be told apart
+    $inflightMax = ($action === 'queue') ? MAX_INFLIGHT : 1;
+    $deadline = $T0 + (($action === 'queue') ? RUN_BUDGET_SEC : 170);
+    $queueIdx = 0;
+    $retry = [];            // studios to send again (stale login)
+    $retryAfterSwitch = []; // studios that got a 429, sent again with the next account
+    $inflight = [];
+    $stop = false;          // no new requests
+    $needSwitch = '';       // '' or the reason to switch account once nothing is in flight
+    $halt = false;
+    $hit419 = false;
+    $limited429 = false;    // single account (or manual) got a 429
+    $hdr429 = '';
+    $netErrs = 0;
     $lastStart = 0.0;
-    for ($n = 0; $n < count($todo); $n++) {
-        $studio = $todo[$n];
-        // PAUSE_SEC is the gap between request starts, so time spent waiting on Scratch counts towards it
-        if ($lastStart > 0) {
-            $gap = PAUSE_SEC - (microtime(true) - $lastStart);
-            if ($gap > 0) {
-                usleep((int)round($gap * 1000000));
-            }
-        }
-        $lastStart = microtime(true);
-        $tried++;
-        [$code, $hdrs, $body] = studio_request($method, $studio, $project, $auth, $jar);
+    $mh = curl_multi_init();
 
-        // A saved session can go stale: log in again once and retry.
-        // DELETE rotates the CSRF token: retry once with the fresh one from the jar.
-        // Queue run: a 419 means this account's session is bad, so stop and make the next run use the next account.
-        if ($code === 419 && $action === 'queue') {
-            $rest = array_merge(array_slice($todo, $n + 1), $rest);
-            if (!$manual) {
-                set_cycle_counter(ACCOUNT_CYCLE_RUNS);
-            }
-            session_drop($currentUser, $jar);
-            out("$tag $project $studio: HTTP 419. " . ($manual ? 'The config.php account was rejected, run again to log in fresh.' : 'Account ' . ($accountIdx + 1) . ' failed, the next queue run switches account.') . "\n");
-            break;
-        }
-        if ($code === 419) {
-            [$code, $hdrs, $body] = studio_request($method, $studio, $project, $auth, $jar);
-        }
-
-        if (!$fresh && in_array($code, [401, 403, 419], true)) {
-            $auth = scratch_login($currentUser, $currentPass, $jar);
-            session_save($currentUser, $auth, $jar);
-            $fresh = true;
-            [$code, $hdrs, $body] = studio_request($method, $studio, $project, $auth, $jar);
-        }
-
-        out("$tag $project $studio: HTTP $code " . substr(trim(preg_replace('/\s+/', ' ', $body)), 0, 150) . "\n");
-        if ($code >= 200 && $code < 300) {
-            $ok++;
-        }
-        if ($action === 'queue') {
-            if ($code > 0 && $code < 500 && $code !== 429) {
-                $pendDone[] = $studio;
-            } elseif ($code >= 500) {
-                $pendEnd[] = $studio;
-            }
-            if ($code >= 200 && $code < 300) {
-                if (!$manual && !$cdCleared) { // adds work again, so any earlier shared wait is over
-                    cooldown_clear();
-                    $cdCleared = true;
-                }
-            }
-        }
-
-        // Rate limited
-        if ($code === 429) {
-            // Several accounts: hold this one back and carry on at once with the next free account.
-            if ($action === 'queue' && count($accounts) > 1) {
-                limit_set($currentUser, retry_after_sec((string)$hdrs));
+    // Move to the next free account (not rate limited). False when there is none.
+    $switchAccount = function (string $why) use (&$accounts, &$accountIdx, &$currentUser, &$currentPass, &$auth, &$jar, &$fresh, &$gen, &$cycleBase, &$acctOk): bool {
+        $free = next_free_account($accounts, $accountIdx, limits_load());
+        while ($free !== null) {
+            session_persist($currentUser, $jar);
+            $accountIdx = $free;
+            do_switch($accountIdx, count($accounts), ', ' . $why);
+            $currentUser = $accounts[$accountIdx]['user'];
+            $currentPass = $accounts[$accountIdx]['pass'];
+            try {
+                [$auth, $jar, $fresh] = open_session($currentUser, $currentPass);
+                $gen++;
+                $cycleBase = 0;
+                $acctOk = 0;
+                return true;
+            } catch (Throwable $e) {
+                out('Login failed for account ' . ($accountIdx + 1) . ': ' . $e->getMessage() . "\n");
+                limit_set($currentUser, 3600);
                 $free = next_free_account($accounts, $accountIdx, limits_load());
-                while ($free !== null) {
-                    session_persist($currentUser, $jar);
-                    $accountIdx = $free;
-                    do_switch($accountIdx, count($accounts), ', after 429');
-                    $currentUser = $accounts[$accountIdx]['user'];
-                    $currentPass = $accounts[$accountIdx]['pass'];
-                    try {
-                        [$auth, $jar, $fresh] = open_session($currentUser, $currentPass);
-                        break;
-                    } catch (Throwable $e) {
-                        out('Login failed for account ' . ($accountIdx + 1) . ': ' . $e->getMessage() . "\n");
-                        limit_set($currentUser, 3600);
-                        $free = next_free_account($accounts, $accountIdx, limits_load());
-                    }
+            }
+        }
+        return false;
+    };
+
+    while (!$halt) {
+        $more = $retry || $queueIdx < count($todo);
+        $now = microtime(true);
+        $canLaunch = !$stop && $more && $now < $deadline && count($inflight) < $inflightMax;
+
+        // Start the next request when PAUSE_SEC has passed since the last start. It does not wait for the answer.
+        if ($canLaunch && $now - $lastStart >= PAUSE_SEC) {
+            $studio = $retry ? array_shift($retry) : $todo[$queueIdx++];
+            $lastStart = microtime(true);
+            $tried++;
+            $ch = scratch_handle($method, studio_url($studio, $project), $jar, studio_headers($auth, $jar), null, false);
+            curl_multi_add_handle($mh, $ch);
+            $inflight[hkey($ch)] = ['studio' => $studio, 'ch' => $ch, 'gen' => $gen];
+            unset($ch);
+        }
+
+        if (!$inflight) {
+            if ($needSwitch !== '') {
+                $why = $needSwitch;
+                $needSwitch = '';
+                if ($switchAccount($why)) {
+                    $stop = false;
+                    $retry = array_merge($retryAfterSwitch, $retry);
+                    $retryAfterSwitch = [];
+                    continue;
                 }
-                if ($free !== null) {
-                    $n--; // same studio again, with the new account
+                if ($why === 'account limit') {
+                    // everyone else is rate limited: carry on with this account
+                    $stop = false;
+                    $cycleBase = 0;
+                    $acctOk = 0;
                     continue;
                 }
                 $wait = limits_min_left($accounts, limits_load());
                 cooldown_set($wait);
                 out('Stopped: all ' . count($accounts) . ' accounts are rate limited. Queue runs wait ' . (int)ceil($wait / 60) . " minutes (add &force=1 to run anyway).\n");
+                $retry = array_merge($retryAfterSwitch, $retry);
+                $retryAfterSwitch = [];
                 break;
             }
-            // One account only: stop and hand back everything not yet tried.
-            $rest = array_merge(array_slice($todo, $n + 1), $rest);
-            if ($manual) {
-                $wait = retry_after_sec((string)$hdrs);
-                limit_set($currentUser, $wait);
-                out('Stopped: the config.php account is rate limited. Manual runs wait ' . (int)ceil($wait / 60) . " minutes (add &force=1 to run anyway).\n");
-            } elseif ($action === 'queue') {
-                $wait = cooldown_start((string)$hdrs);
-                out('Stopped: rate limited. Queue runs wait ' . (int)ceil($wait / 60) . " minutes (add &force=1 to run anyway).\n");
-            } else {
-                out("Stopped: rate limited. Wait a while before continuing.\n");
+            if (!$canLaunch) {
+                break; // finished, out of time, or stopped
             }
-            break;
+            usleep(5000);
+            continue;
+        }
+
+        // Let the requests in flight progress, wake up when the next one may start.
+        curl_multi_exec($mh, $active);
+        $wait = $canLaunch ? max(0.001, PAUSE_SEC - (microtime(true) - $lastStart)) : 0.25;
+        if (curl_multi_select($mh, $wait) === -1) {
+            usleep(5000);
+        }
+        curl_multi_exec($mh, $active);
+
+        // Collect finished requests.
+        $done = [];
+        while ($info = curl_multi_info_read($mh)) {
+            $ch = $info['handle'];
+            $key = hkey($ch);
+            $raw = (string)curl_multi_getcontent($ch);
+            $dCode = (int)curl_getinfo($ch, CURLINFO_HTTP_CODE);
+            $dHsize = (int)curl_getinfo($ch, CURLINFO_HEADER_SIZE);
+            $dErr = ($info['result'] === CURLE_OK) ? '' : curl_error($ch);
+            curl_multi_remove_handle($mh, $ch);
+            $meta = ['studio' => $inflight[$key]['studio'] ?? 0, 'gen' => $inflight[$key]['gen'] ?? $gen];
+            if (PHP_VERSION_ID < 80000) {
+                curl_close($ch);
+            }
+            unset($inflight[$key], $ch, $info); // dropping the last reference makes curl write the cookie jar
+            $done[] = [$meta['studio'], $dErr !== '' ? 0 : $dCode, substr($raw, 0, $dHsize), substr($raw, $dHsize), $meta['gen'], $dErr];
+        }
+
+        foreach ($done as [$studio, $code, $hdrs, $body, $g, $err]) {
+            if ($code === 0) {
+                out("$tag $project $studio: network error $err\n");
+                if (++$netErrs >= 5) {
+                    out("Stopped: 5 network errors in a row.\n");
+                    $halt = true;
+                }
+                continue;
+            }
+            $netErrs = 0;
+
+            // Sent with a login that has since been replaced: just send it again.
+            if ($g < $gen && in_array($code, [401, 403, 419], true)) {
+                array_unshift($retry, $studio);
+                continue;
+            }
+
+            // Queue run: a 419 means this account's session is bad. Stop, the next queue run uses the next account.
+            if ($code === 419 && $action === 'queue') {
+                if (!$hit419) {
+                    $hit419 = true;
+                    $stop = true;
+                    out("$tag $project $studio: HTTP 419. " . ($manual ? 'The config.php account was rejected, run again to log in fresh.' : 'Account ' . ($accountIdx + 1) . ' failed, the next queue run switches account.') . "\n");
+                }
+                continue; // the studio stays queued
+            }
+            if ($code === 419) {
+                // DELETE rotates the CSRF token: retry once with the fresh one from the jar.
+                [$code, $hdrs, $body] = studio_request($method, $studio, $project, $auth, $jar);
+            }
+
+            // A saved session can go stale: log in again once and retry.
+            if (!$fresh && in_array($code, [401, 403, 419], true)) {
+                $auth = scratch_login($currentUser, $currentPass, $jar);
+                session_save($currentUser, $auth, $jar);
+                $fresh = true;
+                $gen++;
+                [$code, $hdrs, $body] = studio_request($method, $studio, $project, $auth, $jar);
+            }
+
+            out("$tag $project $studio: HTTP $code " . substr(trim(preg_replace('/\s+/', ' ', $body)), 0, 150) . "\n");
+            if ($code >= 200 && $code < 300) {
+                $ok++;
+                $acctOk++;
+            }
+            if ($action === 'queue') {
+                if ($code > 0 && $code < 500 && $code !== 429) {
+                    $pendDone[] = $studio;
+                } elseif ($code >= 500) {
+                    $pendEnd[] = $studio;
+                }
+                if ($code >= 200 && $code < 300 && !$manual && !$cdCleared) { // adds work again, so any earlier shared wait is over
+                    cooldown_clear();
+                    $cdCleared = true;
+                }
+            }
+
+            // Rate limited
+            if ($code === 429) {
+                if ($action === 'queue' && count($accounts) > 1) {
+                    // Hold this account back and carry on with the next free one once the requests in flight are done.
+                    if ($needSwitch !== 'after 429') {
+                        limit_set($currentUser, retry_after_sec((string)$hdrs));
+                    }
+                    $retryAfterSwitch[] = $studio;
+                    $stop = true;
+                    $needSwitch = 'after 429';
+                } else {
+                    if (!$limited429) {
+                        $limited429 = true;
+                        $hdr429 = (string)$hdrs;
+                    }
+                    $stop = true;
+                }
+                continue;
+            }
+
+            // This account has done its share of adds: switch once the requests in flight are done.
+            if ($action === 'queue' && count($accounts) > 1 && $needSwitch === '' && !$stop && $cycleBase + $acctOk >= ACCOUNT_CYCLE_STUDIOS) {
+                $stop = true;
+                $needSwitch = 'account limit';
+            }
         }
     }
+    curl_multi_close($mh);
+
+    if ($hit419) {
+        session_drop($currentUser, $jar);
+    }
+    if ($action === 'queue' && !$manual && $accounts) {
+        set_cycle_counter($hit419 ? ACCOUNT_CYCLE_STUDIOS : $cycleBase + $acctOk); // after a 419 the next run switches account
+    }
+    if ($limited429) {
+        if ($manual) {
+            $wait = retry_after_sec($hdr429);
+            limit_set($currentUser, $wait);
+            out('Stopped: the config.php account is rate limited. Manual runs wait ' . (int)ceil($wait / 60) . " minutes (add &force=1 to run anyway).\n");
+        } elseif ($action === 'queue') {
+            $wait = cooldown_start($hdr429);
+            out('Stopped: rate limited. Queue runs wait ' . (int)ceil($wait / 60) . " minutes (add &force=1 to run anyway).\n");
+        } else {
+            out("Stopped: rate limited. Wait a while before continuing.\n");
+        }
+    }
+    $rest = array_merge($retry, array_slice($todo, $queueIdx), $rest);
 
     session_persist($currentUser, $jar);
     queue_flush();
