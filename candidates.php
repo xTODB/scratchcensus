@@ -25,6 +25,9 @@
 // warm=CRON_SECRET (used by cron/warm-cache.php, no key needed) rebuilds the cached list for the default
 // keywords once it is older than 25 minutes, so the first visit is instant too.
 //
+// Queue buttons (POST): add this page, add pages X to Y (every studio on those pages, same keywords, per page and
+// minimum), or clear the queue. script.php?action=queue, or a cron job running it, works through the queue.
+//
 // This only lists studios. Adding a project is still done one studio at a time with script.php.
 require_once __DIR__ . '/functions.php';
 require_once __DIR__ . '/studios-functions.php';
@@ -297,40 +300,67 @@ $total = count($list['ids']);
 $capped = !empty($list['capped']);
 $pages = max(1, (int)ceil($total / $n));
 
-// Queue: the "Add this page to queue" button appends this page's IDs to scratch-session-queue.txt
-// (one ID per line, no duplicates). script.php?action=queue takes them from the top and removes them.
+// Queue: the buttons add studio IDs to scratch-session-queue.txt (one ID per line, no duplicates).
+// script.php?action=queue takes them from the top and removes them once tried.
 const CANDIDATE_QUEUE_FILE = __DIR__ . '/scratch-session-queue.txt';
 function candidateQueueIds(): array {
     $lines = is_file(CANDIDATE_QUEUE_FILE) ? file(CANDIDATE_QUEUE_FILE, FILE_IGNORE_NEW_LINES) : [];
     return array_values(array_unique(array_filter(array_map('intval', $lines), fn($v) => $v > 0)));
 }
 $queueMsg = '';
-if (!$wordsMode && ($_SERVER['REQUEST_METHOD'] ?? '') === 'POST' && isset($_POST['queue']) && $rows) {
-    $fh = fopen(CANDIDATE_QUEUE_FILE, 'c+');
-    if ($fh && flock($fh, LOCK_EX)) {
-        $have = [];
-        while (($l = fgets($fh)) !== false) {
-            if ((int)$l > 0) $have[(int)$l] = true;
+if (!$wordsMode && $error === '' && ($_SERVER['REQUEST_METHOD'] ?? '') === 'POST') {
+    $add = null;
+    $label = '';
+    if (isset($_POST['queue_clear'])) {
+        $fh = @fopen(CANDIDATE_QUEUE_FILE, 'c+');
+        if ($fh && flock($fh, LOCK_EX)) {
+            $was = 0;
+            while (($l = fgets($fh)) !== false) {
+                if ((int)$l > 0) $was++;
+            }
+            ftruncate($fh, 0);
+            flock($fh, LOCK_UN);
+            fclose($fh);
+            $queueMsg = 'Queue cleared (' . number_format($was) . ' IDs removed). ';
+        } else {
+            $queueMsg = 'Could not write the queue file. ';
         }
-        $new = 0;
-        $out = '';
-        foreach ($rows as $r) {
-            $id = (int)$r['id'];
-            if (!isset($have[$id])) { $have[$id] = true; $out .= $id . "\n"; $new++; }
-        }
-        fseek($fh, 0, SEEK_END);
-        if ($out !== '' && ftell($fh) > 0) {
-            // make sure the last existing line ended with a newline
-            fseek($fh, -1, SEEK_END);
-            if (fgetc($fh) !== "\n") $out = "\n" . $out;
+    } elseif (isset($_POST['queue_range'])) {
+        $from = max(1, min($pages, (int)($_POST['from'] ?? 1)));
+        $to = max(1, min($pages, (int)($_POST['to'] ?? $from)));
+        if ($from > $to) [$from, $to] = [$to, $from];
+        $add = array_slice($list['ids'], ($from - 1) * $n, ($to - $from + 1) * $n);
+        $label = "Pages $from to $to: ";
+    } elseif (isset($_POST['queue']) && $rows) {
+        $add = array_map(fn($r) => (int)$r['id'], $rows);
+    }
+    if ($add !== null) {
+        $fh = fopen(CANDIDATE_QUEUE_FILE, 'c+');
+        if ($fh && flock($fh, LOCK_EX)) {
+            $have = [];
+            while (($l = fgets($fh)) !== false) {
+                if ((int)$l > 0) $have[(int)$l] = true;
+            }
+            $new = 0;
+            $out = '';
+            foreach ($add as $id) {
+                $id = (int)$id;
+                if (!isset($have[$id])) { $have[$id] = true; $out .= $id . "\n"; $new++; }
+            }
             fseek($fh, 0, SEEK_END);
+            if ($out !== '' && ftell($fh) > 0) {
+                // make sure the last existing line ended with a newline
+                fseek($fh, -1, SEEK_END);
+                if (fgetc($fh) !== "\n") $out = "\n" . $out;
+                fseek($fh, 0, SEEK_END);
+            }
+            fwrite($fh, $out);
+            flock($fh, LOCK_UN);
+            fclose($fh);
+            $queueMsg = $label . 'Queued ' . number_format($new) . ' new IDs (' . number_format(count($add) - $new) . ' were already queued). ';
+        } else {
+            $queueMsg = 'Could not write the queue file. ';
         }
-        fwrite($fh, $out);
-        flock($fh, LOCK_UN);
-        fclose($fh);
-        $queueMsg = "Queued $new new IDs (" . (count($rows) - $new) . ' were already queued). ';
-    } else {
-        $queueMsg = 'Could not write the queue file. ';
     }
 }
 
@@ -407,8 +437,16 @@ Open studios only, biggest first<?= $capped ? '. A query hit the ' . number_form
 <?php if ($rows): ?>
 <?php $idList = array_map(fn($r) => (int)$r['id'], $rows); ?>
 <p><label>IDs for script.php (studio=...)<br><textarea readonly onclick="this.select()"><?= e(implode(',', $idList)) ?></textarea></label></p>
-<form method="post" action="<?= e($link((int)$page)) ?>" style="margin:0 0 12px">
+<form method="post" action="<?= e($link((int)$page)) ?>" style="margin:0 0 6px">
     <button type="submit" name="queue" value="1">Add this page to queue</button>
+</form>
+<form method="post" action="<?= e($link((int)$page)) ?>" style="margin:0 0 6px">
+    Add pages <input type="number" name="from" value="<?= (int)$page ?>" min="1" max="<?= (int)$pages ?>" style="width:5em">
+    to <input type="number" name="to" value="<?= (int)min($pages, $page + 9) ?>" min="1" max="<?= (int)$pages ?>" style="width:5em">
+    to queue <button type="submit" name="queue_range" value="1">Add</button>
+</form>
+<form method="post" action="<?= e($link((int)$page)) ?>" style="margin:0 0 12px">
+    <button type="submit" name="queue_clear" value="1" onclick="return confirm('Empty the queue?')">Clear queue</button>
     <span class="muted"><?= e($queueMsg) ?><?= number_format(count(candidateQueueIds())) ?> IDs waiting. Run script.php?key=...&amp;project=...&amp;action=queue</span>
 </form>
 <p><label>PHP array<br><textarea readonly onclick="this.select()">[<?= e(implode(', ', $idList)) ?>]</textarea></label></p>
