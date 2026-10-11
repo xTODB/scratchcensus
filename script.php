@@ -382,6 +382,18 @@ try {
             exit;
         }
         echo count($studios) . " IDs in the queue.\n";
+
+        
+        // Check if paused
+        $pauseFile = __DIR__ . '/scratch-session-paused.txt';
+        if (is_file($pauseFile)) {
+            $pausedAt = (int)@file_get_contents($pauseFile);
+            $pausedFor = $pausedAt > 0 ? 'since ' . date('Y-m-d H:i:s', $pausedAt) : '';
+            out("Queue is paused $pausedFor. Exiting.\\n");
+            flock($lock, LOCK_UN);
+            fclose($lock);
+            exit;
+        }
     }
 
     if (!$studios || $project <= 0) {

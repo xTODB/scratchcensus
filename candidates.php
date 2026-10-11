@@ -307,8 +307,26 @@ function candidateQueueIds(): array {
     $lines = is_file(CANDIDATE_QUEUE_FILE) ? file(CANDIDATE_QUEUE_FILE, FILE_IGNORE_NEW_LINES) : [];
     return array_values(array_unique(array_filter(array_map('intval', $lines), fn($v) => $v > 0)));
 }
+
+// Check if queue is paused
+function queueIsPaused(): bool {
+    return is_file(__DIR__ . '/scratch-session-paused.txt');
+}
+
 $queueMsg = '';
 if (!$wordsMode && $error === '' && ($_SERVER['REQUEST_METHOD'] ?? '') === 'POST') {
+    // Pause/unpause the cron queue
+    if (isset($_POST['toggle_pause'])) {
+        $pauseFile = __DIR__ . '/scratch-session-paused.txt';
+        if (is_file($pauseFile)) {
+            @unlink($pauseFile);
+            $queueMsg = 'Queue resumed. ';
+        } else {
+            @file_put_contents($pauseFile, time());
+            $queueMsg = 'Queue paused. ';
+        }
+    }
+
     $add = null;
     $label = '';
     if (isset($_POST['queue_clear'])) {
@@ -449,6 +467,12 @@ Open studios only, biggest first<?= $capped ? '. A query hit the ' . number_form
     <button type="submit" name="queue_clear" value="1" onclick="return confirm('Empty the queue?')">Clear queue</button>
     <span class="muted"><?= e($queueMsg) ?><?= number_format(count(candidateQueueIds())) ?> IDs waiting. Run script.php?key=...&amp;project=...&amp;action=queue</span>
 </form>
+
+<form method="post" action="<?= e($link((int)$page)) ?>" style="margin:0 0 12px">
+    <button type="submit" name="toggle_pause" value="1"><?= queueIsPaused() ? 'Resume queue' : 'Pause queue' ?></button>
+    <span class="muted"><?= queueIsPaused() ? 'Queue is paused. Cron runs will skip processing. ' : 'Queue is running. ' ?></span>
+</form>
+
 <p><label>PHP array<br><textarea readonly onclick="this.select()">[<?= e(implode(', ', $idList)) ?>]</textarea></label></p>
 <table>
 <tr><th class="n">#</th><th>Studio</th><th class="n">Followers</th><th class="n">Projects</th><th>Matched</th></tr>
