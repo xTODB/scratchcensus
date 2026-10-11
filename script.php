@@ -27,6 +27,8 @@ const SCRATCH_UA = 'Mozilla/5.0 (compatible; ScratchCensus/1.0)';
 const SESSION_MAX_AGE = 43200; // reuse a login for 12 hours
 const MAX_PER_RUN = 50;        // studios handled per request
 const PAUSE_SEC = 0.35;           // pause between studios, in seconds (decimals are fine)
+const ACCOUNT_CYCLE_RUNS = 6;     // switch accounts after this many queue runs (6 runs * 50 studios = 300)
+const EMAIL_EVERY_SWITCHES = 5;   // send email report after this many account switches
 
 // One HTTP call. Returns [status code, raw headers, body].
 function scratch_http(string $method, string $url, string $jar, array $headers = [], ?string $body = null): array {
@@ -138,6 +140,101 @@ function load_session(string $jar, string $stateFile): ?array {
     }
     $s['csrf'] = csrf_from_jar($jar) ?: ($s['csrf'] ?? '');
     return $s;
+}
+
+// Load accounts from acc.csv (format: username,password per line)
+function load_accounts(): array {
+    $file = __DIR__ . '/acc.csv';
+    if (!is_file($file)) {
+        return [];
+    }
+    $accounts = [];
+    foreach (file($file, FILE_IGNORE_NEW_LINES | FILE_SKIP_EMPTY_LINES) as $line) {
+        $line = trim($line);
+        if ($line && strpos($line, ',') !== false) {
+            [$user, $pass] = explode(',', $line, 2);
+            $accounts[] = ['user' => trim($user), 'pass' => trim($pass)];
+        }
+    }
+    return $accounts;
+}
+
+// Get the current account from the rotation file
+function get_current_account_idx(): int {
+    $file = __DIR__ . '/scratch-session-account-idx.txt';
+    if (is_file($file)) {
+        $idx = (int)file_get_contents($file);
+        $accounts = load_accounts();
+        if ($idx >= 0 && $idx < count($accounts)) {
+            return $idx;
+        }
+    }
+    return 0;
+}
+
+// Set the current account index
+function set_account_idx(int $idx): void {
+    $accounts = load_accounts();
+    if ($idx >= count($accounts)) {
+        $idx = 0;
+    }
+    @file_put_contents(__DIR__ . '/scratch-session-account-idx.txt', (string)$idx);
+}
+
+// Increment the account cycle counter
+function increment_cycle_counter(): int {
+    $file = __DIR__ . '/scratch-session-cycle-count.txt';
+    $count = is_file($file) ? (int)file_get_contents($file) : 0;
+    $count++;
+    @file_put_contents($file, (string)$count);
+    return $count;
+}
+
+// Get and reset the switch counter for email reports
+function get_switch_counter(): int {
+    $file = __DIR__ . '/scratch-session-switch-count.txt';
+    $count = is_file($file) ? (int)file_get_contents($file) : 0;
+    return $count;
+}
+
+function increment_switch_counter(): int {
+    $file = __DIR__ . '/scratch-session-switch-count.txt';
+    $count = is_file($file) ? (int)file_get_contents($file) : 0;
+    $count++;
+    @file_put_contents($file, (string)$count);
+    return $count;
+}
+
+function reset_switch_counter(): void {
+    @file_put_contents(__DIR__ . '/scratch-session-switch-count.txt', '0');
+}
+
+// Collect activity log entries since last report
+function get_activity_since(int $lines_back = 500): array {
+    $file = __DIR__ . '/scratch-session-log.txt';
+    if (!is_file($file)) {
+        return [];
+    }
+    $all = file($file, FILE_IGNORE_NEW_LINES);
+    return array_slice($all, -$lines_back);
+}
+
+// Send email report of account switches and activity
+function send_activity_report(string $email, array $recent_lines, int $switch_count): void {
+    if (!$email || !filter_var($email, FILTER_VALIDATE_EMAIL)) {
+        return;
+    }
+    
+    $activity = implode("\n", $recent_lines);
+    $subject = "ScratchCensus: Account switch #$switch_count completed";
+    $body = "Account switched for the {$switch_count}th time.\n\n";
+    $body .= "Recent activity (last " . count($recent_lines) . " lines):\n\n";
+    $body .= $activity;
+    
+    $headers = "From: noreply@scratchcensus.local\n";
+    $headers .= "Content-Type: text/plain; charset=utf-8\n";
+    
+    @mail($email, $subject, $body, $headers);
 }
 
 function studio_request(string $method, int $studio, int $project, array $auth, string $jar): array {
@@ -294,14 +391,52 @@ try {
     $todo = array_slice($studios, 0, MAX_PER_RUN);
     $rest = array_slice($studios, MAX_PER_RUN);
 
-    $base = __DIR__ . '/scratch-session-' . md5(CRON_SECRET . SCRATCH_USER);
+    // Handle account rotation in queue mode
+    $currentUser = SCRATCH_USER;
+    $currentPass = SCRATCH_PASS;
+    
+    if ($action === 'queue') {
+        $accounts = load_accounts();
+        if (!empty($accounts)) {
+            // Increment cycle counter
+            $cycle = increment_cycle_counter();
+            $accountIdx = get_current_account_idx();
+            
+            // Switch account every ACCOUNT_CYCLE_RUNS
+            if ($cycle >= ACCOUNT_CYCLE_RUNS) {
+                $accountIdx++;
+                if ($accountIdx >= count($accounts)) {
+                    $accountIdx = 0;
+                }
+                set_account_idx($accountIdx);
+                $switchCount = increment_switch_counter();
+                out("ACCOUNT_SWITCH: Switched to account " . ($accountIdx + 1) . " of " . count($accounts) . " (switch #$switchCount)\n");
+                
+                // Send email report every EMAIL_EVERY_SWITCHES
+                if ($switchCount % EMAIL_EVERY_SWITCHES === 0) {
+                    $activity = get_activity_since(100);
+                    send_activity_report(EMAIL_REPORT_TO, $activity, $switchCount);
+                    out("Sent activity report email (switch #$switchCount)\n");
+                }
+                
+                @file_put_contents(__DIR__ . '/scratch-session-cycle-count.txt', '0');
+            }
+            
+            if (isset($accounts[$accountIdx])) {
+                $currentUser = $accounts[$accountIdx]['user'];
+                $currentPass = $accounts[$accountIdx]['pass'];
+            }
+        }
+    }
+    
+    $base = __DIR__ . '/scratch-session-' . md5(CRON_SECRET . $currentUser);
     $jar = $base . '.cookies';
     $stateFile = $base . '.json';
 
     $auth = load_session($jar, $stateFile);
     $fresh = false;
     if (!$auth) {
-        $auth = scratch_login(SCRATCH_USER, SCRATCH_PASS, $jar, $stateFile);
+        $auth = scratch_login($currentUser, $currentPass, $jar, $stateFile);
         $fresh = true;
     }
 
