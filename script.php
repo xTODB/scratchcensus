@@ -476,6 +476,15 @@ try {
 
         // A saved session can go stale: log in again once and retry.
         // DELETE rotates the CSRF token: retry once with the fresh one from the jar.
+        // Queue run: a 419 means this account's session is bad, so stop and make the next run use the next account.
+        if ($code === 419 && $action === 'queue') {
+            $rest = array_merge(array_slice($todo, $n + 1), $rest);
+            @file_put_contents(__DIR__ . '/scratch-session-cycle-count.txt', (string)ACCOUNT_CYCLE_RUNS);
+            @unlink($jar);
+            @unlink($stateFile);
+            out("$tag $project $studio: HTTP 419. Account " . (isset($accountIdx) ? $accountIdx + 1 : 0) . " failed, the next queue run switches account.\n");
+            break;
+        }
         if ($code === 419) {
             [$code, $hdrs, $body] = studio_request($method, $studio, $project, $auth, $jar);
         }
