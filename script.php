@@ -8,6 +8,9 @@
 // An ID stays queued only if the run was rate limited (429) or Scratch/the network failed (5xx).
 // removeall removes the project from every studio the log (scratch-session-log.txt) says it is still in.
 // Run it again until it says nothing is left.
+// Cron: run the queue action on a schedule. A lock file makes a run stop at once while the previous one is still
+// going, and after a 429 the queue action does nothing until Scratch's Retry-After (else 30 minutes) is over.
+// Add &force=1 to run the queue anyway during that wait.
 // studio takes one ID or a comma/space separated list. At most MAX_PER_RUN studios per request,
 // with PAUSE_SEC between them. The leftover IDs are printed so you can paste them into the next run.
 
@@ -23,7 +26,7 @@ if (($_GET['key'] ?? '') !== CRON_SECRET) {
 const SCRATCH_UA = 'Mozilla/5.0 (compatible; ScratchCensus/1.0)';
 const SESSION_MAX_AGE = 43200; // reuse a login for 12 hours
 const MAX_PER_RUN = 50;        // studios handled per request
-const PAUSE_SEC = 0.35;           // pause between studios
+const PAUSE_SEC = 0.35;           // pause between studios, in seconds (decimals are fine)
 
 // One HTTP call. Returns [status code, raw headers, body].
 function scratch_http(string $method, string $url, string $jar, array $headers = [], ?string $body = null): array {
@@ -179,6 +182,25 @@ function logged_studios(int $project): array {
 }
 
 const QUEUE_FILE = __DIR__ . '/scratch-session-queue.txt';
+const COOLDOWN_FILE = __DIR__ . '/scratch-session-cooldown.txt';
+const COOLDOWN_DEFAULT_SEC = 1800; // wait this long after a 429 when Scratch does not say how long
+
+// After a 429 the queue action waits: Scratch's Retry-After if it sent one (60 s to 24 h), else the default above.
+function cooldown_start(string $headers): int {
+    $sec = COOLDOWN_DEFAULT_SEC;
+    if (preg_match('/^Retry-After:\s*(\d+)/mi', $headers, $m)) {
+        $sec = max(60, min(86400, (int)$m[1]));
+    }
+    @file_put_contents(COOLDOWN_FILE, (string)(time() + $sec));
+    return $sec;
+}
+
+// Seconds the queue action still has to wait (0 = go ahead).
+function cooldown_left(): int {
+    clearstatcache(true, COOLDOWN_FILE);
+    $until = is_file(COOLDOWN_FILE) ? (int)@file_get_contents(COOLDOWN_FILE) : 0;
+    return max(0, $until - time());
+}
 
 function queue_ids(): array {
     $lines = is_file(QUEUE_FILE) ? file(QUEUE_FILE, FILE_IGNORE_NEW_LINES) : [];
@@ -205,6 +227,27 @@ function queue_remove(int $id): void {
     fclose($fh);
 }
 
+// Put one ID at the end of the queue, so a studio that keeps failing with a 5xx cannot block the front of it.
+function queue_move_to_end(int $id): void {
+    $fh = @fopen(QUEUE_FILE, 'c+');
+    if (!$fh || !flock($fh, LOCK_EX)) {
+        return;
+    }
+    $keep = [];
+    while (($l = fgets($fh)) !== false) {
+        $v = (int)$l;
+        if ($v > 0 && $v !== $id) {
+            $keep[] = $v;
+        }
+    }
+    $keep[] = $id;
+    ftruncate($fh, 0);
+    rewind($fh);
+    fwrite($fh, implode("\n", $keep) . "\n");
+    flock($fh, LOCK_UN);
+    fclose($fh);
+}
+
 try {
     $studios = array_values(array_unique(array_filter(
         array_map('intval', preg_split('/[\s,;]+/', (string)($_GET['studio'] ?? ''), -1, PREG_SPLIT_NO_EMPTY)),
@@ -225,6 +268,17 @@ try {
     }
 
     if ($action === 'queue' && $project > 0) {
+        $left = cooldown_left();
+        if ($left > 0 && empty($_GET['force'])) {
+            echo 'Rate limited earlier. Waiting ' . (int)ceil($left / 60) . " more minutes before the next queue run (add &force=1 to run anyway).\n";
+            exit;
+        }
+        // one queue run at a time: a cron tick that starts while the last run is still going just stops
+        $lock = @fopen(__DIR__ . '/scratch-session-queue.lock', 'c');
+        if (!$lock || !flock($lock, LOCK_EX | LOCK_NB)) {
+            echo "Another queue run is still going.\n";
+            exit;
+        }
         $studios = queue_ids();
         if (!$studios) {
             echo "The queue is empty.\n";
@@ -254,34 +308,46 @@ try {
     $ok = 0;
     foreach ($todo as $n => $studio) {
         if ($n > 0) {
-            sleep(PAUSE_SEC);
+            usleep((int)round(PAUSE_SEC * 1000000));
         }
-        [$code, , $body] = studio_request($method, $studio, $project, $auth, $jar);
+        [$code, $hdrs, $body] = studio_request($method, $studio, $project, $auth, $jar);
 
         // A saved session can go stale: log in again once and retry.
         // DELETE rotates the CSRF token: retry once with the fresh one from the jar.
         if ($code === 419) {
-            [$code, , $body] = studio_request($method, $studio, $project, $auth, $jar);
+            [$code, $hdrs, $body] = studio_request($method, $studio, $project, $auth, $jar);
         }
 
         if (!$fresh && in_array($code, [401, 403, 419], true)) {
             $auth = scratch_login(SCRATCH_USER, SCRATCH_PASS, $jar, $stateFile);
             $fresh = true;
-            [$code, , $body] = studio_request($method, $studio, $project, $auth, $jar);
+            [$code, $hdrs, $body] = studio_request($method, $studio, $project, $auth, $jar);
         }
 
         out("$tag $project $studio: HTTP $code " . substr(trim(preg_replace('/\s+/', ' ', $body)), 0, 150) . "\n");
         if ($code >= 200 && $code < 300) {
             $ok++;
         }
-        if ($action === 'queue' && $code > 0 && $code < 500 && $code !== 429) {
-            queue_remove($studio);
+        if ($action === 'queue') {
+            if ($code > 0 && $code < 500 && $code !== 429) {
+                queue_remove($studio);
+            } elseif ($code >= 500) {
+                queue_move_to_end($studio);
+            }
+            if ($code >= 200 && $code < 300) {
+                @unlink(COOLDOWN_FILE); // adds work again, so any earlier wait is over
+            }
         }
 
         // Rate limited: stop and hand back everything not yet tried.
         if ($code === 429) {
             $rest = array_merge(array_slice($todo, $n + 1), $rest);
-            out("Stopped: rate limited. Wait a while before continuing.\n");
+            if ($action === 'queue') {
+                $wait = cooldown_start((string)$hdrs);
+                out('Stopped: rate limited. Queue runs wait ' . (int)ceil($wait / 60) . " minutes (add &force=1 to run anyway).\n");
+            } else {
+                out("Stopped: rate limited. Wait a while before continuing.\n");
+            }
             break;
         }
     }
