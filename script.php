@@ -3,6 +3,7 @@
 // Usage: script.php?key=CRON_SECRET&studio=111,222,333&project=987654321[&action=remove]
 //    or: script.php?key=CRON_SECRET&project=987654321&action=removeall
 //    or: script.php?key=CRON_SECRET&project=987654321&action=queue
+//    or: script.php?key=CRON_SECRET&action=testmail   (sends a test email to EMAIL_REPORT_TO and says what happened)
 // queue adds the project to the top MAX_PER_RUN IDs of scratch-session-queue.txt (filled by the
 // "Add this page to queue" button in candidates.php) and deletes each ID from the file once it was tried.
 // An ID stays queued only if the run was rate limited (429) or Scratch/the network failed (5xx).
@@ -12,6 +13,10 @@
 // going, and after a 429 the queue action does nothing until Scratch's Retry-After (else 30 minutes) is over.
 // Add &force=1 to run the queue anyway during that wait.
 // Add &manual=1 to run the queue even while it is paused (the Pause button in candidates.php) for a manual run or test.
+// A manual run logs in with the config.php account (SCRATCH_USER), not the acc.csv rotation, and does not touch the rotation,
+// the counters or the shared 429 wait.
+// All bookkeeping (rotation, counters, 429 waits, saved logins) lives in scratch-session-state.json. Besides it only the log,
+// the queue, the run lock and the pause flag exist as scratch-session-* files.
 // studio takes one ID or a comma/space separated list. At most MAX_PER_RUN studios per request,
 // with PAUSE_SEC between them. The leftover IDs are printed so you can paste them into the next run.
 
@@ -96,9 +101,8 @@ function csrf_from_response(string $headers, string $jar): ?string {
     return csrf_from_jar($jar);
 }
 
-function scratch_login(string $user, string $pass, string $jar, string $stateFile): array {
+function scratch_login(string $user, string $pass, string $jar): array {
     @unlink($jar);
-    @unlink($stateFile);
 
     $csrf = null;
     $info = '';
@@ -132,25 +136,12 @@ function scratch_login(string $user, string $pass, string $jar, string $stateFil
     }
 
     // Django rotates the CSRF token on login, so take the new one from the jar.
-    $auth = [
+    @chmod($jar, 0600);
+    return [
         'token' => $res[0]['token'],
         'csrf' => csrf_from_jar($jar) ?: $csrf,
         'saved' => time(),
     ];
-    file_put_contents($stateFile, json_encode($auth));
-    return $auth;
-}
-
-function load_session(string $jar, string $stateFile): ?array {
-    if (!is_file($jar) || !is_file($stateFile)) {
-        return null;
-    }
-    $s = json_decode((string)file_get_contents($stateFile), true);
-    if (!$s || empty($s['token']) || time() - ($s['saved'] ?? 0) > SESSION_MAX_AGE) {
-        return null;
-    }
-    $s['csrf'] = csrf_from_jar($jar) ?: ($s['csrf'] ?? '');
-    return $s;
 }
 
 // Load accounts from acc.csv (format: username,password per line)
@@ -170,54 +161,143 @@ function load_accounts(): array {
     return $accounts;
 }
 
-// Get the current account from the rotation file
-function get_current_account_idx(): int {
-    $file = __DIR__ . '/scratch-session-account-idx.txt';
-    if (is_file($file)) {
-        $idx = (int)file_get_contents($file);
-        $accounts = load_accounts();
-        if ($idx >= 0 && $idx < count($accounts)) {
-            return $idx;
+const STATE_FILE = __DIR__ . '/scratch-session-state.json';
+
+// Everything the script has to remember between runs lives in one JSON file: rotation position, counters,
+// 429 waits, last report time and the saved logins. Read-modify-write under a lock, so overlapping requests cannot clobber it.
+function state_update(callable $fn) {
+    $fh = @fopen(STATE_FILE, 'c+');
+    if (!$fh) {
+        return null;
+    }
+    flock($fh, LOCK_EX);
+    $st = json_decode((string)stream_get_contents($fh), true);
+    if (!is_array($st)) {
+        $st = [];
+    }
+    $res = $fn($st);
+    ftruncate($fh, 0);
+    rewind($fh);
+    fwrite($fh, json_encode($st));
+    fflush($fh);
+    flock($fh, LOCK_UN);
+    fclose($fh);
+    @chmod(STATE_FILE, 0600);
+    return $res;
+}
+
+function state_get(): array {
+    $fh = @fopen(STATE_FILE, 'r');
+    if (!$fh) {
+        return [];
+    }
+    flock($fh, LOCK_SH);
+    $st = json_decode((string)stream_get_contents($fh), true);
+    flock($fh, LOCK_UN);
+    fclose($fh);
+    return is_array($st) ? $st : [];
+}
+
+// One-time cleanup: fold the old scratch-session-* helper files into the state file, then delete them.
+function migrate_legacy_files(): void {
+    $dir = __DIR__ . '/';
+    $small = [];
+    foreach (['account-idx.txt', 'cycle-count.txt', 'switch-count.txt', 'cooldown.txt', 'last-mail.txt', 'limits.json'] as $n) {
+        if (is_file($dir . 'scratch-session-' . $n)) {
+            $small[$n] = $dir . 'scratch-session-' . $n;
         }
     }
-    return 0;
+    $sessFiles = [];
+    foreach (glob($dir . 'scratch-session-*') ?: [] as $f) {
+        if (preg_match('/scratch-session-[0-9a-f]{32}\.(cookies|json)$/', $f)) {
+            $sessFiles[] = $f;
+        }
+    }
+    if (!$small && !$sessFiles) {
+        return;
+    }
+
+    // keep logins that are still fresh, so no account has to log in again
+    $users = array_column(load_accounts(), 'user');
+    $users[] = SCRATCH_USER;
+    $sessions = [];
+    foreach (array_unique($users) as $u) {
+        $base = $dir . 'scratch-session-' . md5(CRON_SECRET . $u);
+        if (is_file($base . '.cookies') && is_file($base . '.json')) {
+            $j = json_decode((string)@file_get_contents($base . '.json'), true);
+            if (is_array($j) && !empty($j['token']) && time() - (int)($j['saved'] ?? 0) <= SESSION_MAX_AGE) {
+                $sessions[$u] = [
+                    'token' => $j['token'],
+                    'csrf' => $j['csrf'] ?? '',
+                    'saved' => (int)$j['saved'],
+                    'cookies' => (string)@file_get_contents($base . '.cookies'),
+                ];
+            }
+        }
+    }
+    $read = function (string $n) use ($small) {
+        return isset($small[$n]) ? trim((string)@file_get_contents($small[$n])) : '';
+    };
+    state_update(function (array &$st) use ($read, $sessions) {
+        $map = ['idx' => 'account-idx.txt', 'cycle' => 'cycle-count.txt', 'switches' => 'switch-count.txt',
+                'cooldown_until' => 'cooldown.txt', 'last_mail' => 'last-mail.txt'];
+        foreach ($map as $key => $n) {
+            $v = $read($n);
+            if ($v !== '' && !isset($st[$key])) {
+                $st[$key] = (int)$v;
+            }
+        }
+        $lim = json_decode($read('limits.json'), true);
+        if (is_array($lim) && !isset($st['limits'])) {
+            $st['limits'] = $lim;
+        }
+        foreach ($sessions as $u => $sess) {
+            if (!isset($st['sessions'][$u])) {
+                $st['sessions'][$u] = $sess;
+            }
+        }
+    });
+    foreach (array_merge(array_values($small), $sessFiles) as $f) {
+        @unlink($f);
+    }
+    out('Cleanup: moved ' . (count($small) + count($sessFiles)) . " old scratch-session files into scratch-session-state.json and deleted them.\n");
+}
+
+// Get the current account from the rotation state
+function get_current_account_idx(): int {
+    $idx = (int)(state_get()['idx'] ?? 0);
+    return ($idx >= 0 && $idx < count(load_accounts())) ? $idx : 0;
 }
 
 // Set the current account index
 function set_account_idx(int $idx): void {
-    $accounts = load_accounts();
-    if ($idx >= count($accounts)) {
+    if ($idx >= count(load_accounts())) {
         $idx = 0;
     }
-    @file_put_contents(__DIR__ . '/scratch-session-account-idx.txt', (string)$idx);
+    state_update(function (array &$st) use ($idx) {
+        $st['idx'] = $idx;
+    });
 }
 
 // Increment the account cycle counter
 function increment_cycle_counter(): int {
-    $file = __DIR__ . '/scratch-session-cycle-count.txt';
-    $count = is_file($file) ? (int)file_get_contents($file) : 0;
-    $count++;
-    @file_put_contents($file, (string)$count);
-    return $count;
+    return (int)state_update(function (array &$st) {
+        $st['cycle'] = (int)($st['cycle'] ?? 0) + 1;
+        return $st['cycle'];
+    });
 }
 
-// Get and reset the switch counter for email reports
-function get_switch_counter(): int {
-    $file = __DIR__ . '/scratch-session-switch-count.txt';
-    $count = is_file($file) ? (int)file_get_contents($file) : 0;
-    return $count;
+function set_cycle_counter(int $n): void {
+    state_update(function (array &$st) use ($n) {
+        $st['cycle'] = $n;
+    });
 }
 
 function increment_switch_counter(): int {
-    $file = __DIR__ . '/scratch-session-switch-count.txt';
-    $count = is_file($file) ? (int)file_get_contents($file) : 0;
-    $count++;
-    @file_put_contents($file, (string)$count);
-    return $count;
-}
-
-function reset_switch_counter(): void {
-    @file_put_contents(__DIR__ . '/scratch-session-switch-count.txt', '0');
+    return (int)state_update(function (array &$st) {
+        $st['switches'] = (int)($st['switches'] ?? 0) + 1;
+        return $st['switches'];
+    });
 }
 
 // Collect activity log entries since last report
@@ -230,38 +310,43 @@ function get_activity_since(int $lines_back = 500): array {
     return array_slice($all, -$lines_back);
 }
 
-// Send email report of account switches and activity. Never throws, and logs what happened.
-const EMAIL_MIN_GAP_SEC = 900; // at most one report per 15 minutes, however often accounts switch
-function send_activity_report(array $recent_lines, int $switch_count): void {
+// Send one email to EMAIL_REPORT_TO. Never throws. Returns [accepted, text saying what happened].
+function mail_send(string $subject, string $body): array {
     if (!defined('EMAIL_REPORT_TO') || !filter_var(EMAIL_REPORT_TO, FILTER_VALIDATE_EMAIL)) {
-        out("Email report skipped: EMAIL_REPORT_TO is missing or not a valid address in config.php.\n");
-        return;
+        return [false, 'EMAIL_REPORT_TO is missing or not a valid address in config.php'];
     }
-    $gapFile = __DIR__ . '/scratch-session-last-mail.txt';
-    $last = is_file($gapFile) ? (int)@file_get_contents($gapFile) : 0;
+    $from = defined('EMAIL_REPORT_FROM') ? EMAIL_REPORT_FROM : 'noreply@scratchnews.net';
+    $headers = "From: ScratchCensus <$from>\r\n";
+    $headers .= "Content-Type: text/plain; charset=utf-8\r\n";
+    error_clear_last();
+    $sent = @mail(EMAIL_REPORT_TO, $subject, $body, $headers);
+    if ($sent) {
+        return [true, 'handed to the mail system (to ' . EMAIL_REPORT_TO . ", from $from)"];
+    }
+    $err = error_get_last()['message'] ?? 'mail() returned false';
+    return [false, "FAILED: $err (to " . EMAIL_REPORT_TO . ", from $from)"];
+}
+
+// Email report of account switches and activity. Sends at most one per EMAIL_MIN_GAP_SEC and logs the result.
+const EMAIL_MIN_GAP_SEC = 900;
+function send_activity_report(array $recent_lines, int $switch_count): void {
+    $last = (int)(state_get()['last_mail'] ?? 0);
     if (time() - $last < EMAIL_MIN_GAP_SEC) {
         out("Email report skipped: one was sent less than " . (int)(EMAIL_MIN_GAP_SEC / 60) . " minutes ago.\n");
         return;
     }
-    @file_put_contents($gapFile, (string)time());
-
-    $from = defined('EMAIL_REPORT_FROM') ? EMAIL_REPORT_FROM : 'noreply@scratchnews.net';
-    $subject = "ScratchCensus: account switch #$switch_count";
-    $body = "Account switch #$switch_count.\n\n";
-    $body .= "Recent activity (last " . count($recent_lines) . " lines):\n\n";
-    $body .= implode("\n", $recent_lines);
-
-    $headers = "From: ScratchCensus <$from>\r\n";
-    $headers .= "Content-Type: text/plain; charset=utf-8\r\n";
-
-    $sent = @mail(EMAIL_REPORT_TO, $subject, $body, $headers);
-    out('Email report ' . ($sent ? 'handed to the mail system' : 'FAILED, mail() returned false') . " (switch #$switch_count, from $from).\n");
+    state_update(function (array &$st) {
+        $st['last_mail'] = time();
+    });
+    $body = "Account switch #$switch_count.\n\nRecent activity (last " . count($recent_lines) . " lines):\n\n" . implode("\n", $recent_lines);
+    [, $info] = mail_send("ScratchCensus: account switch #$switch_count", $body);
+    out("Email report $info\n");
 }
 
 // Record an account switch: save the index, restart the run counter, log it, send the periodic report.
 function do_switch(int $idx, int $total, string $why): void {
     set_account_idx($idx);
-    @file_put_contents(__DIR__ . '/scratch-session-cycle-count.txt', '0');
+    set_cycle_counter(0);
     $n = increment_switch_counter();
     out('ACCOUNT_SWITCH: Switched to account ' . ($idx + 1) . " of $total (switch #$n$why)\n");
     if ($n % EMAIL_EVERY_SWITCHES === 0) {
@@ -269,18 +354,57 @@ function do_switch(int $idx, int $total, string $why): void {
     }
 }
 
-// Log in (or reuse the saved session) for one account.
-function open_session(string $user, string $pass): array {
-    $base = __DIR__ . '/scratch-session-' . md5(CRON_SECRET . $user);
-    $jar = $base . '.cookies';
-    $stateFile = $base . '.json';
-    $auth = load_session($jar, $stateFile);
-    $fresh = false;
-    if (!$auth) {
-        $auth = scratch_login($user, $pass, $jar, $stateFile);
-        $fresh = true;
+// A login is kept inside the state file. While a run is going its cookies sit in a temp jar (curl needs a file for them).
+function session_jar(string $user): string {
+    return sys_get_temp_dir() . '/sc-' . md5(CRON_SECRET . $user) . '.jar';
+}
+
+function session_save(string $user, array $auth, string $jar): void {
+    $cookies = is_file($jar) ? (string)file_get_contents($jar) : '';
+    state_update(function (array &$st) use ($user, $auth, $cookies) {
+        $st['sessions'][$user] = [
+            'token' => $auth['token'],
+            'csrf' => $auth['csrf'],
+            'saved' => $auth['saved'] ?? time(),
+            'cookies' => $cookies,
+        ];
+    });
+}
+
+// Put the (possibly rotated) cookies back into the state file and remove the temp jar.
+function session_persist(string $user, string $jar): void {
+    if ($user === '' || $jar === '' || !is_file($jar)) {
+        return;
     }
-    return [$auth, $jar, $stateFile, $fresh];
+    $cookies = (string)file_get_contents($jar);
+    state_update(function (array &$st) use ($user, $cookies) {
+        if (isset($st['sessions'][$user])) {
+            $st['sessions'][$user]['cookies'] = $cookies;
+        }
+    });
+    @unlink($jar);
+}
+
+function session_drop(string $user, string $jar): void {
+    @unlink($jar);
+    state_update(function (array &$st) use ($user) {
+        unset($st['sessions'][$user]);
+    });
+}
+
+// Reuse the saved login for one account, or log in. Returns [auth, jar file, freshly logged in].
+function open_session(string $user, string $pass): array {
+    $jar = session_jar($user);
+    $s = state_get()['sessions'][$user] ?? null;
+    if ($s && !empty($s['token']) && !empty($s['cookies']) && time() - (int)($s['saved'] ?? 0) <= SESSION_MAX_AGE) {
+        file_put_contents($jar, $s['cookies']);
+        @chmod($jar, 0600);
+        $auth = ['token' => $s['token'], 'csrf' => csrf_from_jar($jar) ?: ($s['csrf'] ?? ''), 'saved' => (int)$s['saved']];
+        return [$auth, $jar, false];
+    }
+    $auth = scratch_login($user, $pass, $jar);
+    session_save($user, $auth, $jar);
+    return [$auth, $jar, true];
 }
 
 function studio_request(string $method, int $studio, int $project, array $auth, string $jar): array {
@@ -325,10 +449,7 @@ function logged_studios(int $project): array {
 }
 
 const QUEUE_FILE = __DIR__ . '/scratch-session-queue.txt';
-const COOLDOWN_FILE = __DIR__ . '/scratch-session-cooldown.txt';
 const COOLDOWN_DEFAULT_SEC = 1800; // wait this long after a 429 when Scratch does not say how long
-
-const LIMITS_FILE = __DIR__ . '/scratch-session-limits.json';
 
 // Seconds to hold an account back after a 429: Scratch's Retry-After (60 s to 24 h), else the default above.
 function retry_after_sec(string $headers): int {
@@ -340,23 +461,28 @@ function retry_after_sec(string $headers): int {
 
 // username => unix time until which that account is rate limited (expired entries are dropped).
 function limits_load(): array {
-    $d = is_file(LIMITS_FILE) ? json_decode((string)@file_get_contents(LIMITS_FILE), true) : [];
     $now = time();
     $res = [];
-    if (is_array($d)) {
-        foreach ($d as $u => $t) {
-            if ((int)$t > $now) {
-                $res[(string)$u] = (int)$t;
-            }
+    foreach ((state_get()['limits'] ?? []) as $u => $t) {
+        if ((int)$t > $now) {
+            $res[(string)$u] = (int)$t;
         }
     }
     return $res;
 }
 
 function limit_set(string $user, int $sec): void {
-    $l = limits_load();
-    $l[$user] = time() + $sec;
-    @file_put_contents(LIMITS_FILE, json_encode($l), LOCK_EX);
+    state_update(function (array &$st) use ($user, $sec) {
+        $now = time();
+        $l = [];
+        foreach (($st['limits'] ?? []) as $u => $t) {
+            if ((int)$t > $now) {
+                $l[(string)$u] = (int)$t;
+            }
+        }
+        $l[$user] = $now + $sec;
+        $st['limits'] = $l;
+    });
 }
 
 // Next account after $from that is not rate limited, or null when every other account is.
@@ -384,21 +510,30 @@ function limits_min_left(array $accounts, array $limits): int {
     return max(60, (int)$min);
 }
 
-// After a 429 the queue action waits: Scratch's Retry-After if it sent one (60 s to 24 h), else the default above.
-function cooldown_start(string $headers): int {
-    $sec = COOLDOWN_DEFAULT_SEC;
-    if (preg_match('/^Retry-After:\s*(\d+)/mi', $headers, $m)) {
-        $sec = max(60, min(86400, (int)$m[1]));
+// Shared wait: set only when every account is rate limited (or the single config.php account is). Queue runs do nothing until it ends.
+function cooldown_set(int $sec): void {
+    state_update(function (array &$st) use ($sec) {
+        $st['cooldown_until'] = time() + $sec;
+    });
+}
+
+function cooldown_clear(): void {
+    if (isset(state_get()['cooldown_until'])) {
+        state_update(function (array &$st) {
+            unset($st['cooldown_until']);
+        });
     }
-    @file_put_contents(COOLDOWN_FILE, (string)(time() + $sec));
+}
+
+function cooldown_start(string $headers): int {
+    $sec = retry_after_sec($headers);
+    cooldown_set($sec);
     return $sec;
 }
 
 // Seconds the queue action still has to wait (0 = go ahead).
 function cooldown_left(): int {
-    clearstatcache(true, COOLDOWN_FILE);
-    $until = is_file(COOLDOWN_FILE) ? (int)@file_get_contents(COOLDOWN_FILE) : 0;
-    return max(0, $until - time());
+    return max(0, (int)(state_get()['cooldown_until'] ?? 0) - time());
 }
 
 function queue_ids(): array {
@@ -444,6 +579,7 @@ function queue_flush(): void {
 register_shutdown_function('queue_flush');
 
 try {
+    migrate_legacy_files();
     $studios = array_values(array_unique(array_filter(
         array_map('intval', preg_split('/[\s,;]+/', (string)($_GET['studio'] ?? ''), -1, PREG_SPLIT_NO_EMPTY)),
         fn($n) => $n > 0
@@ -452,6 +588,16 @@ try {
     $action  = (string)($_GET['action'] ?? 'add');
     $method  = ($action === 'remove' || $action === 'removeall') ? 'DELETE' : 'POST';
     $tag     = ($method === 'DELETE') ? 'DEL' : 'ADD';
+    $manual  = ($action === 'queue' && !empty($_GET['manual']));
+
+    if ($action === 'testmail') {
+        [$mailOk, $mailInfo] = mail_send('ScratchCensus test email', 'Test email from script.php sent ' . date('Y-m-d H:i:s') . ".\nIf you can read this, report emails work.\n");
+        out('Test email ' . $mailInfo . "\n");
+        if ($mailOk) {
+            echo "Accepted by the server. Now check your inbox and spam folder. If nothing arrives in a few minutes, the host or your mail provider is dropping it: try an EMAIL_REPORT_FROM address on your own domain in config.php.\n";
+        }
+        exit;
+    }
 
     if ($action === 'removeall' && $project > 0) {
         $studios = logged_studios($project);
@@ -463,7 +609,7 @@ try {
     }
 
     if ($action === 'queue' && $project > 0) {
-        $left = cooldown_left();
+        $left = $manual ? 0 : cooldown_left(); // a manual run uses the config.php account, so the shared wait does not apply
         if ($left > 0 && empty($_GET['force'])) {
             echo 'Rate limited earlier. Waiting ' . (int)ceil($left / 60) . " more minutes before the next queue run (add &force=1 to run anyway).\n";
             exit;
@@ -507,7 +653,15 @@ try {
     $accounts = [];
     $accountIdx = 0;
 
-    if ($action === 'queue') {
+    if ($manual) {
+        $lim = limits_load();
+        if (empty($_GET['force']) && isset($lim[SCRATCH_USER])) {
+            out('Manual run: the config.php account ' . SCRATCH_USER . ' is rate limited for about ' . (int)ceil(($lim[SCRATCH_USER] - time()) / 60) . " more minutes (add &force=1 to run anyway).\n");
+            exit;
+        }
+        out('Manual run: using the config.php account ' . SCRATCH_USER . ", no rotation.\n");
+    }
+    if ($action === 'queue' && !$manual) {
         $accounts = load_accounts();
         if (!empty($accounts)) {
             $cycle = increment_cycle_counter();
@@ -525,7 +679,7 @@ try {
                 $free = next_free_account($accounts, $accountIdx, $limits);
                 if ($free === null) {
                     $wait = limits_min_left($accounts, $limits);
-                    @file_put_contents(COOLDOWN_FILE, (string)(time() + $wait));
+                    cooldown_set($wait);
                     out('All ' . count($accounts) . ' accounts are rate limited. Queue runs wait ' . (int)ceil($wait / 60) . " minutes (add &force=1 to run anyway).\n");
                     exit;
                 }
@@ -538,10 +692,16 @@ try {
         }
     }
 
-    [$auth, $jar, $stateFile, $fresh] = open_session($currentUser, $currentPass);
+    [$auth, $jar, $fresh] = open_session($currentUser, $currentPass);
+    // the logins live in the state file: hand the cookies back and remove the temp jar even if the run dies
+    register_shutdown_function(function () {
+        global $currentUser, $jar;
+        session_persist((string)($currentUser ?? ''), (string)($jar ?? ''));
+    });
 
     $ok = 0;
     $tried = 0;
+    $cdCleared = false;
     $lastStart = 0.0;
     for ($n = 0; $n < count($todo); $n++) {
         $studio = $todo[$n];
@@ -561,10 +721,11 @@ try {
         // Queue run: a 419 means this account's session is bad, so stop and make the next run use the next account.
         if ($code === 419 && $action === 'queue') {
             $rest = array_merge(array_slice($todo, $n + 1), $rest);
-            @file_put_contents(__DIR__ . '/scratch-session-cycle-count.txt', (string)ACCOUNT_CYCLE_RUNS);
-            @unlink($jar);
-            @unlink($stateFile);
-            out("$tag $project $studio: HTTP 419. Account " . ($accountIdx + 1) . " failed, the next queue run switches account.\n");
+            if (!$manual) {
+                set_cycle_counter(ACCOUNT_CYCLE_RUNS);
+            }
+            session_drop($currentUser, $jar);
+            out("$tag $project $studio: HTTP 419. " . ($manual ? 'The config.php account was rejected, run again to log in fresh.' : 'Account ' . ($accountIdx + 1) . ' failed, the next queue run switches account.') . "\n");
             break;
         }
         if ($code === 419) {
@@ -572,7 +733,8 @@ try {
         }
 
         if (!$fresh && in_array($code, [401, 403, 419], true)) {
-            $auth = scratch_login($currentUser, $currentPass, $jar, $stateFile);
+            $auth = scratch_login($currentUser, $currentPass, $jar);
+            session_save($currentUser, $auth, $jar);
             $fresh = true;
             [$code, $hdrs, $body] = studio_request($method, $studio, $project, $auth, $jar);
         }
@@ -588,7 +750,10 @@ try {
                 $pendEnd[] = $studio;
             }
             if ($code >= 200 && $code < 300) {
-                @unlink(COOLDOWN_FILE); // adds work again, so any earlier wait is over
+                if (!$manual && !$cdCleared) { // adds work again, so any earlier shared wait is over
+                    cooldown_clear();
+                    $cdCleared = true;
+                }
             }
         }
 
@@ -599,12 +764,13 @@ try {
                 limit_set($currentUser, retry_after_sec((string)$hdrs));
                 $free = next_free_account($accounts, $accountIdx, limits_load());
                 while ($free !== null) {
+                    session_persist($currentUser, $jar);
                     $accountIdx = $free;
                     do_switch($accountIdx, count($accounts), ', after 429');
                     $currentUser = $accounts[$accountIdx]['user'];
                     $currentPass = $accounts[$accountIdx]['pass'];
                     try {
-                        [$auth, $jar, $stateFile, $fresh] = open_session($currentUser, $currentPass);
+                        [$auth, $jar, $fresh] = open_session($currentUser, $currentPass);
                         break;
                     } catch (Throwable $e) {
                         out('Login failed for account ' . ($accountIdx + 1) . ': ' . $e->getMessage() . "\n");
@@ -617,13 +783,17 @@ try {
                     continue;
                 }
                 $wait = limits_min_left($accounts, limits_load());
-                @file_put_contents(COOLDOWN_FILE, (string)(time() + $wait));
+                cooldown_set($wait);
                 out('Stopped: all ' . count($accounts) . ' accounts are rate limited. Queue runs wait ' . (int)ceil($wait / 60) . " minutes (add &force=1 to run anyway).\n");
                 break;
             }
             // One account only: stop and hand back everything not yet tried.
             $rest = array_merge(array_slice($todo, $n + 1), $rest);
-            if ($action === 'queue') {
+            if ($manual) {
+                $wait = retry_after_sec((string)$hdrs);
+                limit_set($currentUser, $wait);
+                out('Stopped: the config.php account is rate limited. Manual runs wait ' . (int)ceil($wait / 60) . " minutes (add &force=1 to run anyway).\n");
+            } elseif ($action === 'queue') {
                 $wait = cooldown_start((string)$hdrs);
                 out('Stopped: rate limited. Queue runs wait ' . (int)ceil($wait / 60) . " minutes (add &force=1 to run anyway).\n");
             } else {
@@ -633,6 +803,7 @@ try {
         }
     }
 
+    session_persist($currentUser, $jar);
     queue_flush();
     $secs = microtime(true) - $T0;
     out("\nDone: $ok ok of $tried tried in " . number_format($secs, 2) . 's (' . number_format($secs > 0 ? $tried / $secs : 0, 2) . " studios/s).\n");
