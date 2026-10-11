@@ -23,6 +23,8 @@ if (($_GET['key'] ?? '') !== CRON_SECRET) {
     exit;
 }
 
+$T0 = microtime(true);
+
 const SCRATCH_UA = 'Mozilla/5.0 (compatible; ScratchCensus/1.0)';
 const SESSION_MAX_AGE = 43200; // reuse a login for 12 hours
 const MAX_PER_RUN = 50;        // studios handled per request
@@ -32,7 +34,15 @@ const EMAIL_EVERY_SWITCHES = 5;   // send email report after this many account s
 
 // One HTTP call. Returns [status code, raw headers, body].
 function scratch_http(string $method, string $url, string $jar, array $headers = [], ?string $body = null): array {
+    static $share = null;
+    if ($share === null && function_exists('curl_share_init')) {
+        $share = curl_share_init();
+        curl_share_setopt($share, CURLSHOPT_SHARE, CURL_LOCK_DATA_CONNECT);
+    }
     $ch = curl_init($url);
+    if ($share) {
+        curl_setopt($ch, CURLOPT_SHARE, $share);
+    }
     $opts = [
         CURLOPT_RETURNTRANSFER => true,
         CURLOPT_HEADER => true,
@@ -304,18 +314,22 @@ function queue_ids(): array {
     return array_values(array_unique(array_filter(array_map('intval', $lines), fn($v) => $v > 0)));
 }
 
-// Remove one ID from the queue file (locked, so a button press during a run is not lost).
-function queue_remove(int $id): void {
+// Apply a whole run's results to the queue file in one locked pass: $done IDs are dropped, $toEnd IDs go to the end.
+function queue_apply(array $done, array $toEnd): void {
     $fh = @fopen(QUEUE_FILE, 'c+');
     if (!$fh || !flock($fh, LOCK_EX)) {
         return;
     }
+    $drop = array_flip(array_merge($done, $toEnd));
     $keep = [];
     while (($l = fgets($fh)) !== false) {
         $v = (int)$l;
-        if ($v > 0 && $v !== $id) {
+        if ($v > 0 && !isset($drop[$v])) {
             $keep[] = $v;
         }
+    }
+    foreach ($toEnd as $v) {
+        $keep[] = $v;
     }
     ftruncate($fh, 0);
     rewind($fh);
@@ -324,26 +338,18 @@ function queue_remove(int $id): void {
     fclose($fh);
 }
 
-// Put one ID at the end of the queue, so a studio that keeps failing with a 5xx cannot block the front of it.
-function queue_move_to_end(int $id): void {
-    $fh = @fopen(QUEUE_FILE, 'c+');
-    if (!$fh || !flock($fh, LOCK_EX)) {
-        return;
+// Results waiting to be written to the queue file. Flushed after the loop, and by the shutdown hook if the run dies.
+$pendDone = [];
+$pendEnd = [];
+function queue_flush(): void {
+    global $pendDone, $pendEnd;
+    if ($pendDone || $pendEnd) {
+        queue_apply($pendDone, $pendEnd);
+        $pendDone = [];
+        $pendEnd = [];
     }
-    $keep = [];
-    while (($l = fgets($fh)) !== false) {
-        $v = (int)$l;
-        if ($v > 0 && $v !== $id) {
-            $keep[] = $v;
-        }
-    }
-    $keep[] = $id;
-    ftruncate($fh, 0);
-    rewind($fh);
-    fwrite($fh, implode("\n", $keep) . "\n");
-    flock($fh, LOCK_UN);
-    fclose($fh);
 }
+register_shutdown_function('queue_flush');
 
 try {
     $studios = array_values(array_unique(array_filter(
@@ -389,7 +395,7 @@ try {
         if (is_file($pauseFile)) {
             $pausedAt = (int)@file_get_contents($pauseFile);
             $pausedFor = $pausedAt > 0 ? 'since ' . date('Y-m-d H:i:s', $pausedAt) : '';
-            out("Queue is paused $pausedFor. Exiting.\\n");
+            out("Queue is paused $pausedFor. Exiting.\n");
             flock($lock, LOCK_UN);
             fclose($lock);
             exit;
@@ -453,10 +459,18 @@ try {
     }
 
     $ok = 0;
+    $tried = 0;
+    $lastStart = 0.0;
     foreach ($todo as $n => $studio) {
+        // PAUSE_SEC is the gap between request starts, so time spent waiting on Scratch counts towards it
         if ($n > 0) {
-            usleep((int)round(PAUSE_SEC * 1000000));
+            $gap = PAUSE_SEC - (microtime(true) - $lastStart);
+            if ($gap > 0) {
+                usleep((int)round($gap * 1000000));
+            }
         }
+        $lastStart = microtime(true);
+        $tried++;
         [$code, $hdrs, $body] = studio_request($method, $studio, $project, $auth, $jar);
 
         // A saved session can go stale: log in again once and retry.
@@ -466,7 +480,7 @@ try {
         }
 
         if (!$fresh && in_array($code, [401, 403, 419], true)) {
-            $auth = scratch_login(SCRATCH_USER, SCRATCH_PASS, $jar, $stateFile);
+            $auth = scratch_login($currentUser, $currentPass, $jar, $stateFile);
             $fresh = true;
             [$code, $hdrs, $body] = studio_request($method, $studio, $project, $auth, $jar);
         }
@@ -477,9 +491,9 @@ try {
         }
         if ($action === 'queue') {
             if ($code > 0 && $code < 500 && $code !== 429) {
-                queue_remove($studio);
+                $pendDone[] = $studio;
             } elseif ($code >= 500) {
-                queue_move_to_end($studio);
+                $pendEnd[] = $studio;
             }
             if ($code >= 200 && $code < 300) {
                 @unlink(COOLDOWN_FILE); // adds work again, so any earlier wait is over
@@ -499,7 +513,9 @@ try {
         }
     }
 
-    out("\nDone: $ok ok of " . count($todo) . " tried.\n");
+    queue_flush();
+    $secs = microtime(true) - $T0;
+    out("\nDone: $ok ok of $tried tried in " . number_format($secs, 2) . 's (' . number_format($secs > 0 ? $tried / $secs : 0, 2) . " studios/s).\n");
     if ($action === 'queue') {
         out('Left in queue: ' . count(queue_ids()) . "\n");
     } elseif ($rest) {
