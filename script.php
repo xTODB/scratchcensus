@@ -37,8 +37,8 @@ const MAX_PER_RUN = 100;        // studios per add/remove request (the queue act
 const RUN_BUDGET_SEC = 50;      // a queue run starts new requests for this many seconds, then finishes the ones in flight
 const PAUSE_SEC = 0.2;          // gap between request STARTS in seconds (decimals are fine): the speed limit is 1 / PAUSE_SEC per second
 const MAX_INFLIGHT = 4;         // queue only: requests allowed to be on the way at once (about request time / PAUSE_SEC + 1)
-const ACCOUNT_CYCLE_STUDIOS = 300; // switch accounts after this many successful adds on one account
-const EMAIL_EVERY_SWITCHES = 100; // one summary email after this many account switches
+const ACCOUNT_CYCLE_STUDIOS = 100; // switch accounts after this many successful adds on one account
+const EMAIL_EVERY_SWITCHES = 10; // one summary email after this many account switches
 
 // A configured curl handle for one Scratch call. $shareConn reuses the TLS connection between plain calls.
 function scratch_handle(string $method, string $url, string $jar, array $headers = [], ?string $body = null, bool $shareConn = true) {
